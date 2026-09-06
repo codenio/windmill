@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { stopPropagation } from 'svelte/legacy'
 
-	import { createEventDispatcher, getContext } from 'svelte'
+	import { createEventDispatcher, getContext, untrack } from 'svelte'
 	import type { AppViewerContext } from '../../../types'
 	import type { TableAction } from '$lib/components/apps/editor/component'
 
@@ -32,6 +32,7 @@
 		onRemove: (id: string, rowIndex: number) => void
 		wrapActions?: boolean | undefined
 		selectRow: (params: ICellRendererParams<any>) => void
+		setModalRow: (row?: ICellRendererParams<any>) => void
 	}
 
 	let {
@@ -44,15 +45,16 @@
 		onSet,
 		onRemove,
 		wrapActions = undefined,
-		selectRow
+		selectRow,
+		setModalRow
 	}: Props = $props()
 
 	const dispatch = createEventDispatcher()
 	const { selectedComponent, hoverStore, mode, connectingInput, componentControl, app } =
 		getContext<AppViewerContext>('AppViewerContext')
 
-	$componentControl[id] = {
-		...$componentControl[id],
+	$componentControl[untrack(() => id)] = {
+		...$componentControl[untrack(() => id)],
 		onDelete: () => {
 			// Remove associated subgrid
 			actions.forEach((action) => {
@@ -216,11 +218,14 @@
 							id={action.id}
 							customCss={action.customCss}
 							configuration={action.configuration}
+							onOpenRecomputeIds={action.onOpenRecomputeIds}
+							onCloseRecomputeIds={action.onCloseRecomputeIds}
 							verticalAlignment="center"
 							preclickAction={async () => {
 								dispatch('toggleRow')
-								p && selectRow(p)
+								p && (selectRow(p), setModalRow(p))
 							}}
+							onClose={() => setModalRow(undefined)}
 						/>
 					{:else if action.type == 'checkboxcomponent'}
 						<AppCheckbox
@@ -287,11 +292,14 @@
 						id={action.id}
 						customCss={action.customCss}
 						configuration={action.configuration}
+						onOpenRecomputeIds={action.onOpenRecomputeIds}
+						onCloseRecomputeIds={action.onCloseRecomputeIds}
 						verticalAlignment="center"
 						preclickAction={async () => {
 							dispatch('toggleRow')
-							p && selectRow(p)
+							p && (selectRow(p), setModalRow(p))
 						}}
+						onClose={() => setModalRow(undefined)}
 					/>
 				{:else if action.type == 'checkboxcomponent'}
 					<AppCheckbox

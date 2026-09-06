@@ -43,6 +43,7 @@ export type InputType =
 	| 'bigquery'
 	| 'oracledb'
 	| 'ducklake'
+	| 'datatable'
 	| 'app-path'
 
 // Connection to an output of another component
@@ -70,6 +71,7 @@ export type UserInput<U> = {
 	type: 'user'
 	value: U | undefined
 	allowUserResources?: boolean
+	sensitive?: boolean
 }
 
 // Input can be uploaded with a file selector
@@ -270,6 +272,7 @@ export type AppInput =
 	| AppInputSpec<'resource', string, 'bigquery'>
 	| AppInputSpec<'resource', string, 'oracledb'>
 	| AppInputSpec<'ducklake', string, 'ducklake'>
+	| AppInputSpec<'datatable', string, 'datatable'>
 	| AppInputSpec<'array', object[], 'number-tuple'>
 	| AppInputSpec<'app-path', string>
 

@@ -18,10 +18,12 @@
 	import { base } from '$lib/base'
 
 	import MultiplayerMenu from './MultiplayerMenu.svelte'
+	import { Plus } from 'lucide-svelte'
 	import {
 		clearWorkspaceFromStorage,
 		enterpriseLicense,
 		superadmin,
+		usedTriggerKinds,
 		userWorkspaces,
 		workspaceStore,
 		tutorialsToDo,
@@ -35,9 +37,9 @@
 	import { Menu, Menubar, MenuItem } from '$lib/components/meltComponents'
 	import MenuButton, { sidebarClasses } from './MenuButton.svelte'
 	import MenuLink from './MenuLink.svelte'
-	import ResizeTransitionWrapper from '../common/ResizeTransitionWrapper.svelte'
 	import type { FavoriteKind } from './FavoriteMenu.svelte'
 	let darkMode: boolean = $state(false)
+	let showExtraTriggers = $state(false)
 
 	interface Props {
 		isCollapsed?: boolean
@@ -114,55 +116,6 @@
 				label: 'Workers',
 				id: 'workers',
 				href: `${base}/workers`
-			}
-		].filter(filterLink)
-	)
-	let secondMenuTriggerLinks = $derived(
-		[
-			{
-				label: 'Custom HTTP routes',
-				id: 'triggers',
-				href: `${base}/routes`
-			},
-			{
-				label: 'Websocket triggers',
-				id: 'triggers',
-				href: `${base}/websocket_triggers`
-			},
-			{
-				label: 'Postgres triggers',
-				id: 'triggers',
-				href: `${base}/postgres_triggers`
-			},
-			{
-				label: 'Kafka triggers',
-				id: 'triggers',
-				href: `${base}/kafka_triggers`
-			},
-			{
-				label: 'NATS triggers',
-				id: 'triggers',
-				href: `${base}/nats_triggers`
-			},
-			{
-				label: 'SQS triggers',
-				id: 'triggers',
-				href: `${base}/sqs_triggers`
-			},
-			{
-				label: 'GCP Pub/Sub triggers',
-				id: 'triggers',
-				href: `${base}/gcp_triggers`
-			},
-			{
-				label: 'MQTT triggers',
-				id: 'triggers',
-				href: `${base}/mqtt_triggers`
-			},
-			{
-				label: 'Email triggers',
-				id: 'triggers',
-				href: `${base}/email_triggers`
 			},
 			{
 				label: 'Audit logs',
@@ -171,17 +124,71 @@
 			}
 		].filter(filterLink)
 	)
-	let showMore = $state(false)
+	type TriggerMenuLink = SecondMenuLink & { kind: string }
+	let allTriggerLinks: TriggerMenuLink[] = $derived(
+		(
+			[
+				{ label: 'Custom HTTP routes', id: 'triggers', href: `${base}/routes`, kind: 'http' },
+				{
+					label: 'Websocket triggers',
+					id: 'triggers',
+					href: `${base}/websocket_triggers`,
+					kind: 'ws'
+				},
+				{
+					label: 'Postgres triggers',
+					id: 'triggers',
+					href: `${base}/postgres_triggers`,
+					kind: 'postgres'
+				},
+				{ label: 'Kafka triggers', id: 'triggers', href: `${base}/kafka_triggers`, kind: 'kafka' },
+				{ label: 'NATS triggers', id: 'triggers', href: `${base}/nats_triggers`, kind: 'nats' },
+				{ label: 'SQS triggers', id: 'triggers', href: `${base}/sqs_triggers`, kind: 'sqs' },
+				{
+					label: 'GCP Pub/Sub triggers',
+					id: 'triggers',
+					href: `${base}/gcp_triggers`,
+					kind: 'gcp'
+				},
+				{
+					label: 'Azure Event Grid triggers',
+					id: 'triggers',
+					href: `${base}/azure_triggers`,
+					kind: 'azure'
+				},
+				{ label: 'MQTT triggers', id: 'triggers', href: `${base}/mqtt_triggers`, kind: 'mqtt' },
+				{ label: 'AMQP triggers', id: 'triggers', href: `${base}/amqp_triggers`, kind: 'amqp' },
+				{ label: 'Email triggers', id: 'triggers', href: `${base}/email_triggers`, kind: 'email' }
+			] as TriggerMenuLink[]
+		).filter(filterLink)
+	)
+	let secondMenuTriggerLinks = $derived(
+		allTriggerLinks.filter((link) => $usedTriggerKinds.includes(link.kind))
+	)
+	let extraTriggerLinks = $derived(
+		allTriggerLinks.filter((link) => !$usedTriggerKinds.includes(link.kind))
+	)
 </script>
 
 <Menubar>
 	{#snippet children({ createMenu })}
-		<Menu {createMenu} usePointerDownOutside on:close={() => (showMore = false)}>
-			{#snippet triggr({ trigger })}
+		<Menu
+			{createMenu}
+			placement="bottom-start"
+			openOnHover
+			usePointerDownOutside
+			on:close={() => (showExtraTriggers = false)}
+		>
+			{#snippet triggr({ trigger, pinned })}
 				<MenuButton
-					class="!text-xs"
+					class={twMerge(
+						'!text-xs bg-surface !pl-3.5 !pr-2 !w-auto',
+						// A hover-opened menu leaves the button plain once the pointer moves on;
+						// keeping the tint is what tells you the click pinned it.
+						pinned ? sidebarClasses.selectedBg : ''
+					)}
 					icon={MenuIcon}
-					{isCollapsed}
+					isCollapsed={false}
 					lightMode
 					label={undefined}
 					{trigger}
@@ -194,7 +201,7 @@
 							href={favorite.href}
 							{item}
 							class={twMerge(
-								'w-full inline-flex flex-row px-2 py-2 hover:bg-surface-hover',
+								'w-full inline-flex flex-row px-2 py-2',
 								'data-[highlighted]:bg-surface-hover'
 							)}
 						>
@@ -227,7 +234,8 @@
 							class={twMerge(
 								'flex flex-row gap-3.5 items-center px-2 py-2',
 								sidebarClasses.text,
-								sidebarClasses.hoverBg
+								'transition-colors',
+								'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
 							)}
 							lightMode
 							{item}
@@ -251,8 +259,9 @@
 							lightMode
 							class={twMerge(
 								'w-full flex gap-3.5 px-2 py-2',
-								sidebarClasses.hoverBg,
-								sidebarClasses.text
+								'transition-colors',
+								sidebarClasses.text,
+								'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
 							)}
 							{item}
 						>
@@ -267,7 +276,12 @@
 							href="{base}/user/workspaces"
 							onClick={() => clearWorkspaceFromStorage()}
 							lightMode
-							class={twMerge('flex gap-3.5 px-2 py-2', sidebarClasses.hoverBg, sidebarClasses.text)}
+							class={twMerge(
+								'flex gap-3.5 px-2 py-2',
+								'transition-colors',
+								sidebarClasses.text,
+								'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
+							)}
 							{item}
 						>
 							<Building size={14} />
@@ -280,7 +294,7 @@
 								class={twMerge(
 									'flex flex-row gap-3.5 items-center px-2 py-2 ',
 									'text-secondary text-xs',
-									'hover:bg-surface-hover hover:text-primary cursor-pointer',
+									'cursor-pointer',
 									'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
 								)}
 								{item}
@@ -295,7 +309,7 @@
 							class={twMerge(
 								'flex flex-row gap-3.5  items-center px-2 py-2 w-full',
 								'text-primary text-xs',
-								'hover:bg-surface-hover cursor-pointer',
+								'cursor-pointer',
 								'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
 							)}
 							{item}
@@ -304,36 +318,70 @@
 							Sign out
 						</MenuItem>
 					</div>
-					<div onmouseleave={() => (showMore = false)} role="none">
-						{#if secondMenuLinks.length}
-							<ResizeTransitionWrapper vertical innerClass="w-full">
-								{#if !showMore}
-									<div onmouseenter={() => (showMore = true)} role="none">
-										<MenuItem {item}>
-											<div class="px-2 py-2 text-primary text-2xs">More...</div>
-										</MenuItem>
-									</div>
-								{:else}
-									{#snippet renderSecondMenuLinks(menuLinks: SecondMenuLink[])}
-										{#each menuLinks as menuLink (menuLink.href ?? menuLink.label)}
+					<div role="none">
+						{#snippet renderSecondMenuLinks(menuLinks: SecondMenuLink[])}
+							{#each menuLinks as menuLink (menuLink.href ?? menuLink.label)}
+								<MenuItem
+									href={menuLink.href}
+									class={twMerge(
+										'flex flex-row gap-3.5 items-center px-2 py-2 text-secondary text-2xs cursor-pointer',
+										'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
+									)}
+									{item}
+								>
+									{menuLink.label}
+								</MenuItem>
+							{/each}
+						{/snippet}
+						{#if secondMenuLinks.length || secondMenuTriggerLinks.length || extraTriggerLinks.length}
+							<div class="divide-y">
+								{#if secondMenuLinks.length}<div
+										>{@render renderSecondMenuLinks(secondMenuLinks)}</div
+									>{/if}
+								{#if secondMenuTriggerLinks.length}<div
+										>{@render renderSecondMenuLinks(secondMenuTriggerLinks)}</div
+									>{/if}
+								{#if extraTriggerLinks.length}<div>
+										<!-- svelte-ignore a11y_no_static_element_interactions -->
+										<div
+											role="none"
+											onclickcapture={(e) => {
+												// This row expands the list below it instead of acting on the selection, and
+												// melt keeps the menu open only for a click it sees as defaultPrevented.
+												// Svelte delegates onclick to the root, which runs after melt's own listener,
+												// and a capture listener on the item itself would be ordered only by
+												// registration, so an ancestor's capture phase is what reliably wins.
+												e.preventDefault()
+												showExtraTriggers = !showExtraTriggers
+											}}
+										>
 											<MenuItem
-												href={menuLink.href}
 												class={twMerge(
-													'flex flex-row gap-3.5 items-center px-2 py-2 text-secondary text-2xs hover:bg-surface-hover hover:text-primary cursor-pointer',
+													'flex flex-row gap-3.5 items-center px-2 py-2 w-full text-secondary text-2xs cursor-pointer',
 													'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
 												)}
 												{item}
 											>
-												{menuLink.label}
+												<Plus size={12} />
+												<span class="text-2xs">More triggers</span>
 											</MenuItem>
-										{/each}
-									{/snippet}
-									<div class="divide-y">
-										<div>{@render renderSecondMenuLinks(secondMenuLinks)}</div>
-										<div>{@render renderSecondMenuLinks(secondMenuTriggerLinks)}</div>
-									</div>
-								{/if}
-							</ResizeTransitionWrapper>
+										</div>
+										{#if showExtraTriggers}
+											{#each extraTriggerLinks as menuLink (menuLink.href)}
+												<MenuItem
+													href={menuLink.href}
+													class={twMerge(
+														'flex flex-row gap-3.5 items-center px-2 py-2 pl-6 text-tertiary text-2xs cursor-pointer',
+														'data-[highlighted]:bg-surface-hover data-[highlighted]:text-primary'
+													)}
+													{item}
+												>
+													{menuLink.label}
+												</MenuItem>
+											{/each}
+										{/if}
+									</div>{/if}
+							</div>
 						{/if}
 						{#if $enterpriseLicense}
 							<MultiplayerMenu />

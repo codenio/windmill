@@ -8,7 +8,6 @@ export interface NativeTriggerConfig {
 	readonly serviceDisplayName: string
 	readonly serviceKey: NativeServiceName
 	readonly supportsSync: boolean
-	readonly supportsFetchConfig: boolean
 	readonly isCloudCompatible: boolean
 	readonly templates?: {
 		script?: string
@@ -21,11 +20,31 @@ export const NATIVE_TRIGGER_SERVICES: Record<NativeServiceName, NativeTriggerCon
 		serviceDisplayName: 'Nextcloud',
 		serviceKey: 'nextcloud',
 		supportsSync: true,
-		supportsFetchConfig: true,
 		isCloudCompatible: true,
 		templates: {
 			script: '/scripts/add?hub=hub%2F28115',
 			flow: '/flows/add?hub=73'
+		}
+	},
+	// Google handles both Drive and Calendar triggers via trigger_type in service_config
+	google: {
+		serviceDisplayName: 'Google',
+		serviceKey: 'google',
+		supportsSync: true,
+		isCloudCompatible: true,
+		templates: {
+			script: '/scripts/add?hub=hub%2F28135',
+			flow: '/flows/add?hub=75'
+		}
+	},
+	github: {
+		serviceDisplayName: 'GitHub',
+		serviceKey: 'github',
+		supportsSync: true,
+		isCloudCompatible: true,
+		templates: {
+			script: '/scripts/add?hub=hub%2F28202',
+			flow: '/flows/add?hub=80'
 		}
 	}
 }
@@ -102,13 +121,17 @@ export function validateCommonFields(config: Record<string, any>): Record<string
 }
 
 export function formatTriggerDisplayName(trigger: NativeTrigger): string {
-	return `${trigger.script_path} (external id: ${trigger.external_id})`
+	return `${trigger.summary ?? ''} ${trigger.script_path} (external id: ${trigger.external_id})`
 }
 
 export function getTriggerIconName(service: NativeServiceName): string {
 	switch (service) {
 		case 'nextcloud':
 			return 'NextcloudIcon'
+		case 'google':
+			return 'GoogleIcon'
+		case 'github':
+			return 'GithubIcon'
 		default:
 			return 'NextcloudIcon'
 	}
@@ -118,6 +141,10 @@ export async function getServiceIcon(service: NativeServiceName): Promise<any> {
 	switch (service) {
 		case 'nextcloud':
 			return (await import('$lib/components/icons/NextcloudIcon.svelte')).default
+		case 'google':
+			return (await import('$lib/components/icons/GoogleIcon.svelte')).default
+		case 'github':
+			return (await import('$lib/components/icons/GithubIcon.svelte')).default
 	}
 }
 
@@ -186,7 +213,8 @@ export async function saveNativeTriggerFromCfg(
 	const requestBody: NativeTriggerData = {
 		script_path: triggerCfg.script_path,
 		is_flow: triggerCfg.is_flow,
-		service_config: triggerCfg.service_config
+		service_config: triggerCfg.service_config,
+		summary: triggerCfg.summary
 	}
 
 	const serviceName = NATIVE_TRIGGER_SERVICES[service].serviceDisplayName

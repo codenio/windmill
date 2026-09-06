@@ -12,18 +12,19 @@
 	import DrawerContent from '$lib/components/common/drawer/DrawerContent.svelte'
 	import HighlightCode from '$lib/components/HighlightCode.svelte'
 	import { workspaceStore, userStore } from '$lib/stores'
-	import { Plus, FileText, Search, Code2, Edit, Eye } from 'lucide-svelte'
+	import { Plus, FileText, Search, Code2, Edit, Eye, RefreshCw } from 'lucide-svelte'
 	import { WorkspaceDependenciesService, WorkspaceService } from '$lib/gen'
 	import type { WorkspaceDependencies, ScriptLang } from '$lib/gen'
 	import { untrack } from 'svelte'
 	import { sendUserToast } from '$lib/toast'
 	import TimeAgo from '$lib/components/TimeAgo.svelte'
-	import Description from '$lib/components/Description.svelte'
+	import SettingsPageHeader from '$lib/components/settings/SettingsPageHeader.svelte'
 
 	let filter = $state('')
 	let workspaceDependencies: WorkspaceDependencies[] | undefined = $state()
 	let filteredItems: (WorkspaceDependencies & { marked?: string })[] | undefined = $state()
 	let workspaceDependenciesEditor: WorkspaceDependenciesEditor | undefined = $state()
+	let rebuildingDependencyMap = $state(false)
 
 	// View modal state
 	let viewDrawer: Drawer | undefined = $state()
@@ -78,6 +79,20 @@
 		}
 	})
 
+	async function rebuildDependencyMap(): Promise<void> {
+		if (!$workspaceStore) return
+		rebuildingDependencyMap = true
+		try {
+			const status = await WorkspaceService.rebuildDependencyMap({ workspace: $workspaceStore })
+			sendUserToast(status)
+		} catch (error) {
+			console.error('Error rebuilding dependency map:', error)
+			sendUserToast(`Failed to rebuild dependency map: ${error.message}`, true)
+		} finally {
+			rebuildingDependencyMap = false
+		}
+	}
+
 	async function createNewWorkspaceDependencies() {
 		await workspaceDependenciesEditor?.initNew()
 	}
@@ -95,7 +110,10 @@
 
 	// Archive workspace dependencies
 	async function archiveWorkspaceDependencies(deps: WorkspaceDependencies): Promise<void> {
-		const importedPath = workspaceDependenciesEditor?.getWorkspaceDependenciesPath(deps.name ?? null, deps.language)
+		const importedPath = workspaceDependenciesEditor?.getWorkspaceDependenciesPath(
+			deps.name ?? null,
+			deps.language
+		)
 		if (!importedPath) {
 			sendUserToast('Unable to determine enforced dependencies path', true)
 			return
@@ -115,7 +133,9 @@
 				language: deps.language as any,
 				name: deps.name
 			})
-			sendUserToast(`Archived enforced dependencies: ${workspaceDependenciesEditor?.getDisplayName(deps)}`)
+			sendUserToast(
+				`Archived enforced dependencies: ${workspaceDependenciesEditor?.getDisplayName(deps)}`
+			)
 			loadWorkspaceDependencies() // Reload the list
 		} catch (error) {
 			console.error('Error archiving workspace dependencies:', error)
@@ -125,7 +145,10 @@
 
 	// Delete workspace dependencies
 	async function deleteWorkspaceDependencies(deps: WorkspaceDependencies): Promise<void> {
-		const importedPath = workspaceDependenciesEditor?.getWorkspaceDependenciesPath(deps.name ?? null, deps.language)
+		const importedPath = workspaceDependenciesEditor?.getWorkspaceDependenciesPath(
+			deps.name ?? null,
+			deps.language
+		)
 		if (!importedPath) {
 			sendUserToast('Unable to determine enforced dependencies path', true)
 			return
@@ -145,7 +168,9 @@
 				language: deps.language as any,
 				name: deps.name
 			})
-			sendUserToast(`Deleted enforced dependencies: ${workspaceDependenciesEditor?.getDisplayName(deps)}`)
+			sendUserToast(
+				`Deleted enforced dependencies: ${workspaceDependenciesEditor?.getDisplayName(deps)}`
+			)
 			loadWorkspaceDependencies() // Reload the list
 		} catch (error) {
 			console.error('Error deleting workspace dependencies:', error)
@@ -155,7 +180,10 @@
 
 	async function viewReferencedFrom(deps: WorkspaceDependencies): Promise<void> {
 		try {
-			const path = workspaceDependenciesEditor?.getWorkspaceDependenciesPath(deps.name ?? null, deps.language)
+			const path = workspaceDependenciesEditor?.getWorkspaceDependenciesPath(
+				deps.name ?? null,
+				deps.language
+			)
 			if (!path) {
 				sendUserToast('Unable to determine enforced dependencies path', true)
 				return
@@ -171,14 +199,15 @@
 			} else {
 				// Show dependents in a modal or navigate to a detailed view
 				console.log('Dependents:', dependents)
-				sendUserToast(`Found ${dependents.length} dependent runnable${dependents.length !== 1 ? 's' : ''}`)
+				sendUserToast(
+					`Found ${dependents.length} dependent runnable${dependents.length !== 1 ? 's' : ''}`
+				)
 			}
 		} catch (error) {
 			console.error('Error fetching dependent runnables:', error)
 			sendUserToast('Failed to fetch dependent runnables', true)
 		}
 	}
-
 
 	async function handleWarningConfirm(): Promise<void> {
 		if (pendingAction) {
@@ -195,8 +224,7 @@
 		currentImportedPath = null
 	}
 
-
-	function getLanguageForHighlighting(language: ScriptLang): ScriptLang | 'json' | undefined{
+	function getLanguageForHighlighting(language: ScriptLang): ScriptLang | 'json' | undefined {
 		// Map our requirement languages to syntax highlighting languages
 		switch (language) {
 			case 'python3':
@@ -211,7 +239,10 @@
 	}
 </script>
 
-<WorkspaceDependenciesEditor bind:this={workspaceDependenciesEditor} on:create={loadWorkspaceDependencies} />
+<WorkspaceDependenciesEditor
+	bind:this={workspaceDependenciesEditor}
+	on:create={loadWorkspaceDependencies}
+/>
 
 <SearchItems
 	{filter}
@@ -220,20 +251,22 @@
 	f={(x) => (x.name || 'Default') + ' ' + (x.language || '') + ' ' + (x.content || '')}
 />
 
-<div class="flex flex-col gap-4 my-8">
-	<div class="flex flex-col gap-1">
-		<div class="text-sm font-semibold text-emphasis">Enforced Dependencies</div>
-		<Description link="https://www.windmill.dev/docs/">
-			Enforced Dependencies define dependency specifications for scripts by language. Unnamed dependencies serve as workspace defaults, while named dependencies can be referenced by scripts using #raw_reqs annotations.
-		</Description>
-	</div>
-
-	<div class="flex flex-row justify-end">
-		<Button size="md" startIcon={{ icon: Plus }} on:click={createNewWorkspaceDependencies}>
+<SettingsPageHeader
+	title="Enforced Dependencies"
+	description="Enforced Dependencies define dependency specifications for scripts by language. Unnamed dependencies serve as workspace defaults, while named dependencies can be referenced by scripts using #raw_reqs annotations."
+	link="https://www.windmill.dev/docs/core_concepts/workspace_dependencies"
+>
+	{#snippet actions()}
+		<Button
+			unifiedSize="md"
+			variant="accent"
+			startIcon={{ icon: Plus }}
+			onClick={createNewWorkspaceDependencies}
+		>
 			New&nbsp;enforced&nbsp;dependencies
 		</Button>
-	</div>
-</div>
+	{/snippet}
+</SettingsPageHeader>
 
 <div class="pt-2">
 	<div class="relative text-tertiary">
@@ -252,7 +285,7 @@
 	<ListFilters bind:selectedFilter={languageFilter} filters={languages} />
 </div>
 
-<div class="relative overflow-x-auto pb-40 pr-4">
+<div class="relative overflow-x-auto pb-8 pr-4">
 	{#if !filteredItems}
 		<Skeleton layout={[0.5, [2], 1]} />
 		{#each new Array(3) as _}
@@ -295,11 +328,14 @@
 										{#if deps.marked}
 											{@html deps.marked}
 										{:else}
-											{workspaceDependenciesEditor?.getDisplayName(deps) || (deps.name || `Default (${deps.language})`)}
+											{workspaceDependenciesEditor?.getDisplayName(deps) ||
+												deps.name ||
+												`Default (${deps.language})`}
 										{/if}
 									</button>
 									<span class="text-xs text-tertiary font-mono">
-										{workspaceDependenciesEditor?.getFullFilename(deps.language, deps.name ?? null)} • {deps.language}
+										{workspaceDependenciesEditor?.getFullFilename(deps.language, deps.name ?? null)}
+										• {deps.language}
 									</span>
 								</div>
 							</div>
@@ -318,11 +354,12 @@
 							</span>
 						</Cell>
 						<Cell>
-							<span class="text-xs px-1.5 py-0.5 rounded bg-opacity-50 font-medium"
-								class:bg-blue-100="{deps.name === null}"
-								class:text-blue-700="{deps.name === null}"
-								class:bg-gray-100="{deps.name !== null}"
-								class:text-gray-600="{deps.name !== null}"
+							<span
+								class="text-xs px-1.5 py-0.5 rounded bg-opacity-50 font-medium"
+								class:bg-blue-100={deps.name === null}
+								class:text-blue-700={deps.name === null}
+								class:bg-gray-100={deps.name !== null}
+								class:text-gray-600={deps.name !== null}
 							>
 								{deps.name === null ? 'Default' : 'Named'}
 							</span>
@@ -334,23 +371,53 @@
 						</Cell>
 						<Cell last>
 							<div class="flex gap-1 flex-wrap">
-								<Button size="xs" variant="border" color="light" startIcon={{ icon: Eye }} on:click={() => viewWorkspaceDependencies(deps)}>
+								<Button
+									size="xs"
+									variant="border"
+									color="light"
+									startIcon={{ icon: Eye }}
+									on:click={() => viewWorkspaceDependencies(deps)}
+								>
 									View
 								</Button>
-								<Button size="xs" variant="border" color="light" startIcon={{ icon: Edit }} on:click={() => editWorkspaceDependencies(deps)}>
+								<Button
+									size="xs"
+									variant="border"
+									color="light"
+									startIcon={{ icon: Edit }}
+									on:click={() => editWorkspaceDependencies(deps)}
+								>
 									Edit
 								</Button>
 								<!-- Placeholder buttons -->
-								<Button size="xs" variant="border" color="gray" on:click={() => archiveWorkspaceDependencies(deps)} title="Archive">
+								<Button
+									size="xs"
+									variant="border"
+									color="gray"
+									on:click={() => archiveWorkspaceDependencies(deps)}
+									title="Archive"
+								>
 									Archive
 								</Button>
-								<Button size="xs" variant="border" color="red" on:click={() => deleteWorkspaceDependencies(deps)} title="Delete">
+								<Button
+									size="xs"
+									variant="border"
+									color="red"
+									on:click={() => deleteWorkspaceDependencies(deps)}
+									title="Delete"
+								>
 									Delete
 								</Button>
-								<Button size="xs" variant="border" color="gray" on:click={() => viewReferencedFrom(deps)} title="Referenced From">
+								<Button
+									size="xs"
+									variant="border"
+									color="gray"
+									on:click={() => viewReferencedFrom(deps)}
+									title="Referenced From"
+								>
 									Refs
 								</Button>
-						</div>
+							</div>
 						</Cell>
 					</Row>
 				{/each}
@@ -358,6 +425,29 @@
 		</DataTable>
 	{/if}
 </div>
+
+{#if $userStore?.is_admin || $userStore?.is_super_admin}
+	<div class="border-t pt-8 mt-16 pb-12 pr-4 flex items-start justify-between gap-4">
+		<div class="flex flex-col gap-0.5 min-w-0">
+			<span class="text-xs font-medium text-secondary">Rebuild dependency map</span>
+			<span class="text-xs text-tertiary max-w-2xl">
+				Rebuilds the workspace dependency map from scratch. This should almost never be needed —
+				only if dependency tracking has gotten out of sync, e.g. after orphaned references are
+				reported in the logs.
+			</span>
+		</div>
+		<Button
+			size="xs"
+			variant="border"
+			color="light"
+			startIcon={{ icon: RefreshCw }}
+			disabled={rebuildingDependencyMap}
+			onClick={rebuildDependencyMap}
+		>
+			Rebuild
+		</Button>
+	</div>
+{/if}
 
 <Drawer bind:this={viewDrawer} size="900px">
 	<DrawerContent title="View Requirement - {viewPath}" on:close={viewDrawer?.closeDrawer}>

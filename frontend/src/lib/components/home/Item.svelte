@@ -10,19 +10,62 @@
 	import ShareModal from '../ShareModal.svelte'
 	import { createEventDispatcher } from 'svelte'
 	import { ArrowBigUp } from 'lucide-svelte'
-
-	export let item
-	export let depth: number = 0
+	import { userStore, workspaceStore } from '$lib/stores'
+	import { getHomeSelection, toBulkItem } from './homeSelection.svelte'
+	import type { RowSelection } from '../common/table/rowSelection'
 
 	const dispatch = createEventDispatcher()
 
-	let deleteConfirmedCallback: (() => void) | undefined = undefined
-	let shareModal: ShareModal
-	let moveDrawer: MoveDrawer
-	let deploymentDrawer: DeployWorkspaceDrawer
+	let deleteConfirmedCallback: (() => void) | undefined = $state(undefined)
+	let shareModal: any | undefined = $state()
+	let moveDrawer: any | undefined = $state()
+	let deploymentDrawer: any | undefined = $state()
 
-	let menuOpen: boolean = false
-	export let showCode: (path: string, summary: string) => void
+	let menuOpen: boolean = $state(false)
+	interface Props {
+		item: any
+		depth?: number
+		showCode: (path: string, summary: string) => void
+		showEditButton?: boolean
+		keyboardSelected?: boolean
+	}
+
+	let {
+		item,
+		depth = 0,
+		showCode,
+		showEditButton = true,
+		keyboardSelected = false
+	}: Props = $props()
+
+	// Read from context rather than threaded down: the tree renders items through
+	// several nested levels that have no other reason to know about selection.
+	const homeSelection = getHomeSelection()
+	// A raw app the listing returns is an `app` row carrying `raw_app`, and is
+	// selectable like any other app. The separate `raw_app` type is the legacy
+	// listing shape, which renders through RawAppRow — no selection control there,
+	// so it must not enter the selection either.
+	let bulkItem = $derived(
+		homeSelection?.available && item.type !== 'raw_app'
+			? toBulkItem(item, $userStore, $workspaceStore)
+			: undefined
+	)
+	$effect(() => {
+		const b = bulkItem
+		if (!b || !homeSelection) return
+		homeSelection.register(b)
+		return () => homeSelection.unregister(b.key)
+	})
+	let rowSelection: RowSelection | undefined = $derived(
+		bulkItem && homeSelection
+			? {
+					key: bulkItem.key,
+					selected: homeSelection.has(bulkItem.key),
+					active: homeSelection.active,
+					onToggle: (e) => bulkItem && homeSelection.toggle(bulkItem, 'shiftKey' in e && e.shiftKey)
+				}
+			: undefined
+	)
 </script>
 
 {#if item.type == 'script'}
@@ -41,6 +84,9 @@
 		{depth}
 		bind:menuOpen
 		{showCode}
+		{showEditButton}
+		{keyboardSelected}
+		{rowSelection}
 	/>
 {:else if item.type == 'flow'}
 	<FlowRow
@@ -57,6 +103,9 @@
 		{deploymentDrawer}
 		{depth}
 		bind:menuOpen
+		{showEditButton}
+		{keyboardSelected}
+		{rowSelection}
 	/>
 {:else if item.type == 'app'}
 	<AppRow
@@ -69,18 +118,19 @@
 		{deploymentDrawer}
 		{depth}
 		bind:menuOpen
+		{showEditButton}
+		{keyboardSelected}
+		{rowSelection}
 	/>
 {:else if item.type == 'raw_app'}
 	<RawAppRow
-		bind:deleteConfirmedCallback
 		marked={item.marked}
-		on:change={() => dispatch('rawAppChanged')}
 		app={item}
-		{moveDrawer}
 		{shareModal}
 		{deploymentDrawer}
 		{depth}
 		bind:menuOpen
+		{keyboardSelected}
 	/>
 {/if}
 
@@ -89,6 +139,7 @@
 		open={Boolean(deleteConfirmedCallback)}
 		title="Remove"
 		confirmationText="Remove"
+		trashbin
 		on:canceled={() => {
 			deleteConfirmedCallback = undefined
 		}}

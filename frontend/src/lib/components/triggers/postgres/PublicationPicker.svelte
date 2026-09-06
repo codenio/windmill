@@ -1,31 +1,48 @@
 <script lang="ts">
+	import { run } from 'svelte/legacy';
+
 	import { Button } from '$lib/components/common'
 	import Select from '$lib/components/select/Select.svelte'
 	import { safeSelectItems } from '$lib/components/select/utils.svelte'
 	import type { Relations } from '$lib/gen'
 	import { PostgresTriggerService } from '$lib/gen/services.gen'
 	import { workspaceStore } from '$lib/stores'
+	import { getTriggerWorkspace } from '$lib/components/triggers/triggerWorkspace'
 	import { sendUserToast } from '$lib/toast'
 	import { emptyString } from '$lib/utils'
 	import { RefreshCw } from 'lucide-svelte'
 
-	export let items: string[] = []
-	export let can_write: boolean = true
-	export let publication_name: string = ''
-	export let postgres_resource_path: string = ''
-	export let relations: Relations[] | undefined = undefined
-	export let transaction_to_track: string[] = []
-	export let disabled: boolean = false
+	interface Props {
+		items?: string[];
+		can_write?: boolean;
+		publication_name?: string;
+		postgres_resource_path?: string;
+		relations?: Relations[] | undefined;
+		transaction_to_track?: string[];
+		disabled?: boolean;
+	}
 
-	let loadingPublication: boolean = false
-	let deletingPublication: boolean = false
-	let updatingPublication: boolean = false
+	let {
+		items = $bindable([]),
+		can_write = true,
+		publication_name = $bindable(''),
+		postgres_resource_path = '',
+		relations = $bindable(undefined),
+		transaction_to_track = $bindable([]),
+		disabled = false
+	}: Props = $props();
+	const triggerWs = getTriggerWorkspace()
+	const wsId = $derived(triggerWs?.() ?? $workspaceStore)
+
+	let loadingPublication: boolean = $state(false)
+	let deletingPublication: boolean = $state(false)
+	let updatingPublication: boolean = $state(false)
 	async function listDatabasePublication() {
 		try {
 			loadingPublication = true
 			const publications = await PostgresTriggerService.listPostgresPublication({
 				path: postgres_resource_path,
-				workspace: $workspaceStore!
+				workspace: wsId!
 			})
 
 			items = publications
@@ -41,7 +58,7 @@
 			updatingPublication = true
 			const message = await PostgresTriggerService.updatePostgresPublication({
 				path: postgres_resource_path,
-				workspace: $workspaceStore!,
+				workspace: wsId!,
 				publication: publication_name,
 				requestBody: {
 					table_to_track: relations,
@@ -61,7 +78,7 @@
 			deletingPublication = true
 			const message = await PostgresTriggerService.deletePostgresPublication({
 				path: postgres_resource_path,
-				workspace: $workspaceStore!,
+				workspace: wsId!,
 				publication: publication_name
 			})
 			items = items.filter((item) => item != publication_name)
@@ -80,7 +97,7 @@
 		try {
 			const publication_data = await PostgresTriggerService.getPostgresPublication({
 				path: postgres_resource_path,
-				workspace: $workspaceStore!,
+				workspace: wsId!,
 				publication: publication_name
 			})
 			transaction_to_track = [...publication_data.transaction_to_track]
@@ -94,7 +111,9 @@
 	}
 
 	listDatabasePublication()
-	$: publication_name && getAllRelations()
+	run(() => {
+		publication_name && getAllRelations()
+	});
 </script>
 
 <div class="flex gap-1">

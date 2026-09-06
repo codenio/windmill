@@ -1,8 +1,22 @@
+/**
+ * LEGACY: These query builders generate full SQL on the frontend.
+ * They exist only for backwards compatibility with Database Studio (dbexplorercomponent) apps
+ * whose policies were generated with expanded SQL digests.
+ *
+ * New code (Database Manager) should use WM_INTERNAL_DB markers instead,
+ * which are expanded server-side by the Rust query_builders module.
+ * See: dbOps.ts → dbTableOpsWithPreviewScripts()
+ */
 import type { AppInput, RunnableByName } from '$lib/components/apps/inputType'
 import { wrapDucklakeQuery } from '../../../../../ducklake'
 import type { DbType, DbInput } from '$lib/components/dbTypes'
 import { buildParameters } from '../utils'
-import { getLanguageByResourceType, type ColumnDef, buildVisibleFieldList } from '../utils'
+import {
+	getLanguageByResourceType,
+	type ColumnDef,
+	buildVisibleFieldList,
+	duckdbQuicksearchColumns
+} from '../utils'
 
 export function makeCountQuery(
 	dbType: DbType,
@@ -109,8 +123,8 @@ export function makeCountQuery(
 		}
 		case 'duckdb':
 			if (filteredColumns.length > 0) {
-				quicksearchCondition += ` ($quicksearch = '' OR CONCAT(' ', ${filteredColumns.join(
-					', '
+				quicksearchCondition += ` ($quicksearch = '' OR CONCAT(' ', ${duckdbQuicksearchColumns(
+					columnDefs
 				)}) LIKE CONCAT('%', $quicksearch, '%'))`
 			} else {
 				quicksearchCondition += ` ($quicksearch = '' OR 1 = 1)`
@@ -191,7 +205,9 @@ export function getCountInput(
 				? {
 						database: {
 							type: 'static',
-							value: `$res:${dbInput.resourcePath}`,
+							value: dbInput.resourcePath.startsWith('datatable://')
+								? dbInput.resourcePath
+								: `$res:${dbInput.resourcePath}`,
 							fieldType: 'object',
 							format: `resource-${dbType}`
 						}

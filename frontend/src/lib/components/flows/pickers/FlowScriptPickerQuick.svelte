@@ -5,11 +5,23 @@
 	import { sendUserToast } from '$lib/toast'
 	import { createEventDispatcher } from 'svelte'
 
-	export let label: string
-	export let lang: SupportedLanguage | 'docker' | 'javascript' | undefined = undefined
-	export let selected = false
-	export let eeRestricted: boolean
-	export let enterpriseLangs: string[] = []
+	interface Props {
+		label: string
+		lang?: SupportedLanguage | 'docker' | 'javascript' | 'claudesandbox' | undefined
+		selected?: boolean
+		eeRestricted: boolean
+		enterpriseLangs?: string[]
+		onHover?: () => void
+	}
+
+	let {
+		label,
+		lang = undefined,
+		selected = false,
+		eeRestricted,
+		enterpriseLangs = [],
+		onHover = undefined
+	}: Props = $props()
 
 	const dispatch = createEventDispatcher()
 	function handleKeydown(event: KeyboardEvent & { currentTarget: EventTarget & Window }) {
@@ -30,16 +42,16 @@
 	}
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} />
 
 <Button
 	id={`flow-editor-new-${lang}`}
-	{selected}
 	onClick={click}
+	onmousemove={() => onHover?.()}
 	role="menuitem"
 	variant="subtle"
 	unifiedSize="sm"
-	btnClasses="justify-start"
+	btnClasses="justify-start {selected ? 'bg-surface-hover' : onHover ? 'hover:bg-transparent' : ''}"
 >
 	{#if lang}
 		<LanguageIcon {lang} width={13} height={13} />

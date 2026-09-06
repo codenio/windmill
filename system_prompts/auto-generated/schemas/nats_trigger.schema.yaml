@@ -6,6 +6,30 @@ properties:
   is_flow:
     type: boolean
     description: True if script_path points to a flow, false if it points to a script
+  labels:
+    type: array
+    items:
+      type: string
+  draft_only:
+    type: boolean
+    description: 'True when this row is a per-user draft with no deployed
+
+      trigger at the same path. Set by list endpoints when
+
+      `include_draft_only=true` synthesizes the row from the
+
+      draft. Frontend renders a "Draft" badge.
+
+      '
+  is_draft:
+    type: boolean
+    description: 'True when the authed user has a per-user draft at this path
+
+      (over a deployed row or a synthesized draft-only row).
+
+      Frontend appends a `*` to the displayed name.
+
+      '
   nats_resource_path:
     type: string
     description: Path to the NATS resource containing connection configuration
@@ -25,7 +49,9 @@ properties:
     description: Array of NATS subjects to subscribe to
   error_handler_path:
     type: string
-    description: Path to a script or flow to run when the triggered job fails
+    description: Path to a script to run when the triggered job fails. A bare path,
+      without the script/ or flow/ prefix a schedule error handler takes; it cannot
+      be a flow.
   error_handler_args:
     type: object
     description: The arguments to pass to the script or flow

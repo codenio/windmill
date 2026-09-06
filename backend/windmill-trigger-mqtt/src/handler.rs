@@ -1,4 +1,4 @@
-use axum::async_trait;
+use async_trait::async_trait;
 use itertools::Itertools;
 use sqlx::{types::Json as SqlxJson, PgConnection};
 use windmill_api_auth::ApiAuthed;
@@ -25,6 +25,7 @@ impl TriggerCrud for MqttTrigger {
 
     const TABLE_NAME: &'static str = "mqtt_trigger";
     const TRIGGER_TYPE: &'static str = "mqtt";
+    const DRAFT_KIND: windmill_common::user_drafts::UserDraftItemKind = windmill_common::user_drafts::UserDraftItemKind::TriggerMqtt;
     const SUPPORTS_SERVER_STATE: bool = true;
     const SUPPORTS_TEST_CONNECTION: bool = true;
     const ROUTE_PREFIX: &'static str = "/mqtt_triggers";
@@ -39,8 +40,8 @@ impl TriggerCrud for MqttTrigger {
     ];
     const IS_ALLOWED_ON_CLOUD: bool = false;
 
-    fn get_deployed_object(path: String) -> DeployedObject {
-        DeployedObject::MqttTrigger { path }
+    fn get_deployed_object(path: String, parent_path: Option<String>) -> DeployedObject {
+        DeployedObject::MqttTrigger { path, parent_path }
     }
 
     async fn validate_config(
@@ -72,6 +73,8 @@ impl TriggerCrud for MqttTrigger {
         w_id: &str,
         trigger: TriggerData<Self::TriggerConfigRequest>,
     ) -> Result<()> {
+        let resolved_edited_by = trigger.base.resolve_edited_by(authed);
+        let resolved_permissioned_as = trigger.base.resolve_permissioned_as(authed);
         let subscribe_topics = trigger
             .config
             .subscribe_topics
@@ -94,7 +97,7 @@ impl TriggerCrud for MqttTrigger {
                 path,
                 script_path,
                 is_flow,
-                email,
+                permissioned_as,
                 mode,
                 edited_by,
                 error_handler_path,
@@ -114,9 +117,9 @@ impl TriggerCrud for MqttTrigger {
             trigger.base.path,
             trigger.base.script_path,
             trigger.base.is_flow,
-            authed.email,
+            resolved_permissioned_as,
             trigger.base.mode() as _,
-            authed.username,
+            &resolved_edited_by,
             trigger.error_handling.error_handler_path,
             trigger.error_handling.error_handler_args as _,
             trigger.error_handling.retry as _
@@ -136,6 +139,8 @@ impl TriggerCrud for MqttTrigger {
         path: &str,
         trigger: TriggerData<Self::TriggerConfigRequest>,
     ) -> Result<()> {
+        let resolved_edited_by = trigger.base.resolve_edited_by(authed);
+        let resolved_permissioned_as = trigger.base.resolve_permissioned_as(authed);
         let subscribe_topics = trigger
             .config
             .subscribe_topics
@@ -159,7 +164,7 @@ impl TriggerCrud for MqttTrigger {
                 v5_config = $6,
                 is_flow = $7,
                 edited_by = $8,
-                email = $9,
+                permissioned_as = $9,
                 script_path = $10,
                 path = $11,
                 edited_at = now(),
@@ -179,8 +184,8 @@ impl TriggerCrud for MqttTrigger {
             v3_config as Option<SqlxJson<MqttV3Config>>,
             v5_config as Option<SqlxJson<MqttV5Config>>,
             trigger.base.is_flow,
-            authed.username,
-            authed.email,
+            &resolved_edited_by,
+            resolved_permissioned_as,
             trigger.base.script_path,
             trigger.base.path,
             workspace_id,

@@ -6,12 +6,10 @@ use crate::{
     auth::{AuthCache, OptTokened},
     db::{ApiAuthed, DB},
     jobs::start_job_update_sse_stream,
-    resources::try_get_resource_from_db_as,
     triggers::trigger_helpers::{
         get_runnable_format, trigger_runnable, trigger_runnable_and_wait_for_result,
         trigger_runnable_inner, RunnableId,
     },
-    users::fetch_api_authed,
     utils::{check_scopes, ExpiringCacheEntry},
 };
 use axum::{
@@ -30,12 +28,13 @@ use windmill_common::{
     triggers::{TriggerKind, TriggerMetadata},
     utils::{not_found_if_none, StripPath},
 };
+use windmill_store::resources::try_get_resource_from_db_as;
 use windmill_trigger::TriggerMode;
 
 #[cfg(feature = "parquet")]
 use {
     crate::job_helpers_oss::get_workspace_s3_resource,
-    windmill_common::s3_helpers::build_object_store_client,
+    windmill_object_store::build_object_store_client,
 };
 
 async fn conditional_cors_middleware(
@@ -96,7 +95,7 @@ async fn conditional_cors_middleware(
 pub fn http_route_trigger_handler() -> Router {
     Router::new()
         .route(
-            "/*path",
+            "/{*path}",
             get(route_job)
                 .post(route_job)
                 .delete(route_job)
@@ -124,7 +123,9 @@ async fn get_http_route_trigger(
 
     let routers_cache = if routers_cache.routers.is_empty() {
         tracing::warn!("HTTP routers are not loaded, loading from db");
-        let (_, routers_cache) = refresh_routers(db).await?;
+        // refresh_routers takes the write lock, so holding this read guard across it deadlocks.
+        drop(routers_cache);
+        let (_, routers_cache) = refresh_routers(db, false).await?;
         routers_cache
     } else {
         routers_cache
@@ -214,9 +215,15 @@ async fn get_http_route_trigger(
         None
     };
 
-    let authed = fetch_api_authed(
-        trigger.edited_by.clone(),
-        trigger.email.clone(),
+    let email = windmill_common::users::get_email_from_permissioned_as(
+        &trigger.permissioned_as,
+        &trigger.workspace_id,
+        db,
+    )
+    .await?;
+    let authed = windmill_api_auth::fetch_api_authed_from_permissioned_as(
+        trigger.permissioned_as.clone(),
+        email,
         &trigger.workspace_id,
         &db,
         Some(username_override.unwrap_or(format!("HTTP-{}", trigger.path))),
@@ -347,12 +354,12 @@ async fn route_job(
                 &db,
                 None,
                 &trigger.workspace_id,
-                config.storage,
+                config.storage.clone(),
             )
             .await?;
-            let s3_resource = s3_resource_opt.ok_or(Error::internal_err(
-                "No files storage resource defined at the workspace level".to_string(),
-            ))?;
+            let s3_resource = s3_resource_opt.ok_or_else(|| {
+                windmill_object_store::workspace_storage_misconfigured(config.storage.as_deref())
+            })?;
             let s3_client = build_object_store_client(&s3_resource).await?;
 
             let path = if trigger.is_static_website {
@@ -365,13 +372,17 @@ async fn route_job(
             } else {
                 config.s3.clone()
             };
-            let path = object_store::path::Path::from(path);
+            let path = windmill_object_store::object_store_reexports::Path::from(path);
             let s3_object = s3_client.get(&path).await;
 
             let s3_object = match s3_object {
-                Err(object_store::Error::NotFound { .. }) if trigger.is_static_website => {
+                Err(
+                    windmill_object_store::object_store_reexports::ObjectStoreError::NotFound {
+                        ..
+                    },
+                ) if trigger.is_static_website => {
                     // fallback to index.html if the file is not found
-                    let path = object_store::path::Path::from(format!(
+                    let path = windmill_object_store::object_store_reexports::Path::from(format!(
                         "{}/index.html",
                         config.s3.trim_end_matches('/')
                     ));
@@ -410,11 +421,12 @@ async fn route_job(
                 "content-type",
                 s3_object
                     .attributes
-                    .get(&object_store::Attribute::ContentType)
+                    .get(&windmill_object_store::object_store_reexports::Attribute::ContentType)
                     .map(|s| s.parse().ok())
                     .flatten()
                     .unwrap_or("application/octet-stream".parse().unwrap()),
             );
+            response_headers.insert("x-content-type-options", "nosniff".parse().unwrap());
             if !trigger.is_static_website {
                 response_headers.insert(
                     "content-disposition",
@@ -422,7 +434,7 @@ async fn route_job(
                         || {
                             s3_object
                                 .attributes
-                                .get(&object_store::Attribute::ContentDisposition)
+                                .get(&windmill_object_store::object_store_reexports::Attribute::ContentDisposition)
                                 .map(|s| s.parse().ok())
                                 .flatten()
                                 .unwrap_or("inline".parse().unwrap())
@@ -433,6 +445,19 @@ async fn route_job(
                                 .unwrap_or("inline".parse().unwrap())
                         },
                     ),
+                );
+                // For single-file triggers, sandbox any HTML/SVG so it can't
+                // reach the viewer's session cookie. Allow-scripts/forms/etc.
+                // keep the opaque origin (cookies still blocked) while
+                // preserving JS for legitimate HTML payloads. Static-website
+                // triggers intentionally serve a live web app and cannot be
+                // sandboxed; restrict write access to those buckets at the
+                // workspace level.
+                response_headers.insert(
+                    "content-security-policy",
+                    "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
+                        .parse()
+                        .unwrap(),
                 );
             }
 
@@ -464,6 +489,7 @@ async fn route_job(
         .to_args_from_format(
             &trigger.route_path,
             &called_path,
+            &trigger.path,
             &params,
             runnable_format,
             trigger.wrap_body,
@@ -505,7 +531,7 @@ async fn route_job(
     match trigger.request_type {
         RequestType::SyncSse => {
             // Trigger the job (always async when streaming)
-            let (uuid, _, _, _) = trigger_runnable_inner(
+            let (uuid, _, early_return, has_failure_module, _) = trigger_runnable_inner(
                 &db,
                 None,
                 Some(user_db.clone()),
@@ -553,6 +579,9 @@ async fn route_job(
                 None,
                 tx,
                 None,
+                early_return,
+                has_failure_module,
+                false,
             );
 
             let body = axum::body::Body::from_stream(

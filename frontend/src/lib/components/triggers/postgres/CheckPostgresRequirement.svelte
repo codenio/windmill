@@ -3,10 +3,11 @@
 	import Tooltip from '$lib/components/Tooltip.svelte'
 	import { PostgresTriggerService } from '$lib/gen'
 	import { workspaceStore } from '$lib/stores'
+	import { getTriggerWorkspace } from '$lib/components/triggers/triggerWorkspace'
 	import { sendUserToast } from '$lib/toast'
 	import { emptyString } from '$lib/utils'
 
-	let loadingConfiguration = false
+	let loadingConfiguration = $state(false)
 
 	const checkDatabaseConfiguration = async () => {
 		if (emptyString(postgres_resource_path)) {
@@ -15,7 +16,7 @@
 		}
 		try {
 			const invalidConfig = !(await PostgresTriggerService.isValidPostgresConfiguration({
-				workspace: $workspaceStore!,
+				workspace: wsId!,
 				path: postgres_resource_path
 			}))
 
@@ -47,9 +48,15 @@
 		loadingConfiguration = false
 	}
 
-	export let can_write: boolean
-	export let postgres_resource_path: string
-	export let checkConnection: any | undefined = undefined
+	interface Props {
+		can_write: boolean;
+		postgres_resource_path: string;
+		checkConnection?: any | undefined;
+	}
+
+	let { can_write, postgres_resource_path, checkConnection = undefined }: Props = $props();
+	const triggerWs = getTriggerWorkspace()
+	const wsId = $derived(triggerWs?.() ?? $workspaceStore)
 </script>
 
 {#if postgres_resource_path}

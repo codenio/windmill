@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte'
 	import type { EnumType } from '$lib/common'
 	import { computeKind } from '$lib/utils'
 	import Label from './Label.svelte'
@@ -51,7 +52,8 @@
 		computeKind(enum_, contentEncoding, pattern, format)
 	)
 
-	const allowKindChange = overrideAllowKindChange || originalType === 'string'
+	const allowKindChange =
+		untrack(() => overrideAllowKindChange) || untrack(() => originalType) === 'string'
 
 	let patternStr: string = $state(pattern ?? '')
 	let resource: string | undefined = $state()
@@ -341,6 +343,7 @@
 		{/if}
 	{:else if kind == 'none'}
 		{#if !noExtra}
+			<div class="mt-2"></div>
 			<Label label="Min textarea rows">
 				<TextInput
 					inputProps={{ type: 'number' }}
@@ -381,7 +384,7 @@
 			options={{
 				right: 'Is Password/Sensitive',
 				rightTooltip:
-					'The value will be stored as an ephemeral secret variable in the user space of the caller of the job, only viewable by him.'
+					'The value will be stored as an ephemeral secret variable in the user space of the caller of the job, only viewable by that user.'
 			}}
 			checked={password}
 			on:change={(e) => {

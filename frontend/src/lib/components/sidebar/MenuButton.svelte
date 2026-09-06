@@ -1,21 +1,23 @@
 <script module lang="ts">
 	export const sidebarClasses = {
-		text: 'text-primary-inverse dark:text-primary data-[light-mode=true]:text-primary text-xs font-normal',
-		selectedText: 'text-emphasis-inverse dark:text-emphasis text-xs font-normal',
-		sublabelText: 'text-secondary-inverse dark:text-secondary text-2xs font-normal',
-		hoverBg:
-			'transition-colors hover:bg-surface-hover-inverse dark:hover:bg-surface-hover data-[light-mode=true]:hover:bg-surface-hover'
+		text: 'text-secondary text-xs font-normal',
+		iconText: 'text-hint',
+		selectedText: 'text-emphasis text-xs font-semibold',
+		sublabelText: 'text-secondary text-2xs font-normal',
+		hoverBg: 'transition-colors hover:bg-surface-hover',
+		selectedBg: 'bg-surface-hover'
 	}
 </script>
 
 <script lang="ts">
 	import { twMerge } from 'tailwind-merge'
 	import Popover from '../Popover.svelte'
-	import { createEventDispatcher } from 'svelte'
+	import { createEventDispatcher, untrack } from 'svelte'
 	import SideBarNotification from './SideBarNotification.svelte'
 	import { conditionalMelt } from '$lib/utils'
 	import type { MenubarMenuElements } from '@melt-ui/svelte'
 	import { triggerableByAI } from '$lib/actions/triggerableByAI.svelte'
+	import { ChevronDown } from 'lucide-svelte'
 
 	interface Props {
 		aiId?: string | undefined
@@ -35,6 +37,13 @@
 		trigger?: MenubarMenuElements['trigger'] | undefined
 		href?: string | undefined
 		class?: string | undefined
+		// Show a trailing chevron to signal the button opens a dropdown.
+		showChevron?: boolean
+		// Render the label with stronger weight/size (e.g. the workspace name).
+		emphasizeLabel?: boolean
+		// Drop the native `title` attributes — for callers that wrap the button
+		// in their own hover tooltip.
+		disableTitle?: boolean
 	}
 
 	let {
@@ -54,7 +63,10 @@
 		color = null,
 		trigger = undefined,
 		href = undefined,
-		class: classNames = undefined
+		class: classNames = undefined,
+		showChevron = false,
+		emphasizeLabel = false,
+		disableTitle = false
 	}: Props = $props()
 
 	let buttonRef: HTMLButtonElement | HTMLAnchorElement | undefined = $state(undefined)
@@ -62,7 +74,7 @@
 	let dispatch = createEventDispatcher()
 
 	// Dynamic component based on whether href is provided
-	const Element = href ? 'a' : 'button'
+	const Element = untrack(() => href) ? 'a' : 'button'
 </script>
 
 {#if !disabled}
@@ -101,7 +113,8 @@
 				classNames
 			)}
 			use:conditionalMelt={trigger}
-			title={isCollapsed ? undefined : label}
+			aria-label={label}
+			title={isCollapsed || disableTitle ? undefined : label}
 			{...$trigger}
 		>
 			{#if icon}
@@ -112,7 +125,7 @@
 						<foreignObject x="5" y="5" width="16" height="16">
 							<SvelteComponent
 								size={16}
-								class={twMerge(sidebarClasses.text, 'transition-colors', iconClasses)}
+								class={twMerge(sidebarClasses.iconText, 'transition-colors', iconClasses)}
 								{...iconProps}
 							/>
 						</foreignObject>
@@ -120,7 +133,12 @@
 				{:else}
 					<SvelteComponent
 						size={16}
-						class={twMerge('flex-shrink-0', sidebarClasses.text, 'transition-colors', iconClasses)}
+						class={twMerge(
+							'flex-shrink-0',
+							sidebarClasses.iconText,
+							'transition-colors',
+							iconClasses
+						)}
 						{...iconProps}
 					/>
 				{/if}
@@ -131,16 +149,14 @@
 					<div
 						class={twMerge(
 							'whitespace-pre truncate w-full',
-							sidebarClasses.text,
+							emphasizeLabel ? 'text-primary text-sm font-semibold' : sidebarClasses.text,
 							'transition-all',
 							classNames
 						)}
-						title={label}
+						title={disableTitle ? undefined : label}
 					>
 						{label}
-						<span
-							class="pl-2 text-xs dark:text-secondary light:text-secondary-inverse font-semibold"
-						>
+						<span class="pl-2 text-xs text-secondary font-semibold">
 							{shortcut}
 						</span>
 					</div>
@@ -159,8 +175,15 @@
 				{/if}
 			</div>
 
+			{#if showChevron && !isCollapsed}
+				<ChevronDown
+					size={14}
+					class="flex-shrink-0 text-tertiary transition-colors group-hover:text-secondary"
+				/>
+			{/if}
+
 			{#if isCollapsed && notificationsCount > 0}
-				<div class="absolute translate-x-1/2 translate-y-1/2 -top-2 right-1 flex h-fit w-fit">
+				<div class="absolute top-1 right-1 flex h-fit w-fit">
 					<SideBarNotification notificationCount={notificationsCount} small={true} />
 				</div>
 			{:else if notificationsCount > 0}

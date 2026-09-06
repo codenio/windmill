@@ -19,8 +19,6 @@
 	export function computeAssetNodes(nodes: NodeDep[]): {
 		newAssetNodes: (Node & NodeLayout)[]
 		newAssetEdges: Edge[]
-		// Nodes need to be offset on the y axis to make space for the asset nodes
-		newNodePositions: Record<string, { x: number; y: number }>
 	} {
 		if (computeAssetNodesCache && deepEqual(nodes, computeAssetNodesCache[0])) {
 			return computeAssetNodesCache[1]
@@ -29,8 +27,6 @@
 		const ASSETS_OVERFLOWED_NODE_WIDTH = 25
 		const allAssetNodes: (Node & NodeLayout)[] = []
 		const allAssetEdges: Edge[] = []
-
-		const yPosMap: Record<number, { r?: true; w?: true }> = {}
 
 		for (const node of nodes) {
 			const assets = node.data.assets ?? []
@@ -46,13 +42,6 @@
 
 			const overflowedInputAssets = inputAssets.slice(3)
 			const overflowedOutputAssets = outputAssets.slice(3)
-
-			// This allows calculating which nodes to offset on the y axis to
-			// make space for the asset nodes
-			if (inputAssets.length || outputAssets.length)
-				yPosMap[node.position.y] = yPosMap[node.position.y] ?? {}
-			if (inputAssets.length) yPosMap[node.position.y].r = true
-			if (outputAssets.length) yPosMap[node.position.y].w = true
 
 			// All asset nodes displayed on top
 			const inputAssetNodes: (Node & AssetN)[] = displayedInputAssets.map((asset, i) => {
@@ -74,7 +63,7 @@
 					type: 'asset' as const,
 					parentId: node.id,
 					data: { asset, displayedAccessType: 'r' },
-					id: `${node.id}-asset-in-${asset.kind}-${asset.path}`,
+					id: `${node.id}-asset-in-${asset.kind}-${asset.path}-${i}`,
 					width: inputAssetWidth,
 					position: {
 						x:
@@ -111,7 +100,7 @@
 					type: 'asset' as const,
 					parentId: node.id,
 					data: { asset, displayedAccessType: 'w' },
-					id: `${node.id}-asset-out-${asset.kind}-${asset.path}`,
+					id: `${node.id}-asset-out-${asset.kind}-${asset.path}-${i}`,
 					width: outputAssetWidth,
 					position: {
 						x:
@@ -147,7 +136,7 @@
 			allAssetNodes.push(...(inputAssetNodes ?? []), ...(outputAssetNodes ?? []))
 
 			// If there are more than 3 assets, we create an overflow node
-			if (overflowedInputAssets.length)
+			if (overflowedInputAssets.length) {
 				allAssetNodes.push({
 					type: 'assetsOverflowed',
 					data: { overflowedAssets: overflowedInputAssets, displayedAccessType: 'r' },
@@ -159,14 +148,15 @@
 						y: READ_ASSET_Y_OFFSET
 					}
 				} satisfies Node & AssetsOverflowedN)
-			allAssetEdges.push({
-				id: `${node.id}-assets-overflowed-in-edge`,
-				source: `${node.id}-assets-overflowed-in`,
-				target: node.id,
-				type: 'empty',
-				data: { class: '!opacity-35 dark:!opacity-20' }
-			})
-			if (overflowedOutputAssets.length)
+				allAssetEdges.push({
+					id: `${node.id}-assets-overflowed-in-edge`,
+					source: `${node.id}-assets-overflowed-in`,
+					target: node.id,
+					type: 'empty',
+					data: { class: '!opacity-35 dark:!opacity-20' }
+				})
+			}
+			if (overflowedOutputAssets.length) {
 				allAssetNodes.push({
 					type: 'assetsOverflowed',
 					data: { overflowedAssets: overflowedOutputAssets, displayedAccessType: 'w' },
@@ -178,35 +168,19 @@
 						y: WRITE_ASSET_Y_OFFSET
 					}
 				} satisfies Node & AssetsOverflowedN)
-			allAssetEdges.push({
-				id: `${node.id}-assets-overflowed-out-edge`,
-				source: node.id,
-				target: `${node.id}-assets-overflowed-out`,
-				type: 'empty',
-				data: { class: '!opacity-35 dark:!opacity-25' }
-			})
-		}
-
-		// Shift all nodes to make space for the new asset nodes
-		const sortedNewNodes = nodes
-			.map((n) => ({ position: { ...n.position }, id: n.id }))
-			.sort((a, b) => a.position.y - b.position.y)
-
-		let currentYOffset = 0
-		let prevYPos = NaN
-		for (const node of sortedNewNodes) {
-			if (node.position.y !== prevYPos) {
-				if (yPosMap[prevYPos]?.w) currentYOffset += NODE_WITH_WRITE_ASSET_Y_OFFSET
-				if (yPosMap[node.position.y]?.r) currentYOffset += NODE_WITH_READ_ASSET_Y_OFFSET
-				prevYPos = node.position.y
+				allAssetEdges.push({
+					id: `${node.id}-assets-overflowed-out-edge`,
+					source: node.id,
+					target: `${node.id}-assets-overflowed-out`,
+					type: 'empty',
+					data: { class: '!opacity-35 dark:!opacity-25' }
+				})
 			}
-			node.position.y += currentYOffset
 		}
 
 		let ret: ReturnType<typeof computeAssetNodes> = {
 			newAssetNodes: allAssetNodes,
-			newAssetEdges: allAssetEdges,
-			newNodePositions: Object.fromEntries(sortedNewNodes.map((n) => [n.id, n.position]))
+			newAssetEdges: allAssetEdges
 		}
 		computeAssetNodesCache = [clone(nodes), ret]
 		return ret
@@ -225,7 +199,6 @@
 		type AssetWithAltAccessType
 	} from '$lib/components/assets/lib'
 	import { twMerge } from 'tailwind-merge'
-	import type { FlowGraphAssetContext } from '$lib/components/flows/types'
 	import { getContext } from 'svelte'
 	import ExploreAssetButton, { assetCanBeExplored } from '../../../ExploreAssetButton.svelte'
 	import { Tooltip } from '$lib/components/meltComponents'
@@ -234,18 +207,19 @@
 	import type { Edge, Node } from '@xyflow/svelte'
 
 	import { getNodeColorClasses, NODE } from '../../util'
-	import { globalDbManagerDrawer, userStore } from '$lib/stores'
+	import { userStore } from '$lib/stores'
 	import { deepEqual } from 'fast-equals'
 	import { slide } from 'svelte/transition'
 	import AssetColumnBadges from '$lib/components/assets/AssetColumnBadges.svelte'
 
 	interface Props {
 		data: AssetN['data']
+		id?: string
 	}
 
-	const flowGraphAssetsCtx = getContext<FlowGraphAssetContext | undefined>('FlowGraphAssetContext')
+	const flowGraphAssetsCtx = getContext<any | undefined>('FlowGraphAssetContext')
 
-	let { data }: Props = $props()
+	let { data, id }: Props = $props()
 
 	const isSelected = $derived(assetEq(flowGraphAssetsCtx?.val.selectedAsset, data.asset))
 	const cachedResourceMetadata = $derived.by(() => {
@@ -266,7 +240,7 @@
 	)
 </script>
 
-<NodeWrapper wrapperClass="bg-surface-secondary rounded-md">
+<NodeWrapper wrapperClass="bg-surface-secondary rounded-md" nodeId={id}>
 	{#snippet children({ darkMode })}
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<Tooltip customBgClass="bg-surface-tertiary">
@@ -301,7 +275,9 @@
 				{#if data.asset.kind === 'resource' && cachedResourceMetadata === undefined}
 					<Tooltip class={'pr-1 flex items-center justify-center'}>
 						<AlertTriangle size={16} class="text-orange-500" />
-						<svelte:fragment slot="text">Could not find resource</svelte:fragment>
+						{#snippet text()}
+							Could not find resource
+						{/snippet}
 					</Tooltip>
 				{:else if isSelected && assetCanBeExplored(data.asset, cachedResourceMetadata) && !$userStore?.operator}
 					<div transition:slide={{ axis: 'x', duration: 100 }}>
@@ -311,13 +287,13 @@
 							noText
 							buttonVariant="accent"
 							s3FilePicker={flowGraphAssetsCtx?.val.s3FilePicker}
-							dbManagerDrawer={globalDbManagerDrawer.val}
+							workspace={flowGraphAssetsCtx?.val.workspace}
 							_resourceMetadata={cachedResourceMetadata}
 						/>
 					</div>
 				{/if}
 			</div>
-			<svelte:fragment slot="text">
+			{#snippet text()}
 				{#if usageCount !== undefined}
 					Used in {pluralize(usageCount, 'step')}<br />
 				{/if}
@@ -338,7 +314,7 @@
 					{formatAssetKind({ ...data.asset, metadata: cachedResourceMetadata })}</span
 				>
 				<AssetColumnBadges columns={assetColumns} disableTooltip />
-			</svelte:fragment>
+			{/snippet}
 		</Tooltip>
 	{/snippet}
 </NodeWrapper>

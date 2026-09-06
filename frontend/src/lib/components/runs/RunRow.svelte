@@ -7,10 +7,9 @@
 		truncateHash,
 		truncateRev,
 		isScriptPreview,
-		isJobSelectable,
 		msToReadableTime,
 		isFlowPreview,
-		type RunsSelectionMode,
+		getJobKindDisplayLabel,
 		getJobKindIcon
 	} from '$lib/utils'
 	import { Button } from '../common'
@@ -39,7 +38,7 @@
 		containsLabel?: boolean
 		showTag?: boolean
 		activeLabel: string | null
-		selectionMode?: RunsSelectionMode | false
+		manualSelectionMode?: undefined | 'cancel' | 'rerun' | 'resolve'
 	}
 
 	let {
@@ -49,7 +48,7 @@
 		containsLabel = false,
 		showTag = true,
 		activeLabel,
-		selectionMode = false
+		manualSelectionMode
 	}: Props = $props()
 
 	let scheduleEditor: ScheduleEditor | undefined = $state(undefined)
@@ -68,36 +67,34 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	class={twMerge(
-		'hover:bg-surface-hover cursor-pointer',
-		selected ? 'bg-surface-accent-selected' : '',
-		'grid items-center h-full'
+		'cursor-pointer',
+		selected ? 'bg-surface-accent-selected' : 'hover:bg-surface-hover',
+		'grid items-center h-full',
+		'success' in job && job.resolved && 'opacity-60'
 	)}
-	class:grid-runs-table={!containsLabel && !selectionMode && showTag}
-	class:grid-runs-table-with-labels={containsLabel && !selectionMode && showTag}
-	class:grid-runs-table-selection={!containsLabel && selectionMode && showTag}
-	class:grid-runs-table-with-labels-selection={containsLabel && selectionMode && showTag}
-	class:grid-runs-table-no-tag={!containsLabel && !selectionMode && !showTag}
-	class:grid-runs-table-with-labels-no-tag={containsLabel && !selectionMode && !showTag}
-	class:grid-runs-table-selection-no-tag={!containsLabel && selectionMode && !showTag}
-	class:grid-runs-table-with-labels-selection-no-tag={containsLabel && selectionMode && !showTag}
+	class:grid-runs-table={!containsLabel && !manualSelectionMode && showTag}
+	class:grid-runs-table-with-labels={containsLabel && !manualSelectionMode && showTag}
+	class:grid-runs-table-selection={!containsLabel && manualSelectionMode && showTag}
+	class:grid-runs-table-with-labels-selection={containsLabel && manualSelectionMode && showTag}
+	class:grid-runs-table-no-tag={!containsLabel && !manualSelectionMode && !showTag}
+	class:grid-runs-table-with-labels-no-tag={containsLabel && !manualSelectionMode && !showTag}
+	class:grid-runs-table-selection-no-tag={!containsLabel && manualSelectionMode && !showTag}
+	class:grid-runs-table-with-labels-selection-no-tag={containsLabel &&
+		manualSelectionMode &&
+		!showTag}
 	style="width: {containerWidth}px"
-	onclick={() => {
-		if (!selectionMode || isJobSelectable(selectionMode)(job)) {
-			dispatch('select')
-		}
-	}}
+	onclick={() => dispatch('select')}
+	oncontextmenu={(e) => !selected && dispatch('select')}
 >
 	<!-- Selection column (only when in selection mode) -->
-	{#if selectionMode}
-		<div class="flex items-center justify-center">
-			<div class="w-4 h-4">
-				<input type="checkbox" checked={selected} disabled={!isJobSelectable(selectionMode)(job)} />
-			</div>
+	{#if manualSelectionMode}
+		<div class="w-4 h-4 ml-4 pointer-events-none">
+			<input type="checkbox" checked={selected} />
 		</div>
 	{/if}
 
 	<!-- Status -->
-	<div class="flex items-center justify-start pl-2">
+	<div class="flex items-center justify-start pl-4">
 		<JobStatusIcon {job} {isExternal} />
 	</div>
 
@@ -107,7 +104,7 @@
 			{#if job}
 				{#if ('started_at' in job && job.started_at) || ('completed_at' in job && job.completed_at)}
 					{#if 'completed_at' in job && job.completed_at}
-						{isJobRecent ? 'Ended' : ''}
+						{isJobRecent ? (job.canceled ? 'Canceled' : 'Ended') : ''}
 						<TimeAgo bind:isRecent={isJobRecent} agoOnlyIfRecent date={job.completed_at ?? ''} />
 					{:else if 'started_at' in job && job.started_at}
 						{isJobRecent ? 'Started' : ''}
@@ -124,12 +121,14 @@
 					{displayDate(job.scheduled_for)}<Clock size={12} />
 				{:else if job.canceled}
 					{#if job.type == 'CompletedJob'}
-						Cancelled <TimeAgo agoOnlyIfRecent date={job.created_at || ''} />
+						Canceled <TimeAgo agoOnlyIfRecent date={job.created_at || ''} />
 					{:else}
 						Cancelling job... (created <TimeAgo agoOnlyIfRecent date={job.created_at || ''} />)
 					{/if}
 				{:else if `scheduled_for` in job && job.scheduled_for && forLater(job.scheduled_for)}
 					Waiting executor (<TimeAgo agoOnlyIfRecent date={job.scheduled_for || ''} />)
+				{:else if 'running' in job && job.running && job.suspend}
+					Suspended (created <TimeAgo agoOnlyIfRecent date={job.created_at || ''} />)
 				{:else}
 					Waiting executor (<TimeAgo agoOnlyIfRecent date={job.created_at || ''} />)
 				{/if}
@@ -163,7 +162,7 @@
 					{#snippet text()}
 						<span>
 							{#if job && job.job_kind}
-								{job.job_kind}
+								{getJobKindDisplayLabel(job.job_kind, job.script_path)}
 							{/if}
 							{#if job && job.is_flow_step && job.parent_job}
 								<br /> Step of flow

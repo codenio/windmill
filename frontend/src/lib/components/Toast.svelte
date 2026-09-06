@@ -10,13 +10,13 @@
 
 		let hover = Object.values(toastStates).some((state) => state.hover)
 		for (const toastId in toastStates) {
-			const state = toastStates[toastId]
+			const st = toastStates[toastId]
 			if (hover) continue
-			if (state.elapsed >= state.duration) {
+			if (st.elapsed >= st.duration) {
 				delete toastStates[toastId]
 				continue
 			}
-			state.elapsed += delta
+			st.elapsed += delta
 		}
 		lastTime = time
 
@@ -36,18 +36,16 @@
 			})
 		}
 	}
-
-	export type ToastType = AlertType
 </script>
 
 <script lang="ts">
 	import { toast } from '@zerodevx/svelte-toast'
 	import Button from './common/button/Button.svelte'
-	import { type ToastAction } from '$lib/toast'
+	import { type ToastAction, type ToastType } from '$lib/toast'
 	import { processMessage } from './toast'
 	import { onDestroy, untrack } from 'svelte'
 	import { twMerge } from 'tailwind-merge'
-	import { classes, icons, type AlertType } from '$lib/components/common/alert/model'
+	import { classes, icons } from '$lib/components/common/alert/model'
 
 	interface Props {
 		message: string
@@ -84,22 +82,30 @@
 		}
 	})
 
-	let color = classes[type]
+	// Defensive: a miscall like `sendUserToast(msg, err)` passes a non-
+	// AlertType as `type`. Without a fallback the `classes[type]` lookup
+	// returns undefined and `color.descriptionClass` throws — and because
+	// the toast renders inside the root layout, that crashes the whole
+	// page instead of just dropping one toast. Coerce anything unknown to
+	// 'error' (a bad type almost always accompanies an error path).
+	const safeType: ToastType = untrack(() => (type in classes ? type : 'error'))
+
+	let color = classes[safeType]
 
 	let containerClass = {
 		success: 'toast-success',
 		error: 'toast-error',
 		info: 'toast-info',
 		warning: 'toast-warning'
-	}[type]
+	}[safeType]
 
-	let Icon = $derived(icons[type])
+	let Icon = icons[safeType]
 
 	let showMore = $state(false)
 	const MAX_MSG_LEN = 160
-	let isLongMessage = $derived(message.length > MAX_MSG_LEN)
+	let isLongMessage = $derived((message ?? '').length > MAX_MSG_LEN)
 	let displayMessage = $derived(
-		isLongMessage && !showMore ? message.slice(0, MAX_MSG_LEN) + '... ' : message
+		isLongMessage && !showMore ? (message ?? '').slice(0, MAX_MSG_LEN) + '... ' : (message ?? '')
 	)
 	// let hover = $derived(Object.values(toastStates).some((state) => state.hover))
 </script>

@@ -1,8 +1,22 @@
+/**
+ * LEGACY: These query builders generate full SQL on the frontend.
+ * They exist only for backwards compatibility with Database Studio (dbexplorercomponent) apps
+ * whose policies were generated with expanded SQL digests.
+ *
+ * New code (Database Manager) should use WM_INTERNAL_DB markers instead,
+ * which are expanded server-side by the Rust query_builders module.
+ * See: dbOps.ts → dbTableOpsWithPreviewScripts()
+ */
 import type { AppInput, RunnableByName } from '$lib/components/apps/inputType'
 import { wrapDucklakeQuery } from '../../../../../ducklake'
 import type { DbType, DbInput } from '$lib/components/dbTypes'
 import { buildParameters } from '../utils'
-import { getLanguageByResourceType, type ColumnDef, buildVisibleFieldList } from '../utils'
+import {
+	getLanguageByResourceType,
+	type ColumnDef,
+	buildVisibleFieldList,
+	duckdbQuicksearchColumns
+} from '../utils'
 
 function makeSnowflakeSelectQuery(
 	table: string,
@@ -157,6 +171,19 @@ CASE WHEN :order_by = '${column.field}' AND :is_desc IS true THEN \`${column.fie
       ${columnDefs
 				.map((column) => {
 					if (breakingFeatures?.fixPgIntTypes) {
+						// Array types (e.g. json[], text[]) and the json type have no ordering
+						// operator in PostgreSQL. PostgreSQL type-checks every THEN branch of a
+						// CASE expression at plan time -- even branches whose WHEN condition is
+						// never true -- so a bare column reference in ORDER BY fails with
+						// "could not identify an ordering operator for type json[]".
+						// Force a text cast for these types to avoid the error.
+						const forceTextCast =
+							column.datatype?.includes('[]') || column.datatype?.toLowerCase() === 'json'
+						if (forceTextCast) {
+							return `
+      ${buildOrderBy({ field: column.field, is_desc: false, text_cast: true })},
+      ${buildOrderBy({ field: column.field, is_desc: true, text_cast: true })}`
+						}
 						return `
       ${buildOrderBy({ field: column.field, is_desc: false, text_cast: true, check_is_number: false })},
       ${buildOrderBy({ field: column.field, is_desc: false, text_cast: false, check_is_number: true })},
@@ -276,8 +303,8 @@ CASE WHEN :order_by = '${column.field}' AND :is_desc IS true THEN \`${column.fie
 				)
 				.join(',\n')}`
 
-			quicksearchCondition = `($quicksearch = '' OR CONCAT(${filteredColumns.join(
-				', '
+			quicksearchCondition = `($quicksearch = '' OR CONCAT(${duckdbQuicksearchColumns(
+				columnDefs
 			)}) ILIKE '%' || $quicksearch || '%')`
 
 			query += `SELECT ${filteredColumns.join(', ')} FROM ${table}\n`
@@ -337,7 +364,9 @@ export function getSelectInput(
 				? {
 						database: {
 							type: 'static',
-							value: `$res:${dbInput.resourcePath}`,
+							value: dbInput.resourcePath.startsWith('datatable://')
+								? dbInput.resourcePath
+								: `$res:${dbInput.resourcePath}`,
 							fieldType: 'object',
 							format: `resource-${dbType}`
 						}

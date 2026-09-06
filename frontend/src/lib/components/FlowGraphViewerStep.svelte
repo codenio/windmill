@@ -4,6 +4,7 @@
 	import IconedPath from './IconedPath.svelte'
 	import type { FlowModule } from '$lib/gen'
 	import { Badge, Button, Drawer, DrawerContent } from './common'
+	import { Link } from 'lucide-svelte'
 	import { Highlight } from 'svelte-highlight'
 	import ObjectViewer from './propertyPicker/ObjectViewer.svelte'
 	import typescript from 'svelte-highlight/languages/typescript'
@@ -11,7 +12,7 @@
 	import SchemaViewer from './SchemaViewer.svelte'
 	import { scriptPathToHref } from '$lib/scripts'
 	import { cleanExpr, copyToClipboard } from '$lib/utils'
-	import { hubBaseUrlStore } from '$lib/stores'
+	import { hubBaseUrlStore, workspaceStore } from '$lib/stores'
 
 	import { twMerge } from 'tailwind-merge'
 	import FlowModuleScript from './flows/content/FlowModuleScript.svelte'
@@ -19,17 +20,31 @@
 	import HighlightTheme from './HighlightTheme.svelte'
 	import LanguageIcon from './common/languageIcons/LanguageIcon.svelte'
 
-	export let schema: any | undefined = undefined
+	interface Props {
+		schema?: any | undefined
+		stepDetail?: FlowModule | string | undefined
+		jobScriptHash?: string | undefined
+		hideDefaultInputs?: boolean
+		// The workspace the viewed flow belongs to (differs from the nav workspace in fork/session
+		// editors); used to qualify resource links.
+		workspace?: string
+	}
 
-	export let stepDetail: FlowModule | string | undefined = undefined
-	export let jobScriptHash: string | undefined = undefined
-	let codeViewer: Drawer
+	let {
+		schema = undefined,
+		stepDetail = undefined,
+		jobScriptHash = undefined,
+		hideDefaultInputs = false,
+		workspace = undefined
+	}: Props = $props()
+	let ws = $derived(workspace ?? $workspaceStore)
+	let codeViewer: Drawer | undefined = $state()
 </script>
 
 <HighlightTheme />
 
 <Drawer bind:this={codeViewer} size="900px">
-	<DrawerContent title={'Expanded Code'} on:close={codeViewer.closeDrawer}>
+	<DrawerContent title={'Expanded Code'} on:close={codeViewer?.closeDrawer}>
 		{#if stepDetail && typeof stepDetail != 'string'}
 			{#if stepDetail.value.type == 'script'}
 				<div class="mb-4">
@@ -47,17 +62,10 @@
 
 					<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
 				</div>
-				{#if stepDetail.value.path.startsWith('hub/')}
-					<div class="mt-6">
-						<h3 class="mb-1 mt-6 text-xs font-semibold text-emphasis">Code</h3>
-						<iframe
-							class="w-full h-full text-sm"
-							title="embedded script from hub"
-							frameborder="0"
-							src="{$hubBaseUrlStore}/embed/script/{stepDetail.value?.path?.substring(4)}"
-						></iframe>
-					</div>
-				{/if}
+				<div class="mt-6">
+					<h3 class="mb-1 mt-6 text-xs font-semibold text-emphasis">Code</h3>
+					<FlowModuleScript path={stepDetail.value.path} hash={jobScriptHash} />
+				</div>
 			{:else if stepDetail.value.type == 'rawscript'}
 				<div class="text-2xs mb-4 mt-2">
 					<h3 class="mb-1 text-xs font-semibold text-emphasis">Step inputs</h3>
@@ -89,10 +97,8 @@
 <div class={twMerge('p-2 overflow-y-scroll')}>
 	{#if stepDetail == undefined}
 		<div>
-			<p class="font-medium text-secondary text-center pt-4 pb-8">
-				Click on a step to see its details
-			</p>
-			{#if schema}
+			<p class="text-secondary text-xs italic px-2 pt-2"> Click on a step to see its details </p>
+			{#if schema && !hideDefaultInputs}
 				<h3 class="mb-2 font-semibold">Flow Inputs</h3>
 				<SchemaViewer {schema} />
 			{/if}
@@ -183,7 +189,7 @@
 					<Button
 						unifiedSize="sm"
 						variant="subtle"
-						onClick={codeViewer.openDrawer}
+						onClick={codeViewer?.openDrawer}
 						startIcon={{ icon: Expand }}>Expand</Button
 					>
 				</div>
@@ -214,29 +220,29 @@
 					<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
 				</div>
 			{/if}
-			{#if stepDetail.value.path.startsWith('hub/')}
-				<div class="flex flex-col grow">
-					<div class="mb-1 mt-6 flex justify-between items-center">
-						<h3 class="font-semibold text-xs text-emphasis">Code</h3>
-						<Button
-							unifiedSize="sm"
-							variant="subtle"
-							onClick={codeViewer.openDrawer}
-							startIcon={{ icon: Expand }}>Expand</Button
-						>
-					</div>
-					<iframe
-						class="w-full grow text-sm h-full"
-						title="embedded script from hub"
-						frameborder="0"
-						src="{$hubBaseUrlStore}/embed/script/{stepDetail.value?.path?.substring(4)}"
-					></iframe>
-				</div>
-			{:else}
-				<FlowModuleScript path={stepDetail.value.path} hash={jobScriptHash} />
-			{/if}
+			<div class="mb-1 mt-6 flex justify-between items-center">
+				<h3 class="font-semibold text-xs text-emphasis">Code</h3>
+				<Button
+					unifiedSize="sm"
+					variant="subtle"
+					onClick={codeViewer?.openDrawer}
+					startIcon={{ icon: Expand }}>Expand</Button
+				>
+			</div>
+			<FlowModuleScript path={stepDetail.value.path} hash={jobScriptHash} />
 		{:else if stepDetail.value.type == 'aiagent'}
 			<div class="text-xs">
+				{#if stepDetail.value.agent}
+					<div class="mb-1 flex items-center gap-1.5 text-2xs text-secondary">
+						<Link size={12} class="shrink-0" />
+						<span class="shrink-0">Linked to</span>
+						<a
+							class="truncate font-medium"
+							href={`/resources?path=${stepDetail.value.agent}&workspace=${ws}`}
+							title={stepDetail.value.agent}>{stepDetail.value.agent}</a
+						>
+					</div>
+				{/if}
 				<h3 class="mb-1 font-semibold mt-2 text-xs text-emphasis">Step inputs</h3>
 				<InputTransformsViewer inputTransforms={stepDetail?.value?.input_transforms ?? {}} />
 			</div>

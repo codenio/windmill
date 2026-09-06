@@ -37,7 +37,11 @@ pub fn parse_csharp_sig_meta(code: &str) -> anyhow::Result<CsharpMainSigMeta> {
 
     // Traverse the AST to find the Main method signature
     let main_sig = find_main_signature(root_node, code);
-    let no_main_func = Some(main_sig.is_none());
+    let auto_kind = if main_sig.is_none() {
+        Some("lib".to_string())
+    } else {
+        None
+    };
     let mut is_async = false;
     let mut is_public = false;
     let mut returns_void = false;
@@ -73,7 +77,7 @@ pub fn parse_csharp_sig_meta(code: &str) -> anyhow::Result<CsharpMainSigMeta> {
                         }
                     }
                     let (otyp, typ, name) = parse_csharp_typ(p_list_node, code)?;
-                    args.push(Arg { name, otyp, typ, default, has_default: false, oidx: None });
+                    args.push(Arg { name, otyp, typ, default, has_default: false, oidx: None, otyp_inferred: false });
                 }
             }
         }
@@ -84,7 +88,8 @@ pub fn parse_csharp_sig_meta(code: &str) -> anyhow::Result<CsharpMainSigMeta> {
         star_kwargs: false,
         args,
         has_preprocessor: None,
-        no_main_func,
+        auto_kind,
+        ..Default::default()
     };
 
     Ok(CsharpMainSigMeta { is_async, returns_void, class_name, main_sig, is_public })

@@ -1,5 +1,5 @@
-// deno-lint-ignore-file no-explicit-any
-import { Command, log } from "../../../deps.ts";
+import { Command } from "@cliffy/command";
+import * as log from "../../core/log.ts";
 import * as wmill from "../../../gen/services.gen.ts";
 
 import { requireLogin } from "../../core/auth.ts";
@@ -16,6 +16,10 @@ interface HubResourceType {
   schema: string;
   app: string;
   description: string;
+  is_fileset?: boolean;
+  // Absent from hubs predating the column, so a missing value is "ordinary type",
+  // not "unset it".
+  format_extension?: string | null;
 }
 
 export async function pull(opts: GlobalOptions) {
@@ -114,7 +118,9 @@ export async function pull(opts: GlobalOptions) {
           y.name === x.name &&
           typeof y.schema !== "string" &&
           deepEqual(y.schema, x.schema) &&
-          y.description === x.description
+          y.description === x.description &&
+          (y.is_fileset ?? false) === (x.is_fileset ?? false) &&
+          (y.format_extension ?? null) === (x.format_extension ?? null)
       )
     ) {
       log.info("skipping " + x.name + " (same as current)");

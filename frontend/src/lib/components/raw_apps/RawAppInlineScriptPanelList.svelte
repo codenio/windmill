@@ -1,21 +1,67 @@
 <script lang="ts">
 	import { Button } from '$lib/components/common'
 	import { Plus, File, AlertCircle, AlertTriangle } from 'lucide-svelte'
-	import PanelSection from '../apps/editor/settingsPanel/common/PanelSection.svelte'
+	import PanelSection, {
+		SUBTLE_PANEL_TITLE
+	} from '../apps/editor/settingsPanel/common/PanelSection.svelte'
 	import Popover from '../Popover.svelte'
 
 	import type { Runnable } from '../apps/inputType'
-	import { getNextId } from '$lib/components/flows/idUtils'
+	import { getNextId, forbiddenIds } from '$lib/components/flows/idUtils'
 	import { rawAppLintStore } from './lintStore'
 	import RunnableRow from './RunnableRow.svelte'
+	import { sendUserToast } from '$lib/toast'
 
 	interface Props {
+		/** Read-only; the editor switches selection through `onSelect`. */
 		selectedRunnable: string | undefined
 		runnables: Record<string, Runnable>
 		onSelect?: (id: string) => void
+		/** The editor deletes and moves the selection off it in one tick. Required:
+		 * the row's Delete does nothing without it. */
+		onDelete: (id: string) => void
 	}
 
-	let { selectedRunnable = $bindable(), runnables, onSelect }: Props = $props()
+	let { selectedRunnable, runnables, onSelect, onDelete }: Props = $props()
+
+	let editingId: string | undefined = $state(undefined)
+
+	const validIdPattern = /^[a-zA-Z_][a-zA-Z0-9_]*$/
+
+	function renameRunnable(oldId: string, newId: string) {
+		if (newId === oldId) {
+			editingId = undefined
+			return
+		}
+		if (!newId) {
+			sendUserToast('ID cannot be empty', true)
+			editingId = undefined
+			return
+		}
+		if (!validIdPattern.test(newId)) {
+			sendUserToast('ID must be a valid identifier (letters, digits, underscores)', true)
+			editingId = undefined
+			return
+		}
+		if (newId in runnables) {
+			sendUserToast(`ID "${newId}" is already in use`, true)
+			editingId = undefined
+			return
+		}
+		if (forbiddenIds.includes(newId)) {
+			sendUserToast(`"${newId}" is a reserved keyword`, true)
+			editingId = undefined
+			return
+		}
+
+		runnables[newId] = runnables[oldId]
+		delete runnables[oldId]
+
+		if (selectedRunnable === oldId) {
+			onSelect?.(newId)
+		}
+		editingId = undefined
+	}
 
 	// Subscribe to lint store for reactive updates
 	let lintSnapshot = $state(rawAppLintStore.getSnapshot())
@@ -43,12 +89,17 @@
 			type: 'inline'
 		}
 
-		selectedRunnable = nid
 		onSelect?.(nid)
 	}
 </script>
 
-<PanelSection size="sm" fullHeight={false} title="backend" id="app-editor-runnable-panel">
+<PanelSection
+	size="sm"
+	fullHeight={false}
+	title="backend"
+	titleClass={SUBTLE_PANEL_TITLE}
+	id="app-editor-runnable-panel"
+>
 	{#snippet action()}
 		<div class="flex flex-row gap-1">
 			<Button
@@ -75,16 +126,12 @@
 								{id}
 								{runnable}
 								isSelected={selectedRunnable === id}
-								onSelect={() => {
-									selectedRunnable = id
-									onSelect?.(id)
-								}}
-								onDelete={() => {
-									delete runnables[id]
-									if (selectedRunnable === id) {
-										selectedRunnable = undefined
-									}
-								}}
+								isEditing={editingId === id}
+								onSelect={() => onSelect?.(id)}
+								onDelete={() => onDelete(id)}
+								onRename={(newId) => renameRunnable(id, newId)}
+								onRequestEdit={() => (editingId = id)}
+								onCancelEdit={() => (editingId = undefined)}
 							/>
 						{/if}
 					{/each}

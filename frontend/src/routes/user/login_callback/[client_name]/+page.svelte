@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$lib/navigation'
+	import { applyDarkModeVariant } from '$lib/darkModeVariant'
 	import { sendUserToast } from '$lib/toast'
 	import { onMount } from 'svelte'
 	import { UserService, WorkspaceService } from '$lib/gen'
@@ -8,6 +9,7 @@
 	import { userStore, usersWorkspaceStore, workspaceStore } from '$lib/stores'
 	import { getUserExt } from '$lib/user'
 	import { logoutWithRedirect } from '$lib/logoutKit'
+	import { isValidLogoutRedirect } from '$lib/logoutRedirect'
 	import { parseQueryParams } from '$lib/utils'
 	import { page } from '$app/state'
 	import { isCloudHosted } from '$lib/cloud'
@@ -20,18 +22,17 @@
 	let state = page.url.searchParams.get('state') ?? undefined
 
 	onMount(async () => {
-		// const closeCookie = getAndDeleteCookie('close')
-		// console.log('closeCookie', closeCookie)
-		const rd = localStorage.getItem('rd')
-		if (rd) {
+		const rawRd = localStorage.getItem('rd')
+		if (rawRd) {
 			localStorage.removeItem('rd')
 		}
-		const cookieCloseUponLogin = getCookie('close') == 'true'
-		const closeUponLogin = cookieCloseUponLogin ?? localStorage.getItem('closeUponLogin') == 'true'
+		const rd = rawRd?.startsWith('http') && !isValidLogoutRedirect(rawRd) ? null : rawRd
+		const closeUponLogin =
+			getCookie('close') == 'true' || localStorage.getItem('closeUponLogin') == 'true'
 		if (error) {
 			sendUserToast(`Error trying to login with ${clientName} ${error}`, true)
 			if (closeUponLogin) {
-				goto('/user/close')
+				closeUponLoginError(`Error trying to login with ${clientName} ${error}`)
 				return
 			}
 			await logoutWithRedirect(rd ?? undefined)
@@ -40,7 +41,7 @@
 				await UserService.loginWithOauth({ requestBody: { code, state }, clientName })
 			} catch (e) {
 				if (closeUponLogin) {
-					goto('/user/close')
+					closeUponLoginError(e.body ?? e.message)
 					return
 				}
 				await logoutWithRedirect(rd ?? undefined)
@@ -63,7 +64,10 @@
 				try {
 					const globalUserInfo = await UserService.globalWhoami()
 					if (globalUserInfo.first_time_user) {
-						goto('/user/onboarding')
+						// `rd` rides along: someone arriving from a shared hub project signs up with a
+						// destination already in hand, and dropping it here strands them in an empty
+						// workspace with no sign of what they came to import.
+						goto(`/user/onboarding${rd ? `?rd=${encodeURIComponent(rd)}` : ''}`)
 						return
 					}
 				} catch (err) {
@@ -132,9 +136,20 @@
 	} else {
 		document.documentElement.classList.remove('dark')
 	}
+	// This route bypasses the (root) layout, so restore the variant class too.
+	applyDarkModeVariant()
 
 	function closeUponLoginSuccess() {
-		const message = { type: 'success' }
+		relayToOpener({ type: 'success' })
+	}
+
+	/** The popup is the only window that saw the server's answer, and it closes: a
+	 * refusal that stayed here would leave the page that opened it with nothing to show. */
+	function closeUponLoginError(error: string) {
+		relayToOpener({ type: 'error', error: typeof error === 'string' ? error : String(error) })
+	}
+
+	function relayToOpener(message: { type: 'success' } | { type: 'error'; error: string }) {
 		if (window.opener) {
 			window.opener.postMessage(message, '*')
 		} else {

@@ -7,12 +7,16 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use windmill_common::{db::UserDB, utils::StripPath, DB};
-use windmill_mcp::common::transform::apply_key_transformation;
+use windmill_mcp::common::schema::enrich_resource_schemas;
+use windmill_mcp::common::transform::transform_property_keys;
 use windmill_mcp::common::types::{
-    FlowInfo, HubScriptInfo, ResourceInfo, ResourceType, SchemaType, ScriptInfo,
+    FlowInfo, HubScriptInfo, ResourceInfo, ResourceType, SchemaType, ScriptInfo, WorkspaceInfo,
 };
-use windmill_mcp::server::{BackendResult, EndpointTool, ErrorData, McpBackend};
+use windmill_mcp::server::{
+    BackendResult, EndpointTool, ErrorData, McpBackend, McpRequest, PathFilter,
+};
 
+use crate::auth::AuthCache;
 use crate::db::ApiAuthed;
 use crate::jobs::{
     run_wait_result_flow_by_path_internal, run_wait_result_script_by_path_internal, RunJobQuery,
@@ -30,14 +34,20 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use windmill_mcp::server::{
-    LocalSessionManager, Runner, StreamableHttpServerConfig, StreamableHttpService,
+    LocalSessionManager, McpToken, MultiWorkspaceMcp, Runner, StreamableHttpServerConfig,
+    StreamableHttpService,
 };
 use windmill_mcp::WorkspaceId;
 
 use axum::{
-    extract::Path, http::Request, middleware::Next, response::Response, routing::get, Json, Router,
+    extract::{Extension, Path},
+    http::Request,
+    middleware::Next,
+    response::Response,
+    routing::get,
+    Json, Router,
 };
-use windmill_common::error::JsonResult;
+use windmill_common::{auth::hash_token, db::GatewayWorkspaceId, error::JsonResult};
 
 // McpAuth impl for ApiAuthed is in windmill-api-auth (same crate as the type)
 
@@ -47,11 +57,17 @@ pub struct WindmillBackend {
     pub db: DB,
     pub user_db: UserDB,
     pub base_internal_url: String,
+    pub auth_cache: Arc<AuthCache>,
 }
 
 impl WindmillBackend {
-    pub fn new(db: DB, user_db: UserDB, base_internal_url: String) -> Self {
-        Self { db, user_db, base_internal_url }
+    pub fn new(
+        db: DB,
+        user_db: UserDB,
+        base_internal_url: String,
+        auth_cache: Arc<AuthCache>,
+    ) -> Self {
+        Self { db, user_db, base_internal_url, auth_cache }
     }
 }
 
@@ -64,11 +80,19 @@ impl McpBackend for WindmillBackend {
         auth: &ApiAuthed,
         workspace_id: &str,
         favorites_only: bool,
+        path_filter: Option<PathFilter<'_>>,
     ) -> BackendResult<Vec<ScriptInfo>> {
         let scope_type = if favorites_only { "favorites" } else { "all" };
-        get_items::<ScriptInfo>(&self.user_db, auth, workspace_id, scope_type, "script")
-            .await
-            .map_err(|e| ErrorData::internal_error(e.message, None))
+        get_items::<ScriptInfo>(
+            &self.user_db,
+            auth,
+            workspace_id,
+            scope_type,
+            "script",
+            path_filter,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.message, None))
     }
 
     async fn list_flows(
@@ -76,11 +100,19 @@ impl McpBackend for WindmillBackend {
         auth: &ApiAuthed,
         workspace_id: &str,
         favorites_only: bool,
+        path_filter: Option<PathFilter<'_>>,
     ) -> BackendResult<Vec<FlowInfo>> {
         let scope_type = if favorites_only { "favorites" } else { "all" };
-        get_items::<FlowInfo>(&self.user_db, auth, workspace_id, scope_type, "flow")
-            .await
-            .map_err(|e| ErrorData::internal_error(e.message, None))
+        get_items::<FlowInfo>(
+            &self.user_db,
+            auth,
+            workspace_id,
+            scope_type,
+            "flow",
+            path_filter,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.message, None))
     }
 
     async fn list_resource_types(
@@ -164,89 +196,15 @@ impl McpBackend for WindmillBackend {
         let mut schema_obj = schema.clone();
 
         // Replace invalid char in property key with underscore
-        let replacements: Vec<(String, String, Value)> = schema_obj
-            .properties
-            .iter()
-            .filter_map(|(key, value)| {
-                if key.chars().any(|c| !c.is_alphanumeric() && c != '_') {
-                    let new_key = apply_key_transformation(key);
-                    Some((key.clone(), new_key, value.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        transform_property_keys(&mut schema_obj);
 
-        for (old_key, new_key, value) in replacements {
-            schema_obj.properties.remove(&old_key);
-            schema_obj.properties.insert(new_key, value);
-        }
-
-        for (_key, prop_value) in schema_obj.properties.iter_mut() {
-            if let Value::Object(prop_map) = prop_value {
-                if let Some(format_value) = prop_map.get("format") {
-                    if let Value::String(format_str) = format_value {
-                        if format_str.starts_with("resource-") {
-                            let resource_type_key =
-                                format_str.split("-").last().unwrap_or_default().to_string();
-                            let resource_type = resources_types
-                                .iter()
-                                .find(|rt| rt.name == resource_type_key);
-                            let resource_type_obj = resource_type.cloned();
-
-                            if let Some(resource_cache) = resources_cache.get(&resource_type_key) {
-                                let resources_count = resource_cache.len();
-                                let description = match resource_type_obj {
-                                    Some(resource_type_obj) => format!(
-                                        "This is a resource named `{}` with the following description: `{}`.\\nThe path of the resource should be used to specify the resource.\\n{}",
-                                        resource_type_obj.name,
-                                        resource_type_obj.description.as_deref().unwrap_or("No description"),
-                                        if resources_count == 0 {
-                                            "This resource does not have any available instances, you should create one from your windmill workspace."
-                                        } else if resources_count > 1 {
-                                            "This resource has multiple available instances, you should precisely select the one you want to use."
-                                        } else {
-                                            "There is 1 resource available."
-                                        }
-                                    ),
-                                    None => "An object parameter.".to_string(),
-                                };
-                                prop_map.insert(
-                                    "type".to_string(),
-                                    Value::String("string".to_string()),
-                                );
-                                prop_map
-                                    .insert("description".to_string(), Value::String(description));
-                                if resources_count > 0 {
-                                    let resources_description = resource_cache
-                                        .iter()
-                                        .map(|resource| {
-                                            format!(
-                                                "{}: $res:{}",
-                                                resource
-                                                    .description
-                                                    .as_deref()
-                                                    .unwrap_or("No title"),
-                                                resource.path
-                                            )
-                                        })
-                                        .collect::<Vec<String>>()
-                                        .join("\\n");
-
-                                    prop_map.insert(
-                                        "description".to_string(),
-                                        Value::String(format!(
-                                            "{}\\nHere are the available resources, in the format title:path. Title can be empty. Path should be used to specify the resource:\\n{}",
-                                            prop_map.get("description").unwrap_or(&Value::String("No description".to_string())),
-                                            resources_description
-                                        )),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Enrich every resource reference in the schema — including those
+        // inside `items`, nested `properties`, etc. — with a description
+        // listing the available resources. Both shapes are handled:
+        //   { type: "object", format: "resource-<name>" }   (top-level scalar)
+        //   { type: "resource", resourceType: "<name>" }    (inside list items)
+        for prop_value in schema_obj.properties.values_mut() {
+            enrich_resource_schemas(prop_value, resources_cache, resources_types);
         }
 
         schema_obj
@@ -258,8 +216,11 @@ impl McpBackend for WindmillBackend {
         workspace_id: &str,
         path: &str,
         args: Value,
+        request: &McpRequest<'_>,
     ) -> BackendResult<Value> {
-        let push_args = prepare_push_args(args);
+        let push_args = prepare_push_args(&self.db, workspace_id, path, false, args, request)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let result = run_wait_result_script_by_path_internal(
             self.db.clone(),
@@ -282,8 +243,11 @@ impl McpBackend for WindmillBackend {
         workspace_id: &str,
         path: &str,
         args: Value,
+        request: &McpRequest<'_>,
     ) -> BackendResult<Value> {
-        let push_args = prepare_push_args(args);
+        let push_args = prepare_push_args(&self.db, workspace_id, path, true, args, request)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let result = run_wait_result_flow_by_path_internal(
             self.db.clone(),
@@ -324,15 +288,18 @@ impl McpBackend for WindmillBackend {
             args_map,
             &endpoint_tool.path_params_schema,
         )?;
-        let query_string = build_query_string(args_map, &endpoint_tool.query_params_schema);
+        let query_string = build_query_string(
+            args_map,
+            &endpoint_tool.query_params_schema,
+            &endpoint_tool.query_field_renames,
+        );
         let full_url = format!(
             "{}/api{}{}",
             self.base_internal_url, path_template, query_string
         );
 
         // Prepare request body
-        let body_json =
-            build_request_body(&endpoint_tool.method, args_map, &endpoint_tool.body_schema);
+        let body_json = build_request_body(endpoint_tool, args_map)?;
 
         // Create and execute request
         let response = create_http_request(
@@ -363,6 +330,57 @@ impl McpBackend for WindmillBackend {
                 None,
             ))
         }
+    }
+
+    async fn list_accessible_workspaces(
+        &self,
+        auth: &ApiAuthed,
+    ) -> BackendResult<Vec<WorkspaceInfo>> {
+        // A superadmin can act in every workspace and often has no explicit `usr`
+        // membership row (matching resolve_workspace_auth, which authorizes any
+        // workspace for a superadmin), so list them all. Everyone else is limited
+        // to the workspaces they are a member of.
+        let workspaces = if auth.is_admin {
+            sqlx::query_as!(
+                WorkspaceInfo,
+                "SELECT id, name FROM workspace WHERE deleted = false ORDER BY name",
+            )
+            .fetch_all(&self.db)
+            .await
+        } else {
+            sqlx::query_as!(
+                WorkspaceInfo,
+                "SELECT workspace.id, workspace.name
+                 FROM workspace
+                 JOIN usr ON usr.workspace_id = workspace.id
+                 WHERE usr.email = $1 AND usr.disabled = false AND workspace.deleted = false
+                 ORDER BY workspace.name",
+                auth.email,
+            )
+            .fetch_all(&self.db)
+            .await
+        };
+
+        workspaces.map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+
+    async fn resolve_workspace_auth(
+        &self,
+        token: &str,
+        workspace_id: &str,
+    ) -> BackendResult<ApiAuthed> {
+        self.auth_cache
+            .get_authed(Some(workspace_id.to_string()), token)
+            .await
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "Access denied: token owner is not a member of workspace '{}'",
+                        workspace_id
+                    ),
+                    None,
+                )
+            })
     }
 
     fn all_endpoint_tools(&self) -> Vec<EndpointTool> {
@@ -406,7 +424,7 @@ pub async fn add_www_authenticate_header(
 
     // Only add header to 401 Unauthorized responses
     if response.status() == StatusCode::UNAUTHORIZED {
-        let base_url = BASE_URL.read().await;
+        let base_url = BASE_URL.load();
 
         // RFC 9728: The resource parameter contains the protected resource URL.
         // Clients derive the metadata URL by inserting /.well-known/oauth-protected-resource
@@ -428,29 +446,138 @@ pub async fn add_www_authenticate_header(
     }
 }
 
+/// Extract the bearer token from either the `Authorization` header or the
+/// `?token=` query parameter (MCP clients commonly pass it in the URL).
+fn extract_gateway_token(request: &Request<axum::body::Body>) -> Option<String> {
+    if let Some(token) = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        return Some(token.to_string());
+    }
+    request.uri().query().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes())
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.into_owned())
+    })
+}
+
+/// Middleware for gateway: resolve the MCP session mode from the Bearer token in
+/// the DB. A token bound to a workspace injects `WorkspaceId` (single-workspace
+/// mode). A workspace-less MCP token (`workspace_id IS NULL` with an `mcp:` scope)
+/// injects `MultiWorkspaceMcp` + `McpToken`, putting the runner in
+/// multi-workspace mode where tools take an explicit `workspace_id` argument.
+pub async fn extract_workspace_from_token(
+    Extension(db): Extension<DB>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(token) = extract_gateway_token(&request) {
+        let t_hash = hash_token(&token);
+        match sqlx::query!(
+            "SELECT workspace_id, scopes FROM token WHERE token_hash = $1 AND (expiration > NOW() OR expiration IS NULL)",
+            t_hash
+        )
+        .fetch_optional(&db)
+        .await
+        {
+            Ok(Some(row)) => match row.workspace_id {
+                Some(workspace_id) => {
+                    request
+                        .extensions_mut()
+                        .insert(GatewayWorkspaceId(workspace_id.clone()));
+                    request.extensions_mut().insert(WorkspaceId(workspace_id));
+                }
+                None => {
+                    // Only enter multi-workspace mode for genuine MCP tokens; a
+                    // full-privilege global token without mcp scope is rejected
+                    // by the runner's mcp-scope check anyway.
+                    let is_mcp = row
+                        .scopes
+                        .as_deref()
+                        .is_some_and(|s| s.iter().any(|scope| scope.starts_with("mcp:")));
+                    if is_mcp {
+                        request.extensions_mut().insert(MultiWorkspaceMcp);
+                        request.extensions_mut().insert(McpToken(token));
+                    }
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Gateway token workspace lookup failed: {}", e);
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
+/// Middleware that adds WWW-Authenticate header for gateway 401 responses
+pub async fn add_www_authenticate_header_gateway(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    use axum::http::StatusCode;
+    use windmill_common::BASE_URL;
+
+    let response = next.run(request).await;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let base_url = BASE_URL.load();
+        let resource_url = format!("{}/api/mcp/gateway", base_url);
+        let www_authenticate = format!("Bearer resource=\"{}\"", resource_url);
+
+        let (mut parts, body) = response.into_parts();
+        parts.headers.insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            www_authenticate
+                .parse()
+                .unwrap_or_else(|_| "Bearer".parse().unwrap()),
+        );
+        Response::from_parts(parts, body)
+    } else {
+        response
+    }
+}
+
 /// Setup the MCP server with HTTP transport
 pub async fn setup_mcp_server(
     db: DB,
     user_db: UserDB,
     base_internal_url: String,
+    auth_cache: Arc<AuthCache>,
 ) -> anyhow::Result<(Router, CancellationToken)> {
     let cancellation_token = CancellationToken::new();
     let session_manager = Arc::new(LocalSessionManager::default());
 
-    let backend = WindmillBackend::new(db, user_db, base_internal_url);
+    let backend = WindmillBackend::new(db, user_db, base_internal_url, auth_cache);
     let runner = Runner::new(backend);
 
-    let service_config = StreamableHttpServerConfig {
-        sse_keep_alive: Some(Duration::from_secs(15)),
-        stateful_mode: false,
-        cancellation_token: cancellation_token.clone(),
-        sse_retry: Some(Duration::from_secs(15)),
-    };
+    let service_config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(Some(Duration::from_secs(15)))
+        .with_sse_retry(Some(Duration::from_secs(15)))
+        .with_cancellation_token(cancellation_token.clone())
+        // Sessionless: every request re-resolves auth from its own bearer token, so
+        // there is no session to bind. This also makes legacy `initialize` clients
+        // take the same stateless path as 2026-07-28 ones.
+        .with_legacy_session_mode(false)
+        // rmcp's Host allowlist defaults to localhost, which guards an unauthenticated
+        // locally-bound server against DNS rebinding. This endpoint instead sits behind
+        // Windmill's own authentication, and is reached under whatever hostname the
+        // instance is served on, so keeping that default would reject every remote MCP
+        // client while adding nothing.
+        .disable_allowed_hosts()
+        // MCP bodies are ordinary API payloads — `createApp`/`updateApp` carry whole app
+        // sources — so they follow the instance's request size limit rather than rmcp's
+        // much smaller default, which would 413 them with no way to raise it.
+        .with_max_request_body_bytes(*crate::REQUEST_SIZE_LIMIT.read().await);
 
     let service =
         StreamableHttpService::new(move || Ok(runner.clone()), session_manager, service_config);
 
-    let router = Router::new().nest_service("/", service);
+    let router = Router::new().route_service("/", service);
     Ok((router, cancellation_token))
 }
 

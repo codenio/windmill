@@ -15,7 +15,13 @@
 	import Head from '$lib/components/table/Head.svelte'
 	import Tooltip from '$lib/components/Tooltip.svelte'
 	import WorkspaceGroup from '$lib/components/WorkerGroup.svelte'
-	import { WorkerService, type WorkerPing, ConfigService, SettingService, SettingsService } from '$lib/gen'
+	import {
+		WorkerService,
+		type WorkerPing,
+		ConfigService,
+		SettingService,
+		SettingsService
+	} from '$lib/gen'
 	import {
 		enterpriseLicense,
 		superadmin,
@@ -29,6 +35,7 @@
 	import {
 		ExternalLink,
 		LineChart,
+		Loader2,
 		Plus,
 		Search,
 		Tags,
@@ -38,6 +45,7 @@
 	import { onDestroy, onMount, untrack } from 'svelte'
 
 	import YAML from 'yaml'
+	import { cleanWorkerGroupConfig } from '$lib/components/worker_group'
 	import { DEFAULT_TAGS_WORKSPACES_SETTING } from '$lib/consts'
 	import AutoscalingEvents from '$lib/components/AutoscalingEvents.svelte'
 	import HttpAgentWorkerDrawer from '$lib/components/HttpAgentWorkerDrawer.svelte'
@@ -45,7 +53,6 @@
 	import Select from '$lib/components/select/Select.svelte'
 	import TextInput from '$lib/components/text_input/TextInput.svelte'
 	import TagList from '$lib/components/TagList.svelte'
-	import EEOnly from '$lib/components/EEOnly.svelte'
 	import MeltTooltip from '$lib/components/meltComponents/Tooltip.svelte'
 
 	let workers: WorkerPing[] | undefined = $state(undefined)
@@ -87,8 +94,11 @@
 		const minVersion = isAgent ? agentMinKeepAliveVersion : minKeepAliveVersion
 		if (minVersion) {
 			const minKeepAlive = parseVersion(minVersion)
-			if (minKeepAlive && (worker[0] < minKeepAlive[0] ||
-				(worker[0] === minKeepAlive[0] && worker[1] < minKeepAlive[1]))) {
+			if (
+				minKeepAlive &&
+				(worker[0] < minKeepAlive[0] ||
+					(worker[0] === minKeepAlive[0] && worker[1] < minKeepAlive[1]))
+			) {
 				return 'critical'
 			}
 		}
@@ -104,7 +114,13 @@
 	// Compute the worst version warning across alive workers only
 	let worstVersionWarning = $derived.by(() => {
 		if (!workers) return 'none' as VersionWarning
-		const priority: Record<VersionWarning, number> = { none: 0, note: 1, newer: 2, warning: 3, critical: 4 }
+		const priority: Record<VersionWarning, number> = {
+			none: 0,
+			note: 1,
+			newer: 2,
+			warning: 3,
+			critical: 4
+		}
 		let worst: VersionWarning = 'none'
 		for (const w of workers) {
 			// Only check alive workers (pinged within last 60 seconds, accounting for time since refresh)
@@ -178,19 +194,6 @@
 		}
 	}
 
-	let defaultTagPerWorkspace: boolean | undefined = $state(undefined)
-	let defaultTagWorkspaces: string[] = $state([])
-	async function loadDefaultTagsPerWorkspace() {
-		try {
-			defaultTagPerWorkspace = await WorkerService.isDefaultTagsPerWorkspace()
-			defaultTagWorkspaces = (await SettingService.getGlobal({
-				key: DEFAULT_TAGS_WORKSPACES_SETTING
-			})) as any
-		} catch (err) {
-			sendUserToast(`Could not load default tag per workspace setting: ${err}`, true)
-		}
-	}
-
 	function parseLicenseKey(key: string): {
 		valid: boolean
 		expiration?: Date
@@ -231,13 +234,11 @@
 			const { valid, expiration } = parseLicenseKey(licenseKey)
 
 			if (!valid && expiration) {
-				// License is expired
 				sendUserToast(
 					`Enterprise license key expired on ${expiration.toLocaleDateString()}. Please renew your license key to continue using Windmill.`,
 					true
 				)
 			} else if (expiration) {
-				// Check if expires within 7 days
 				const daysUntilExpiration = Math.floor(
 					(expiration.getTime() - Date.now()) / (1000 * 60 * 60 * 24)
 				)
@@ -250,8 +251,20 @@
 				}
 			}
 		} catch (err) {
-			// Silently fail - don't show errors for license check
 			console.error('Failed to check license expiration:', err)
+		}
+	}
+
+	let defaultTagPerWorkspace: boolean | undefined = $state(undefined)
+	let defaultTagWorkspaces: string[] = $state([])
+	async function loadDefaultTagsPerWorkspace() {
+		try {
+			defaultTagPerWorkspace = await WorkerService.isDefaultTagsPerWorkspace()
+			defaultTagWorkspaces = (await SettingService.getGlobal({
+				key: DEFAULT_TAGS_WORKSPACES_SETTING
+			})) as any
+		} catch (err) {
+			sendUserToast(`Could not load default tag per workspace setting: ${err}`, true)
 		}
 	}
 
@@ -268,11 +281,15 @@
 	loadWorkers()
 	loadWorkerGroups()
 	loadCustomTags()
-	SettingsService.backendVersion().then((v) => (serverVersion = v)).catch((e) => console.error('Failed to fetch server version:', e))
-	SettingService.getMinKeepAliveVersion().then((v) => {
-		minKeepAliveVersion = v.worker
-		agentMinKeepAliveVersion = v.agent
-	}).catch((e) => console.error('Failed to fetch min keep-alive version:', e))
+	SettingsService.backendVersion()
+		.then((v) => (serverVersion = v))
+		.catch((e) => console.error('Failed to fetch server version:', e))
+	SettingService.getMinKeepAliveVersion()
+		.then((v) => {
+			minKeepAliveVersion = v.worker
+			agentMinKeepAliveVersion = v.agent
+		})
+		.catch((e) => console.error('Failed to fetch min keep-alive version:', e))
 
 	onDestroy(() => {
 		if (intervalId) {
@@ -378,6 +395,101 @@
 		sendUserToast('Worker group(s) config successfully imported')
 
 		await loadWorkerGroups()
+	}
+
+	let yamlConfigDrawer: Drawer | undefined = $state(undefined)
+	let yamlConfigCode = $state('')
+	let yamlConfigOriginal = $state('')
+	let yamlDiffMode = $state(false)
+	let yamlSaving = $state(false)
+
+	function serializeWorkerGroupsAsYaml(groups: Record<string, any>): string {
+		const priorityGroups = ['default', 'native']
+		const sorted: Record<string, any> = {}
+		const entries = Object.entries(groups).sort(([a], [b]) => {
+			const ai = priorityGroups.indexOf(a)
+			const bi = priorityGroups.indexOf(b)
+			if (ai !== -1 && bi !== -1) return ai - bi
+			if (ai !== -1) return -1
+			if (bi !== -1) return 1
+			return a.localeCompare(b)
+		})
+		for (const [name, config] of entries) {
+			sorted[name] = cleanWorkerGroupConfig(config)
+		}
+		return YAML.stringify(sorted)
+	}
+
+	function openYamlDrawer() {
+		if (!workerGroups) {
+			return sendUserToast('No worker groups found', true)
+		}
+		yamlConfigCode = serializeWorkerGroupsAsYaml(workerGroups)
+		yamlConfigOriginal = yamlConfigCode
+		yamlDiffMode = false
+		yamlConfigDrawer?.toggleDrawer?.()
+	}
+
+	async function saveYamlConfig() {
+		yamlSaving = true
+		try {
+			const parsed = YAML.parse(yamlConfigCode)
+			if (typeof parsed !== 'object' || parsed == null || Array.isArray(parsed)) {
+				sendUserToast('YAML must be a map of worker group name to config', true)
+				return
+			}
+
+			const newGroups = new Map<string, any>()
+			for (const [name, config] of Object.entries(parsed)) {
+				if (typeof name !== 'string' || name.length === 0) {
+					sendUserToast('Worker group names must be non-empty strings', true)
+					return
+				}
+				newGroups.set(name, config ?? {})
+			}
+
+			const oldNames = new Set(Object.keys(workerGroups ?? {}))
+			const newNames = new Set(newGroups.keys())
+
+			// Protect well-known groups from accidental deletion
+			const protectedGroups = ['default', 'native']
+			const deletedProtected = protectedGroups.filter((g) => oldNames.has(g) && !newNames.has(g))
+			if (deletedProtected.length > 0) {
+				sendUserToast(
+					`Cannot remove well-known groups: ${deletedProtected.join(', ')}. Add them back to the YAML.`,
+					true
+				)
+				return
+			}
+
+			// Delete removed groups
+			for (const name of oldNames) {
+				if (!newNames.has(name)) {
+					await ConfigService.deleteConfig({ name: 'worker__' + name })
+				}
+			}
+
+			// Create or update groups
+			for (const [name, config] of newGroups) {
+				await ConfigService.updateConfig({
+					name: 'worker__' + name,
+					requestBody: config
+				})
+			}
+
+			yamlDiffMode = false
+			yamlConfigDrawer?.toggleDrawer?.()
+			sendUserToast('Worker group configs saved')
+			await loadWorkerGroups()
+		} catch (err) {
+			if (err instanceof Error) {
+				sendUserToast(err.message, true)
+			} else {
+				sendUserToast('Could not save worker group configs', true)
+			}
+		} finally {
+			yamlSaving = false
+		}
 	}
 
 	let queueMetricsDrawer: QueueMetricsDrawer | undefined = $state(undefined)
@@ -512,6 +624,7 @@
 			lang="yaml"
 			class="h-full"
 			fixedOverflowWidgets={false}
+			leadingChangeSync
 		/>
 		{#snippet actions()}
 			<Button
@@ -520,6 +633,76 @@
 				onClick={importConfigFromYaml}
 				disabled={!importConfigCode}>Import</Button
 			>
+		{/snippet}
+	</DrawerContent>
+</Drawer>
+
+<Drawer bind:this={yamlConfigDrawer} size="800px">
+	<DrawerContent
+		title="Worker groups config (YAML)"
+		on:close={() => {
+			yamlDiffMode = false
+			yamlConfigDrawer?.toggleDrawer?.()
+		}}
+	>
+		<p class="text-2xs text-tertiary mb-2">
+			Use this YAML to manage worker group configs as code.
+			<a
+				href="https://www.windmill.dev/docs/advanced/instance_settings#kubernetes-operator"
+				target="_blank"
+				rel="noopener noreferrer">Learn more <ExternalLink size={12} class="inline-block" /></a
+			>
+		</p>
+		{#if yamlDiffMode}
+			<div class="w-full h-full">
+				{#await import('$lib/components/DiffEditor.svelte')}
+					<div class="flex items-center justify-center h-full">
+						<Loader2 class="animate-spin" />
+					</div>
+				{:then Module}
+					<Module.default
+						open={true}
+						className="!h-full"
+						defaultLang="yaml"
+						defaultOriginal={yamlConfigOriginal}
+						defaultModified={yamlConfigCode}
+						readOnly
+						inlineDiff={true}
+					/>
+				{/await}
+			</div>
+		{:else}
+			<SimpleEditor
+				bind:code={yamlConfigCode}
+				lang="yaml"
+				class="h-full"
+				fixedOverflowWidgets={false}
+				leadingChangeSync
+			/>
+		{/if}
+		{#snippet actions()}
+			{#if yamlDiffMode}
+				<Button
+					unifiedSize="md"
+					variant="default"
+					disabled={yamlSaving}
+					onClick={() => {
+						yamlDiffMode = false
+					}}>Back to editor</Button
+				>
+				<Button unifiedSize="md" variant="accent" loading={yamlSaving} onClick={saveYamlConfig}
+					>Save</Button
+				>
+			{:else}
+				<Button
+					unifiedSize="md"
+					variant="accent"
+					disabled={!yamlConfigCode || yamlConfigCode === yamlConfigOriginal}
+					onClick={() => {
+						yamlDiffMode = true
+					}}>Review & Save</Button
+				>
+			{/if}
 		{/snippet}
 	</DrawerContent>
 </Drawer>
@@ -602,14 +785,8 @@
 						>
 						<Popover
 							floatingConfig={{ strategy: 'absolute', placement: 'bottom-start' }}
-							containerClasses="border rounded-lg shadow-lg p-4 bg-surface"
 							onKeyDown={(e) => {
-								if (
-									e.key === 'Enter' &&
-									newConfigName &&
-									newConfigName.trim() !== '' &&
-									$enterpriseLicense
-								) {
+								if (e.key === 'Enter' && newConfigName && newConfigName.trim() !== '') {
 									addConfig()
 								}
 							}}
@@ -627,38 +804,36 @@
 										unifiedSize="md"
 										startIcon={{ icon: Plus }}
 										nonCaptureEvent
-										disabled={!$enterpriseLicense}
-										dropdownItems={$enterpriseLicense
-											? [
-													{
-														label: 'Copy groups config as YAML',
-														onClick: () => {
-															if (!workerGroups) {
-																return sendUserToast('No worker groups found', true)
+										dropdownItems={[
+											...($enterpriseLicense
+												? [
+														{
+															label: 'Copy groups config as YAML',
+															onClick: () => {
+																if (!workerGroups) {
+																	return sendUserToast('No worker groups found', true)
+																}
+																navigator.clipboard.writeText(
+																	serializeWorkerGroupsAsYaml(workerGroups)
+																)
+																sendUserToast('Worker groups config copied to clipboard as YAML')
 															}
-
-															const workersConfig = Object.entries(workerGroups).map(
-																([name, config]) => ({
-																	name,
-																	...config
-																})
-															)
-															navigator.clipboard.writeText(YAML.stringify(workersConfig))
-															sendUserToast('Worker groups config copied to clipboard as YAML')
+														},
+														{
+															label: 'Import groups config from YAML',
+															onClick: () => {
+																importConfigDrawer?.toggleDrawer?.()
+															}
 														}
-													},
-													{
-														label: 'Import groups config from YAML',
-														onClick: () => {
-															importConfigDrawer?.toggleDrawer?.()
-														}
-													}
-												]
-											: undefined}
+													]
+												: []),
+											{
+												label: 'Edit all configs as YAML',
+												onClick: openYamlDrawer
+											}
+										]}
 									>
-										<span class="hidden md:block"
-											>New group config {!$enterpriseLicense ? '(EE)' : ''}</span
-										>
+										<span class="hidden md:block">New group config</span>
 
 										<Tooltip light>
 											Worker Group configs are propagated to every workers in the worker group
@@ -674,14 +849,11 @@
 										bind:value={newConfigName}
 									/>
 
-									{#if !$enterpriseLicense}
-										<EEOnly />
-									{/if}
 									<Button
 										unifiedSize="md"
 										variant="accent"
 										startIcon={{ icon: Plus }}
-										disabled={!newConfigName || !$enterpriseLicense}
+										disabled={!newConfigName}
 										on:click={addConfig}
 									>
 										Create
@@ -695,20 +867,20 @@
 
 			{#if worstVersionWarning === 'critical'}
 				<Alert type="error" title="Critical: Workers below minimum version" class="my-4">
-					One or more workers are running below the minimum supported version.
-					This may cause undefined behavior and cluster instability.
-					Upgrade these workers immediately—running workers this old is untested and strongly discouraged.
+					One or more workers are running below the minimum supported version. This may cause
+					undefined behavior and cluster instability. Upgrade these workers immediately—running
+					workers this old is untested and strongly discouraged.
 				</Alert>
 			{:else if worstVersionWarning === 'warning'}
 				<Alert type="warning" title="Workers significantly behind" class="my-4">
-					One or more workers are significantly behind the server ({serverVersion}) by more than 50 minor versions.
-					While they should still function, the risk of issues is elevated.
-					Further server upgrades may push these workers into a critical state. Upgrading is recommended.
+					One or more workers are significantly behind the server ({serverVersion}) by more than 50
+					minor versions. While they should still function, the risk of issues is elevated. Further
+					server upgrades may push these workers into a critical state. Upgrading is recommended.
 				</Alert>
 			{:else if worstVersionWarning === 'newer'}
 				<Alert type="warning" title="Workers ahead of server" class="my-4">
-					One or more workers are running a newer version than the server ({serverVersion}).
-					Workers should be at or behind the server version. This may cause undefined behavior.
+					One or more workers are running a newer version than the server ({serverVersion}). Workers
+					should be at or behind the server version. This may cause undefined behavior.
 				</Alert>
 			{/if}
 
@@ -764,6 +936,7 @@
 								shouldAutoOpenDrawer = ''
 							}}
 							onDeleted={handleWorkerGroupDeleted}
+							onOpenYamlEditor={openYamlDrawer}
 							selectGroup={(groupedWorkers ?? []).length > 5 ? selectGroup : undefined}
 						/>
 
@@ -849,7 +1022,7 @@
 											</Cell>
 										</tr>
 										{#if workers}
-											{#each workers as { worker, custom_tags, last_ping, started_at, jobs_executed, last_job_id, last_job_workspace_id, occupancy_rate_15s, occupancy_rate_5m, occupancy_rate_30m, occupancy_rate, wm_version, vcpus, memory, memory_usage, wm_memory_usage }}
+											{#each workers as { worker, custom_tags, last_ping, started_at, jobs_executed, last_job_id, last_job_workspace_id, occupancy_rate_15s, occupancy_rate_5m, occupancy_rate_30m, occupancy_rate, wm_version, vcpus, memory, memory_usage, wm_memory_usage, native_mode }}
 												{@const isWorkerAlive = isWorkerMaybeAlive(last_ping)}
 												{@const tagMismatchInfo = getTagMismatchInfo(
 													custom_tags,
@@ -911,6 +1084,9 @@
 																	{/snippet}
 																</MeltTooltip>
 															{/if}
+															{#if native_mode}
+																<Badge color="blue" small>Native</Badge>
+															{/if}
 														</div>
 													</Cell>
 													{#if !config || !config.worker_tags || config.worker_tags.length === 0}
@@ -965,33 +1141,57 @@
 														</div>
 													</Cell>
 													<Cell class="text-secondary">
-														{@const versionWarning = getVersionWarning(wm_version, worker.startsWith('ag-'))}
+														{@const versionWarning = getVersionWarning(
+															wm_version,
+															worker.startsWith('ag-')
+														)}
 														<div class="flex items-center gap-1">
 															<div class="!text-2xs" title={wm_version}>
 																{wm_version.split('-')[0]}
 															</div>
 															{#if versionWarning !== 'none'}
 																<MeltTooltip>
-																	<Badge color={versionWarning === 'critical' ? 'red' : versionWarning === 'warning' ? 'yellow' : versionWarning === 'newer' ? 'yellow' : 'blue'}>
+																	<Badge
+																		color={versionWarning === 'critical'
+																			? 'red'
+																			: versionWarning === 'warning'
+																				? 'yellow'
+																				: versionWarning === 'newer'
+																					? 'yellow'
+																					: 'blue'}
+																	>
 																		<TriangleAlert size={12} />
 																	</Badge>
 																	{#snippet text()}
 																		{@const isAgent = worker.startsWith('ag-')}
 																		<div class="max-w-xs text-xs">
 																			{#if versionWarning === 'critical'}
-																				<strong>Critical:</strong> This {isAgent ? 'agent worker' : 'worker'} is running below the minimum supported version ({isAgent ? agentMinKeepAliveVersion : minKeepAliveVersion}).
-																				This may cause undefined behavior and cluster instability.
-																				Upgrade this {isAgent ? 'agent worker' : 'worker'} immediately—running {isAgent ? 'agent workers' : 'workers'} this old is untested and strongly discouraged.
+																				<strong>Critical:</strong> This {isAgent
+																					? 'agent worker'
+																					: 'worker'} is running below the minimum supported version
+																				({isAgent
+																					? agentMinKeepAliveVersion
+																					: minKeepAliveVersion}). This may cause undefined behavior
+																				and cluster instability. Upgrade this {isAgent
+																					? 'agent worker'
+																					: 'worker'} immediately—running {isAgent
+																					? 'agent workers'
+																					: 'workers'} this old is untested and strongly discouraged.
 																			{:else if versionWarning === 'warning'}
-																				<strong>Warning:</strong> This worker is significantly behind the server ({serverVersion}) by more than 50 minor versions.
-																				While it should still function, the risk of issues is elevated.
-																				Further server upgrades may push this worker into a critical state. Upgrading is recommended.
+																				<strong>Warning:</strong> This worker is significantly
+																				behind the server ({serverVersion}) by more than 50 minor
+																				versions. While it should still function, the risk of issues
+																				is elevated. Further server upgrades may push this worker
+																				into a critical state. Upgrading is recommended.
 																			{:else if versionWarning === 'newer'}
-																				<strong>Warning:</strong> This worker is running a newer version than the server ({serverVersion}).
-																				Workers should be at or behind the server version. This may cause undefined behavior.
+																				<strong>Warning:</strong> This worker is running a newer
+																				version than the server ({serverVersion}). Workers should be
+																				at or behind the server version. This may cause undefined
+																				behavior.
 																			{:else}
 																				<strong>Note:</strong> This worker is behind the server version.
-																				While generally fine, keeping all workers aligned with the server provides the best stability and is most thoroughly tested.
+																				While generally fine, keeping all workers aligned with the server
+																				provides the best stability and is most thoroughly tested.
 																			{/if}
 																		</div>
 																	{/snippet}
@@ -1086,6 +1286,7 @@
 									shouldAutoOpenDrawer = ''
 								}}
 								onDeleted={handleWorkerGroupDeleted}
+								onOpenYamlEditor={openYamlDrawer}
 							/>
 							<div class="text-xs text-primary"> No workers currently in this worker group </div>
 						{/if}

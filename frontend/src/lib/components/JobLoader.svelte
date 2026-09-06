@@ -15,10 +15,13 @@
 		type OpenFlow
 	} from '$lib/gen'
 	import { workspaceStore } from '$lib/stores'
+	import { getViewToken } from '$lib/viewToken'
+	import { WM_LOGS_SKIPPED } from '$lib/consts'
 	import { getContext, onDestroy, tick, untrack } from 'svelte'
 	import type { SupportedLanguage } from '$lib/common'
 	import { sendUserToast } from '$lib/toast'
 	import { DynamicInput, isScriptPreview } from '$lib/utils'
+	import { getActiveReplay, getReplayStartTime } from './recording/replay.svelte'
 
 	// Will be set to number if job is not a flow
 
@@ -41,6 +44,9 @@
 		noLogs?: boolean
 		workspaceOverride?: string | undefined
 		notfound?: boolean
+		/** Status/body of the last load failure, so callers can distinguish e.g. a
+		 * 403 (job exists but no access — offer a share link) from a 404. */
+		loadError?: { status?: number; message?: string } | undefined
 		allowConcurentRequests?: boolean
 		jobUpdateLastFetch?: Date | undefined
 		toastError?: boolean
@@ -59,6 +65,7 @@
 		allowConcurentRequests = false,
 		workspaceOverride = undefined,
 		notfound = $bindable(false),
+		loadError = $bindable(undefined),
 		jobUpdateLastFetch = $bindable(undefined),
 		toastError = false,
 		onlyResult = false,
@@ -80,11 +87,12 @@
 	let finished: string[] = []
 	let ITERATIONS_BEFORE_SLOW_REFRESH = 10
 	let ITERATIONS_BEFORE_SUPER_SLOW_REFRESH = 100
+	const MAX_SSE_ATTEMPTS = 3
 
 	let lastStartedAt: number = Date.now()
 	let currentId: string | undefined = $state(undefined)
 	let noPingTimeout: number | undefined = undefined
-	let lastNoLogs = $state(noLogs)
+	let lastNoLogs = $state(untrack(() => noLogs))
 	let lastCompletedJobId = $state<string | undefined>(undefined)
 
 	let token = getContext<{ token?: string }>('AuthToken')
@@ -102,13 +110,13 @@
 	$effect(() => {
 		if (noLogs != lastNoLogs) {
 			lastNoLogs = noLogs
-			if (!noLogs) {
+			if (!noLogs && !getActiveReplay()) {
 				currentEventSource?.onerror?.(new Event(noLogsChangeRestartEvent))
 				const lastJobId = lastCompletedJobId
 				if (lastJobId && (job || lastCallbacks?.loadExtraLogs)) {
 					plimit(() =>
 						JobService.getCompletedJobLogsTail({
-							workspace: $workspaceStore!,
+							workspace: workspace!,
 							id: lastJobId
 						})
 					).then((res) => {
@@ -123,6 +131,37 @@
 			}
 		}
 	})
+
+	function isSkippedLogsValue(logs: string | undefined): boolean {
+		return logs === WM_LOGS_SKIPPED
+	}
+
+	function getResolvedLogs(logs: string | undefined): string {
+		return isSkippedLogsValue(logs) ? '' : (logs ?? '')
+	}
+
+	function mergeLogs(existingLogs: string | undefined, newLogs: string | undefined): string {
+		const existing = getResolvedLogs(existingLogs)
+		const incoming = newLogs ?? ''
+		return existing.length === 0 ? incoming : existing.concat(incoming)
+	}
+
+	function pickMoreCompleteLogs(
+		primaryLogs: string | undefined,
+		fallbackLogs: string | undefined
+	): string {
+		const primary = getResolvedLogs(primaryLogs)
+		const fallback = getResolvedLogs(fallbackLogs)
+		// When neither side has real logs but one was the skipped sentinel, keep
+		// the sentinel so downstream consumers can still lazily resolve logs
+		// instead of treating the job as having genuinely produced none.
+		if (primary.length === 0 && fallback.length === 0) {
+			return isSkippedLogsValue(primaryLogs) || isSkippedLogsValue(fallbackLogs)
+				? WM_LOGS_SKIPPED
+				: ''
+		}
+		return primary.length >= fallback.length ? primary : fallback
+	}
 
 	function clearCurrentId() {
 		if (currentId) {
@@ -141,7 +180,7 @@
 			lastCompletedJobId = undefined
 			clearCurrentJob()
 			lastCallbacks = callbacks
-			noPingTimeout = undefined
+			clearNoPingTimeout()
 			const startedAt = Date.now()
 			const testId = await fn()
 
@@ -180,7 +219,7 @@
 		return abstractRun(
 			() =>
 				JobService.runScriptByPath({
-					workspace: $workspaceStore!,
+					workspace: workspace!,
 					path: path ?? '',
 					requestBody: args,
 					skipPreprocessor: true
@@ -197,7 +236,7 @@
 		return abstractRun(
 			() =>
 				JobService.runScriptByHash({
-					workspace: $workspaceStore!,
+					workspace: workspace!,
 					hash: hash ?? '',
 					requestBody: args,
 					skipPreprocessor: true
@@ -214,7 +253,7 @@
 		return abstractRun(
 			() =>
 				JobService.runFlowByPath({
-					workspace: $workspaceStore!,
+					workspace: workspace!,
 					path: path ?? '',
 					requestBody: args,
 					skipPreprocessor: true
@@ -226,16 +265,18 @@
 	export async function runFlowPreview(
 		args: Record<string, any>,
 		flow: OpenFlow & { tag?: string },
-		callbacks?: Callbacks
+		callbacks?: Callbacks,
+		path?: string
 	): Promise<string> {
 		return abstractRun(
 			() =>
 				JobService.runFlowPreview({
-					workspace: $workspaceStore!,
+					workspace: workspace!,
 					requestBody: {
 						args,
 						value: flow.value,
-						tag: flow.tag
+						tag: flow.tag,
+						path
 					}
 				}),
 			callbacks
@@ -244,11 +285,12 @@
 
 	function refreshLogOffset() {
 		if (logOffset == 0) {
-			logOffset = job?.logs?.length ? job.logs?.length + 1 : 0
+			const currentLogs = getResolvedLogs(job?.logs)
+			logOffset = currentLogs.length ? currentLogs.length + 1 : 0
 		}
 	}
 	export async function getLogs() {
-		if (job) {
+		if (job && !getActiveReplay()) {
 			refreshLogOffset()
 			const getUpdate = await JobService.getJobUpdates({
 				workspace: workspace!,
@@ -257,7 +299,7 @@
 				logOffset: logOffset
 			})
 
-			if ((job?.logs ?? '').length == 0) {
+			if (getResolvedLogs(job?.logs).length == 0) {
 				job.logs = getUpdate.new_logs ?? ''
 				logOffset = getUpdate.log_offset ?? 0
 			}
@@ -273,7 +315,7 @@
 		return abstractRun(
 			() =>
 				JobService.runDynamicSelect({
-					workspace: $workspaceStore!,
+					workspace: workspace!,
 					requestBody: { entrypoint_function, args, runnable_ref }
 				}),
 			callbacks
@@ -288,12 +330,17 @@
 		tag: string | undefined,
 		lock?: string,
 		hash?: string,
-		callbacks?: Callbacks
+		callbacks?: Callbacks,
+		flowPath?: string,
+		modules?: Record<string, import('$lib/gen').ScriptModule> | null,
+		tempScriptRefs?: Record<string, string>,
+		timeout?: number
 	): Promise<string> {
 		return abstractRun(
 			() =>
 				JobService.runScriptPreview({
-					workspace: $workspaceStore!,
+					workspace: workspace!,
+					timeout,
 					requestBody: {
 						path,
 						content: code,
@@ -301,7 +348,10 @@
 						language: lang as Preview['language'],
 						tag,
 						lock,
-						script_hash: hash
+						script_hash: hash,
+						flow_path: flowPath,
+						modules: modules ?? undefined,
+						temp_script_refs: tempScriptRefs
 					}
 				}),
 			callbacks
@@ -318,7 +368,7 @@
 			currentEventSource = undefined
 			try {
 				await JobService.cancelQueuedJob({
-					workspace: $workspaceStore ?? '',
+					workspace: workspace ?? '',
 					id,
 					requestBody: {}
 				})
@@ -344,14 +394,74 @@
 		return sseSupported
 	}
 
+	let replayTimeouts: ReturnType<typeof setTimeout>[] = []
+
 	let startedWatchingJob: number | undefined = undefined
 	export async function watchJob(testId: string, callbacks?: Callbacks) {
+		// Cancel a previous replay's pending event timers: switching the watched job
+		// on a reused loader (the recording players click node→node) would otherwise
+		// let the old job's scheduled events mutate the newly-watched job.
+		replayTimeouts.forEach(clearTimeout)
+		replayTimeouts = []
 		logOffset = 0
 		resultStreamOffset = 0
 		syncIteration = 0
 		errorIteration = 0
 		currentId = testId
 		scriptProgress = undefined
+
+		// Replay mode: feed recorded events instead of real SSE
+		const replay = getActiveReplay()
+		if (replay) {
+			const recorded = replay.jobs[testId]
+			if (recorded) {
+				job = JSON.parse(JSON.stringify(recorded.initial_job))
+				callbacks?.change?.(job!)
+				// Compute delays relative to replay start so sub-jobs (discovered
+				// later by FlowStatusViewerInner) stay in sync with the root job.
+				const elapsed = Date.now() - getReplayStartTime()
+				for (const event of recorded.events) {
+					const delay = Math.max(0, event.t - elapsed)
+					const timeout = setTimeout(async () => {
+						// A malformed replayed event (recordings are caller-controlled) would
+						// throw in this timer where no boundary can catch it, so skip it.
+						// `onJobCompleted` is awaited so its async rejection is caught too.
+						try {
+							if (job) {
+								updateJobFromProgress(event.data, job, callbacks)
+							}
+							if (event.data.completed) {
+								const njob = (event.data as any).job as Job & { result_stream?: string }
+								if (njob) {
+									// Use whichever logs are more complete (longer), but never
+									// let the WM_LOGS_SKIPPED sentinel win over real logs.
+									njob.logs = pickMoreCompleteLogs(job?.logs, njob.logs)
+									const streamedResult = job?.result_stream ?? ''
+									const completedResult = njob.result_stream ?? ''
+									njob.result_stream =
+										streamedResult.length >= completedResult.length
+											? streamedResult
+											: completedResult
+									job = njob
+									await onJobCompleted(testId, job, callbacks)
+								}
+							}
+						} catch (err) {
+							console.error('replay event failed', err)
+						}
+					}, delay)
+					replayTimeouts.push(timeout)
+				}
+				return
+			}
+			// Job not in recording — stub it to prevent API calls
+			const stubJob = { id: testId, type: 'CompletedJob', success: true } as Job
+			job = stubJob
+			callbacks?.change?.(stubJob)
+			clearCurrentId()
+			return
+		}
+
 		if (loadPlaceholderJobOnStart) {
 			job = structuredClone(loadPlaceholderJobOnStart)
 		} else {
@@ -392,11 +502,10 @@
 		}
 
 		if (previewJobUpdates.new_logs) {
-			if (logOffset == 0) {
-				job.logs = previewJobUpdates.new_logs ?? ''
-			} else {
-				job.logs = (job?.logs ?? '').concat(previewJobUpdates.new_logs)
-			}
+			job.logs =
+				logOffset == 0
+					? (previewJobUpdates.new_logs ?? '')
+					: mergeLogs(job?.logs, previewJobUpdates.new_logs)
 		}
 
 		if (previewJobUpdates.new_result_stream) {
@@ -441,6 +550,17 @@
 			callbacks?.change?.(job)
 		}
 	}
+	// When a job is fetched with no_logs=true the server omits logs entirely.
+	// Flag it with a sentinel so consumers (the log panel) can tell "logs were
+	// intentionally skipped" apart from "job genuinely produced no logs", and
+	// lazily resolve the real logs on demand.
+	function flagSkippedLogs<T extends Job>(j: T, effectiveNoLogs: boolean): T {
+		if (effectiveNoLogs && !(j as Job & { logs?: string }).logs) {
+			;(j as Job & { logs?: string }).logs = WM_LOGS_SKIPPED
+		}
+		return j
+	}
+
 	async function loadTestJob(id: string, callbacks?: Callbacks): Promise<boolean> {
 		let isCompleted = false
 		if (isCurrentJob(id)) {
@@ -460,23 +580,29 @@
 					})
 
 					if ((previewJobUpdates.running ?? false) || (previewJobUpdates.completed ?? false)) {
-						job = await JobService.getJob({
-							workspace: workspace!,
-							id,
-							noCode,
-							noLogs: onlyResult || noLogs
-						})
+						job = flagSkippedLogs(
+							await JobService.getJob({
+								workspace: workspace!,
+								id,
+								noCode,
+								noLogs: onlyResult || noLogs
+							}),
+							onlyResult || noLogs
+						)
 						callbacks?.change?.(job)
 					}
 
 					updateJobFromProgress(previewJobUpdates, job, callbacks)
 				} else {
-					job = await JobService.getJob({
-						workspace: workspace!,
-						id,
-						noLogs: onlyResult || noLogs,
-						noCode
-					})
+					job = flagSkippedLogs(
+						await JobService.getJob({
+							workspace: workspace!,
+							id,
+							noLogs: onlyResult || noLogs,
+							noCode
+						}),
+						onlyResult || noLogs
+					)
 				}
 				jobUpdateLastFetch = new Date()
 
@@ -494,9 +620,14 @@
 					}
 				}
 				notfound = false
+				loadError = undefined
 			} catch (err) {
+				const status = (err as any)?.status
+				loadError = { status, message: (err as any)?.body ?? (err as any)?.message }
 				errorIteration += 1
-				if (errorIteration == 5) {
+				// Auth failures won't resolve by retrying: surface them immediately so
+				// the caller can show the right message (e.g. 403 -> request a share link).
+				if (status === 403 || status === 404 || errorIteration == 5) {
 					notfound = true
 					job = undefined
 					clearCurrentId()
@@ -539,16 +670,30 @@
 		}
 	}
 
-	function setNoPingTimeout(id: string, attempt: number, callbacks?: Callbacks) {
+	function clearNoPingTimeout() {
 		if (noPingTimeout) {
 			clearTimeout(noPingTimeout)
+			noPingTimeout = undefined
 		}
+	}
+
+	function setNoPingTimeout(id: string, attempt: number, callbacks?: Callbacks) {
+		clearNoPingTimeout()
 		if (isCurrentJob(id)) {
 			noPingTimeout = setTimeout(() => {
+				noPingTimeout = undefined
 				if (isCurrentJob(id)) {
 					currentEventSource?.close()
 					currentEventSource = undefined
-					loadTestJobWithSSE(id, attempt + 1, callbacks)
+					// A proxy that buffers the response rather than cutting it keeps the
+					// connection open and error-free, so this watchdog is the only signal that
+					// no event is getting through. It has to share the retry budget: otherwise
+					// it reopens an equally mute stream forever and polling is never reached.
+					if (attempt < MAX_SSE_ATTEMPTS) {
+						loadTestJobWithSSE(id, attempt + 1, callbacks)
+					} else {
+						syncer(id, callbacks)
+					}
 				}
 			}, 10000)
 		}
@@ -569,12 +714,15 @@
 			try {
 				// First load the job to get initial state
 				if ((!job || job.id == '') && !onlyResult) {
-					job = await JobService.getJob({
-						workspace: workspace!,
-						id,
-						noLogs: noLogs,
-						noCode
-					})
+					job = flagSkippedLogs(
+						await JobService.getJob({
+							workspace: workspace!,
+							id,
+							noLogs: noLogs,
+							noCode
+						}),
+						noLogs
+					)
 
 					callbacks?.change?.(job)
 				}
@@ -644,6 +792,13 @@
 						params.set('token', token.token)
 					}
 
+					// Share read link: SSE/EventSource can't set the X-View-Token header,
+					// so carry the token as a query param instead.
+					const viewToken = getViewToken()
+					if (viewToken) {
+						params.set('view_token', viewToken)
+					}
+
 					const sseUrl = `/api/w/${workspace}/jobs_u/getupdate_sse/${id}?${params.toString()}`
 
 					currentEventSource = new EventSource(sseUrl)
@@ -701,10 +856,7 @@
 							if (previewJobUpdates.completed) {
 								currentEventSource?.close()
 								currentEventSource = undefined
-								if (noPingTimeout) {
-									clearTimeout(noPingTimeout)
-									noPingTimeout = undefined
-								}
+								clearNoPingTimeout()
 								isCompleted = true
 								if (onlyResult) {
 									callbacks?.doneResult?.({
@@ -714,7 +866,7 @@
 									clearCurrentId()
 								} else {
 									const njob = previewJobUpdates.job as Job & { result_stream?: string }
-									njob.logs = job?.logs ?? ''
+									njob.logs = pickMoreCompleteLogs(job?.logs, njob.logs)
 									njob.result_stream = job?.result_stream ?? ''
 									job = njob
 									onJobCompleted(id, job, callbacks)
@@ -729,16 +881,26 @@
 						console.warn('SSE error:', error)
 						currentEventSource?.close()
 						currentEventSource = undefined
+						clearNoPingTimeout()
 						let delay = 1000
 						let isNoLogsChange = error.type == noLogsChangeRestartEvent
 						if (isNoLogsChange) {
 							delay = 0
 						}
-						if (attempt < 3 || isNoLogsChange) {
+						if (attempt < MAX_SSE_ATTEMPTS || isNoLogsChange) {
 							if (!isNoLogsChange) {
-								console.log(`SSE error (1), retrying ...  attempt: ${attempt + 1}/3`)
+								console.log(
+									`SSE error (1), retrying ...  attempt: ${attempt + 1}/${MAX_SSE_ATTEMPTS}`
+								)
 							}
-							setTimeout(() => loadTestJobWithSSE(id, attempt + 1, callbacks), delay)
+							// A no-logs restart is deliberate (the caller wants a stream with different
+							// query args), not a failure, so it must not consume the retry budget:
+							// toggling the flow graph tab would otherwise exhaust it in a few clicks
+							// and strand a healthy stream on polling.
+							setTimeout(
+								() => loadTestJobWithSSE(id, isNoLogsChange ? attempt : attempt + 1, callbacks),
+								delay
+							)
 						} else {
 							// Fall back to polling on error
 							setTimeout(() => syncer(id, callbacks), 1000)
@@ -761,9 +923,10 @@
 				// Fall back to polling on error
 				currentEventSource?.close()
 				currentEventSource = undefined
+				clearNoPingTimeout()
 
-				if (attempt < 3) {
-					console.log(`SSE error (2), retrying ... attempt: ${attempt}/3`)
+				if (attempt < MAX_SSE_ATTEMPTS) {
+					console.log(`SSE error (2), retrying ... attempt: ${attempt}/${MAX_SSE_ATTEMPTS}`)
 					attempt++
 					loadTestJobWithSSE(id, attempt, callbacks)
 				} else {
@@ -802,6 +965,9 @@
 		clearCurrentId()
 		currentEventSource?.close()
 		currentEventSource = undefined
+		clearNoPingTimeout()
+		replayTimeouts.forEach(clearTimeout)
+		replayTimeouts = []
 	})
 </script>
 

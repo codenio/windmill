@@ -108,6 +108,9 @@ export function argSigToJsonSchemaType(
   } else if (t === "datetime") {
     newS.type = "string";
     newS.format = "date-time";
+  } else if (t === "date") {
+    newS.type = "string";
+    newS.format = "date";
   } else if (typeof t !== "string" && "oneof" in t) {
     newS.type = "object";
     if (t.oneof) {
@@ -225,7 +228,7 @@ export function argSigToJsonSchemaType(
         if (oldS.items && typeof oldS.items === "object") {
           ITEMS_PRESERVED_FIELDS.forEach((field) => {
             if (oldS.items && oldS.items[field] !== undefined) {
-              newS.items![field] = oldS.items[field];
+              (newS.items as any)[field] = oldS.items[field];
             }
           });
         }
@@ -238,7 +241,7 @@ export function argSigToJsonSchemaType(
       if (oldS.items && typeof oldS.items === "object") {
         ITEMS_PRESERVED_FIELDS.forEach((field) => {
           if (oldS.items && oldS.items[field] !== undefined) {
-            newS.items![field] = oldS.items[field];
+            (newS.items as any)[field] = oldS.items[field];
           }
         });
       }

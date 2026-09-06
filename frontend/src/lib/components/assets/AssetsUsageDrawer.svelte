@@ -65,17 +65,17 @@
 	</DrawerContent>
 </Drawer>
 
-{#snippet rightBadge(text: string | undefined, tooltip?: string)}
-	{#if text}
+{#snippet rightBadge(badgeText: string | undefined, tooltip?: string)}
+	{#if badgeText}
 		<Tooltip disablePopup={!tooltip}>
 			<div class={twMerge('text-xs 	font-normal text-primary min-w-12 p-1 text-center rounded-md')}>
-				{text}
+				{badgeText}
 			</div>
-			<svelte:fragment slot="text">
+			{#snippet text()}
 				{#if tooltip}
 					{tooltip}
 				{/if}
-			</svelte:fragment>
+			{/snippet}
 		</Tooltip>
 	{/if}
 {/snippet}

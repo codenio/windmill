@@ -11,25 +11,40 @@
 	import { createEventDispatcher, getContext, untrack } from 'svelte'
 	import type { FlowEditorContext } from './flows/types'
 	import { runFlowPreview } from './flows/utils.svelte'
+	import { processSecretArgs } from './secretArgUtils'
 	import SchemaForm from './SchemaForm.svelte'
 	import SchemaFormWithArgPicker from './SchemaFormWithArgPicker.svelte'
 	import FlowStatusViewer from '../components/FlowStatusViewer.svelte'
 	import FlowProgressBar from './flows/FlowProgressBar.svelte'
 	import FlowExecutionStatus from './runs/FlowExecutionStatus.svelte'
 	import JobDetailHeader from './runs/JobDetailHeader.svelte'
-	import { AlertTriangle, CornerDownLeft, Loader2, Play, RefreshCw, X } from 'lucide-svelte'
-	import { emptyString, sendUserToast, type StateStore } from '$lib/utils'
+	import {
+		AlertTriangle,
+		Circle,
+		CornerDownLeft,
+		Download,
+		Loader2,
+		Play,
+		RefreshCw,
+		X
+	} from 'lucide-svelte'
+	import { sendUserToast, type StateStore } from '$lib/utils'
 	import { dfs } from './flows/dfs'
 	import { sliceModules } from './flows/flowStateUtils.svelte'
 	import InputSelectedBadge from './schema/InputSelectedBadge.svelte'
 	import Toggle from './Toggle.svelte'
 	import JsonInputs from './JsonInputs.svelte'
+	import { argsToJsonPayload } from '$lib/schema'
+	import type { Schema } from '$lib/common'
 	import FlowHistoryJobPicker from './FlowHistoryJobPicker.svelte'
 	import type { DurationStatus, GraphModuleState } from './graph'
 	import { getStepHistoryLoaderContext } from './stepHistoryLoader.svelte'
 	import FlowChat from './flows/conversations/FlowChat.svelte'
 	import { stateSnapshot } from '$lib/svelte5Utils.svelte'
 	import FlowRestartButton from './FlowRestartButton.svelte'
+	import { useNestedRestartState } from './useNestedRestartState.svelte'
+	import { buildFlowRecording, downloadRecordingJson } from './recording/runRecording'
+	import { agentStreamingEnabled } from './flows/agentFormFields'
 
 	interface Props {
 		previewMode: 'upTo' | 'whole'
@@ -46,7 +61,7 @@
 		scrollTop?: number
 		localModuleStates?: Record<string, GraphModuleState>
 		localDurationStatuses?: Record<string, DurationStatus>
-		onRunPreview?: () => void
+		onRunPreview?: (jobId?: string) => void
 		render?: boolean
 		onJobDone?: () => void
 		upToId?: string | undefined
@@ -78,7 +93,26 @@
 		suspendStatus
 	}: Props = $props()
 
-	let restartBranchNames: [number, string][] = []
+	let previewExpandedSubflows: Record<
+		string,
+		{ modules: import('$lib/gen').FlowModule[]; groups?: any[] }
+	> = $state({})
+	const restart = useNestedRestartState({
+		selectedJobStep: () => selectedJobStep,
+		job: () => job,
+		graphModuleStates: () => localModuleStates,
+		expandedSubflows: () => previewExpandedSubflows
+	})
+	// `selectedJobStepType` and `selectedJobStepIsTopLevel` are still exposed as
+	// `$bindable` props to legacy parents (FlowPreviewButtons binds them but
+	// doesn't read them). Sync them out of the composable here so the prop
+	// surface stays unchanged.
+	$effect(() => {
+		selectedJobStepIsTopLevel = restart.selectedJobStepIsTopLevel
+	})
+	$effect(() => {
+		selectedJobStepType = restart.selectedJobStepType
+	})
 	let isRunning: boolean = $state(false)
 	let jsonView: boolean = $state(false)
 	let jsonEditor: JsonInputs | undefined = $state(undefined)
@@ -100,8 +134,12 @@
 		initialPathStore,
 		fakeInitialPath,
 		customUi,
-		executionCount
+		executionCount,
+		devTempScriptRefs,
+		opWorkspace
 	} = $state(getContext<FlowEditorContext>('FlowEditorContext'))
+	// Acting workspace when previewing inside an AI session; else the nav workspace.
+	let opWs = $derived(opWorkspace?.() ?? $workspaceStore)
 	const dispatch = createEventDispatcher()
 
 	let renderCount: number = $state(0)
@@ -109,16 +147,25 @@
 	let currentJobId: string | undefined = $state(undefined)
 	let stepHistoryLoader = getStepHistoryLoaderContext()
 	let flowProgressBar: FlowProgressBar | undefined = $state(undefined)
+
+	// Recording: nothing is captured live — once the run completes, its id is
+	// remembered and the recording is built from the completed jobs on download.
+	let lastRecordingJobId: string | undefined = $state(undefined)
+	let recordedFlow: OpenFlow | undefined = undefined
+	let downloadingRecording: boolean = $state(false)
+	let recordingMode: boolean = $state(false)
+
+	export function setRecordingMode(on: boolean) {
+		recordingMode = on
+	}
+
 	let loadingHistory = $state(false)
 
 	let shouldUseStreaming = $derived.by(() => {
 		const modules = flowStore.val.value?.modules
 		const lastModule = modules && modules.length > 0 ? modules[modules.length - 1] : undefined
-		return (
-			lastModule?.value?.type === 'aiagent' &&
-			lastModule?.value?.input_transforms?.streaming?.type === 'static' &&
-			lastModule?.value?.input_transforms?.streaming?.value === true
-		)
+		if (lastModule?.value?.type !== 'aiagent') return false
+		return agentStreamingEnabled(lastModule.value)
 	})
 
 	function extractFlow(previewMode: 'upTo' | 'whole'): OpenFlow {
@@ -150,14 +197,30 @@
 			lastPreviewFlow = JSON.stringify(flowStore.val)
 			flowProgressBar?.reset()
 			const newFlow = extractFlow(previewMode)
-			newJobId = await runFlowPreview(args, newFlow, $pathStore, restartedFrom, conversationId)
+			if (recordingMode) {
+				// Any completed run in recording mode becomes downloadable, so pair
+				// the flow as it is for *this* run — not a stale earlier capture.
+				// Deep-cloned: extractFlow('whole') returns the live store object,
+				// and edits made before download must not rewrite the run's definition.
+				recordedFlow = JSON.parse(JSON.stringify(newFlow))
+			}
+			args = await processSecretArgs(args, flowStore.val.schema as any, opWs)
+			newJobId = await runFlowPreview(
+				args,
+				newFlow,
+				$pathStore,
+				restartedFrom,
+				conversationId,
+				devTempScriptRefs?.(),
+				opWorkspace?.()
+			)
 			jobId = newJobId
 			isRunning = true
 			if (inputSelected) {
 				savedArgs = $state.snapshot(previewArgs.val)
 				inputSelected = undefined
 			}
-			onRunPreview?.()
+			onRunPreview?.(newJobId)
 		} catch (e) {
 			sendUserToast('Could not run preview', true, undefined, e.toString())
 			isRunning = false
@@ -188,27 +251,6 @@
 		}
 	}
 
-	function onSelectedJobStepChange() {
-		if (selectedJobStep !== undefined && job?.flow_status?.modules !== undefined) {
-			selectedJobStepIsTopLevel =
-				job?.flow_status?.modules.map((m) => m.id).indexOf(selectedJobStep) >= 0
-			let moduleDefinition = job?.raw_flow?.modules.find((m) => m.id == selectedJobStep)
-			if (moduleDefinition?.value.type == 'forloopflow') {
-				selectedJobStepType = 'forloop'
-			} else if (moduleDefinition?.value.type == 'branchall') {
-				selectedJobStepType = 'branchall'
-				moduleDefinition?.value.branches.forEach((branch, idx) => {
-					restartBranchNames.push([
-						idx,
-						emptyString(branch.summary) ? `Branch #${idx}` : branch.summary!
-					])
-				})
-			} else {
-				selectedJobStepType = 'single'
-			}
-		}
-	}
-
 	let savedArgs = $state(previewArgs.val)
 	let inputSelected: 'captures' | 'history' | 'saved' | undefined = $state(undefined)
 	async function selectInput(input, type?: 'captures' | 'history' | 'saved' | undefined) {
@@ -222,12 +264,41 @@
 			previewArgs.val = input
 			inputSelected = type
 			preventEscape = true
-			jsonEditor?.setCode(JSON.stringify(previewArgs.val ?? {}, null, '\t'))
 		}
+		// Deselecting restores the args the same way selecting replaced them, so both branches
+		// owe the editor an overwrite — it holds a payload for the input being left behind.
+		jsonEditor?.setCode(
+			argsToJsonPayload(flowStore.val.schema as Schema | undefined, previewArgs.val)
+		)
 	}
 
 	export function refresh() {
 		renderCount++
+	}
+
+	async function recordAndTest() {
+		lastRecordingJobId = undefined
+		await runPreview(previewArgs.val, undefined)
+	}
+
+	async function downloadRecording() {
+		if (!lastRecordingJobId || downloadingRecording) return
+		downloadingRecording = true
+		try {
+			// A run started before recording mode was enabled captured no flow —
+			// fall back to the flow as it is now.
+			const recording = await buildFlowRecording(
+				opWs!,
+				lastRecordingJobId,
+				$pathStore,
+				recordedFlow ?? extractFlow(previewMode)
+			)
+			downloadRecordingJson(recording, `flow-recording-${$pathStore.replace(/\//g, '-')}`)
+		} catch (e: any) {
+			sendUserToast('Could not build the recording', true, undefined, e?.toString())
+		} finally {
+			downloadingRecording = false
+		}
 	}
 
 	let scrollableDiv: HTMLDivElement | undefined = $state(undefined)
@@ -243,9 +314,6 @@
 			scrollableDiv.scrollTop = scrollTop
 		}
 	}
-	$effect.pre(() => {
-		selectedJobStep !== undefined && untrack(() => onSelectedJobStepChange())
-	})
 	$effect(() => {
 		scrollableDiv && render && untrack(() => onScrollableDivChange())
 	})
@@ -255,7 +323,7 @@
 		try {
 			jobId &&
 				(await JobService.cancelQueuedJob({
-					workspace: $workspaceStore ?? '',
+					workspace: opWs ?? '',
 					id: jobId,
 					requestBody: {}
 				}))
@@ -308,7 +376,7 @@
 			</div>
 
 			{#if isRunning}
-				<div class="mx-auto">
+				<div class="mx-auto flex items-center gap-2">
 					<Button
 						variant="accent"
 						destructive
@@ -322,15 +390,29 @@
 					>
 						Cancel
 					</Button>
+					{#if recordingMode}
+						<span class="text-xs text-red-500 font-medium flex items-center gap-1">
+							<Circle size={8} fill="currentColor" /> Recording
+						</span>
+					{/if}
 				</div>
 			{:else}
-				<div class="grow justify-center flex flex-row gap-2">
-					{#if jobId !== undefined && selectedJobStep !== undefined && selectedJobStepIsTopLevel}
+				<div class="grow justify-center flex flex-row gap-2 items-center">
+					{#if jobId !== undefined && selectedJobStep !== undefined && restart.topLevelRestartable}
+						<!--
+							Nested-step restart is intentionally not surfaced from the editor
+							preview: the chain needs `flow_job_id` resolved at every level,
+							which only the backend can do (by walking the original
+							execution). Users who want nested restart should use the run
+							page, which goes through the dedicated restart API.
+						-->
 						<FlowRestartButton
 							{jobId}
 							{selectedJobStep}
-							{selectedJobStepType}
-							{restartBranchNames}
+							selectedJobStepType={restart.selectedJobStepType}
+							restartBranchNames={restart.restartBranchNames}
+							presetIterationN={restart.topLevelLoopIteration}
+							iterationCounts={restart.iterationCounts}
 							onRestart={(stepId, branchOrIterationN) => {
 								runPreview(previewArgs.val, {
 									flow_job_id: jobId,
@@ -346,7 +428,8 @@
 							startIcon={{ icon: isRunning ? RefreshCw : Play }}
 							size="sm"
 							btnClasses="w-full max-w-lg"
-							on:click={() => runPreview(previewArgs.val, undefined)}
+							on:click={() =>
+								recordingMode ? recordAndTest() : runPreview(previewArgs.val, undefined)}
 							id="flow-editor-test-flow-drawer"
 							shortCut={{ Icon: CornerDownLeft }}
 						>
@@ -355,9 +438,23 @@
 								<Badge baseClass="ml-1" color="indigo">
 									{selectionManager.getSelectedId()}
 								</Badge>
+							{:else if recordingMode}
+								Test flow and record
 							{:else}
 								Test flow
 							{/if}
+						</Button>
+					{/if}
+					{#if lastRecordingJobId && recordingMode}
+						<Button
+							variant="subtle"
+							unifiedSize="sm"
+							title="Download recording"
+							on:click={downloadRecording}
+							loading={downloadingRecording}
+							startIcon={{ icon: Download }}
+						>
+							Download recording
 						</Button>
 					{/if}
 				</div>
@@ -394,6 +491,7 @@
 						runnableId={$initialPathStore}
 						stablePathForCaptures={$initialPathStore || fakeInitialPath}
 						runnableType={'FlowPath'}
+						workspace={opWs}
 						previewArgs={previewArgs.val}
 						on:openTriggers
 						on:select={(e) => {
@@ -416,8 +514,7 @@
 										rightTooltip: 'Fill args from JSON'
 									}}
 									lightMode
-									on:change={(e) => {
-										jsonEditor?.setCode(JSON.stringify(previewArgs.val ?? {}, null, '\t'))
+									on:change={() => {
 										refresh()
 									}}
 								/>
@@ -432,6 +529,10 @@
 											previewArgs.val = e.detail
 										}
 									}}
+									initialCode={argsToJsonPayload(
+										flowStore.val.schema as Schema | undefined,
+										previewArgs.val
+									)}
 									updateOnBlur={false}
 									placeholder={`Write args as JSON.<br/><br/>Example:<br/><br/>{<br/>&nbsp;&nbsp;"foo": "12"<br/>}`}
 								/>
@@ -442,6 +543,7 @@
 									<SchemaForm
 										noVariablePicker
 										compact
+										workspace={opWs}
 										schema={flowStore.val.schema}
 										bind:args={previewArgs.val}
 										on:change={() => {
@@ -484,6 +586,7 @@
 				{/if}
 				<FlowHistoryJobPicker
 					selectInitial={jobId == undefined}
+					newFlow={$initialPathStore === ''}
 					on:select={(e) => {
 						if (!currentJobId) {
 							currentJobId = jobId
@@ -503,13 +606,14 @@
 				/>
 			</div>
 
-			<FlowProgressBar {job} bind:this={flowProgressBar} slim textPosition="bottom" showStepId />
+			{#if jobId}
+				<FlowProgressBar {job} bind:this={flowProgressBar} slim textPosition="bottom" showStepId />
+			{/if}
 
 			{#if job}
 				<div class="w-full my-6">
 					<FlowExecutionStatus
 						{job}
-						workspaceId={$workspaceStore}
 						{isOwner}
 						innerModules={job?.flow_status?.modules}
 						{suspendStatus}
@@ -536,15 +640,27 @@
 				<FlowStatusViewer
 					bind:job
 					bind:localModuleStates
+					bind:expandedSubflows={previewExpandedSubflows}
 					bind:localDurationStatuses
 					{suspendStatus}
 					hideDownloadInGraph={customUi?.downloadLogs === false}
 					wideResults
 					bind:flowState={flowStateStore.val}
+					workspaceId={opWs}
 					{jobId}
-					onDone={() => {
+					onDone={async ({ job: completedJob }) => {
 						isRunning = false
 						$executionCount = $executionCount + 1
+						// Reset 'initial' flags for modules that were part of this flow test,
+						// so OutputPicker no longer shows "Run loaded from history"
+						for (const mod of completedJob.flow_status?.modules ?? []) {
+							if (mod.id) {
+								stepHistoryLoader?.resetInitial(mod.id)
+							}
+						}
+						if (recordingMode && completedJob?.id) {
+							lastRecordingJobId = completedJob.id
+						}
 						onJobDone?.()
 					}}
 					bind:selectedJobStep
@@ -553,10 +669,16 @@
 					{render}
 					{customUi}
 					showLogsWithResult
+					notes={flowStore.val.value.notes}
+					groups={flowStore.val.value.groups}
 				/>
 			{:else if loadingHistory}
 				<div class="italic text-primary h-full grow mx-auto flex flex-row items-center gap-2">
 					<Loader2 class="animate-spin" /> <span> Loading history... </span>
+				</div>
+			{:else}
+				<div class="italic text-tertiary h-full grow mx-auto flex flex-row items-center">
+					Flow status will display here
 				</div>
 			{/if}
 		</div>

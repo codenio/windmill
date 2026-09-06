@@ -6,8 +6,6 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-use const_format::concatcp;
-
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -39,11 +37,16 @@ fn compact_layer<S>() -> Layer<S, format::DefaultFields, format::Format<format::
 lazy_static::lazy_static! {
     pub static ref JSON_FMT: bool = std::env::var("JSON_FMT").map(|x| x == "true").unwrap_or(false);
     pub static ref QUIET_MODE: bool = std::env::var("QUIET").map(|x| x == "true" || x == "1").unwrap_or(false);
+    pub static ref OTEL_JOB_LOGS: bool = std::env::var("OTEL_JOB_LOGS").ok().is_some_and(|x| x == "1" || x == "true");
 }
 
 /// Target name for verbose logs that should be filtered in quiet mode.
 /// Use `tracing::info!(target: windmill_common::tracing_init::VERBOSE_TARGET, ...)` for logs that should be suppressed in quiet mode.
 pub const VERBOSE_TARGET: &str = "windmill_verbose";
+
+/// Prefix used by user scripts to emit a log line as an OTEL tracing event
+/// when `OTEL_JOB_LOGS=true`. Stripped before forwarding to the tracing layer.
+pub const OTEL_PREFIX: &str = "OTEL: ";
 
 /// Creates a Targets filter that optionally filters out verbose logs when quiet mode is enabled.
 fn create_targets_filter(default_env_filter: LevelFilter) -> Targets {
@@ -60,15 +63,22 @@ fn create_targets_filter(default_env_filter: LevelFilter) -> Targets {
 }
 
 pub const LOGS_SERVICE: &str = "logs/services/";
+pub const LOGS_AUDIT: &str = "logs/audit/";
 
-pub const TMP_WINDMILL_LOGS_SERVICE: &str = concatcp!("/tmp/windmill/", LOGS_SERVICE);
+lazy_static::lazy_static! {
+    pub static ref TMP_WINDMILL_LOGS_SERVICE: String = format!("{}/{}", *crate::worker::WINDMILL_DIR, LOGS_SERVICE);
+}
 
 pub fn initialize_tracing(
     hostname: &str,
     mode: &Mode,
     environment: &str,
 ) -> (WorkerGuard, crate::otel_oss::OtelProvider) {
-    let style = std::env::var("RUST_LOG_STYLE").unwrap_or_else(|_| "auto".into());
+    let style = if std::env::var("NO_COLOR").is_ok() {
+        "never".into()
+    } else {
+        std::env::var("RUST_LOG_STYLE").unwrap_or_else(|_| "auto".into())
+    };
 
     let rust_log_env = std::env::var("RUST_LOG");
     let rust_log_stdout_env = std::env::var("RUST_LOG_STDOUT");
@@ -108,7 +118,7 @@ pub fn initialize_tracing(
 
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
-    let log_dir = format!("{}/{}/", TMP_WINDMILL_LOGS_SERVICE, hostname);
+    let log_dir = format!("{}/{}/", *TMP_WINDMILL_LOGS_SERVICE, hostname);
     std::fs::create_dir_all(&log_dir).unwrap();
     let file_appender = RollingFileAppender::builder()
         .rotation(Rotation::MINUTELY)
@@ -168,56 +178,40 @@ pub fn initialize_tracing(
         .with(logs_bridge.with_filter(otel_logs_filter))
         .with(opentelemetry_filtered);
 
-    match *JSON_FMT {
-        true => {
-            // Stdout layer with its own filter
-            let stdout_layer = json_layer()
-                .with_writer(std::io::stdout)
-                .flatten_event(true)
-                .with_filter(stdout_env_filter)
-                .with_filter(create_targets_filter(default_env_filter));
+    // The service log files are written to be indexed, not tailed, so they always carry the
+    // JSON format: it is what preserves level, target and the current span as fields rather
+    // than as text the index would have to recover by regex. JSON_FMT governs stdout only.
+    let file_layer = json_layer()
+        .with_writer(log_file_writer)
+        .flatten_event(true)
+        .with_filter(file_env_filter)
+        .with_filter(create_targets_filter(default_env_filter));
 
-            // File layer with its own filter
-            let file_layer = json_layer()
-                .with_writer(log_file_writer)
-                .flatten_event(true)
-                .with_filter(file_env_filter)
-                .with_filter(create_targets_filter(default_env_filter));
+    // Boxed so both arms have one type: the file layer is a single value and could not
+    // otherwise be typed against two different subscriber stacks.
+    let stdout_layer = match *JSON_FMT {
+        true => json_layer()
+            .with_writer(std::io::stdout)
+            .flatten_event(true)
+            .with_filter(stdout_env_filter)
+            .with_filter(create_targets_filter(default_env_filter))
+            .boxed(),
+        false => compact_layer()
+            .with_writer(std::io::stdout)
+            .with_ansi(style.to_lowercase() != "never")
+            .with_file(true)
+            .with_line_number(true)
+            .with_target(false)
+            .with_filter(stdout_env_filter)
+            .with_filter(create_targets_filter(default_env_filter))
+            .boxed(),
+    };
 
-            base_layer
-                .with(stdout_layer)
-                .with(file_layer)
-                .with(CountingLayer::new())
-                .init()
-        }
-        false => {
-            // Stdout layer with its own filter
-            let stdout_layer = compact_layer()
-                .with_writer(std::io::stdout)
-                .with_ansi(style.to_lowercase() != "never")
-                .with_file(true)
-                .with_line_number(true)
-                .with_target(false)
-                .with_filter(stdout_env_filter)
-                .with_filter(create_targets_filter(default_env_filter));
-
-            // File layer with its own filter
-            let file_layer = compact_layer()
-                .with_writer(log_file_writer)
-                .with_ansi(false) // No ANSI codes in log files
-                .with_file(true)
-                .with_line_number(true)
-                .with_target(false)
-                .with_filter(file_env_filter)
-                .with_filter(create_targets_filter(default_env_filter));
-
-            base_layer
-                .with(stdout_layer)
-                .with(file_layer)
-                .with(CountingLayer::new())
-                .init()
-        }
-    }
+    base_layer
+        .with(stdout_layer)
+        .with(file_layer)
+        .with(CountingLayer::new())
+        .init();
     (_guard, meter_provider)
 }
 

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { run } from 'svelte/legacy';
+
 	import { workspaceStore, superadmin } from '$lib/stores'
 	import Alert from '../common/alert/Alert.svelte'
 	import Button from '../common/button/Button.svelte'
@@ -8,14 +10,12 @@
 	import { Pen } from 'lucide-svelte'
 	import { isCloudHosted } from '$lib/cloud'
 
-	let newName = ''
-	let newId = ''
-	let checking = false
-	let errorId = ''
+	let newName = $state('')
+	let newId = $state('')
+	let checking = $state(false)
+	let errorId = $state('')
 
-	$: newId = newName.toLowerCase().replace(/\s/gi, '-')
 
-	$: validateName(newId)
 
 	async function validateName(id: string): Promise<void> {
 		checking = true
@@ -30,7 +30,7 @@
 		checking = false
 	}
 
-	let loading = false
+	let loading = $state(false)
 	async function renameWorkspace() {
 		try {
 			loading = true
@@ -53,11 +53,22 @@
 		}
 	}
 
-	export let open = false
+	interface Props {
+		open?: boolean;
+	}
+
+	let { open = $bindable(false) }: Props = $props();
+	run(() => {
+		newId = newName.toLowerCase().replace(/\s/gi, '-')
+	});
+	run(() => {
+		validateName(newId)
+	});
 </script>
 
 <div class="flex flex-col gap-1">
-	<p class="font-medium text-xs text-emphasis">Workspace ID</p>
+	<p class="font-semibold text-xs text-emphasis">Workspace ID</p>
+	<p class="text-xs text-secondary font-normal">Slug to uniquely identify your workspace</p>
 	<div class="flex flex-row gap-0.5 items-center">
 		<p class="text-xs font-normal text-primary">{$workspaceStore ?? ''}</p>
 		{#if !isCloudHosted() || $superadmin}
@@ -65,9 +76,8 @@
 				on:click={() => {
 					open = true
 				}}
-				size="xs"
-				spacingSize="xs2"
-				color="light"
+				unifiedSize="sm"
+				variant="subtle"
 				iconOnly
 				startIcon={{
 					icon: Pen
@@ -75,7 +85,6 @@
 			/>
 		{/if}
 	</div>
-	<p class="text-xs text-secondary font-normal">Slug to uniquely identify your workspace</p>
 </div>
 
 <Modal bind:open title="Change workspace ID">
@@ -106,7 +115,6 @@
 
 	{#snippet actions()}
 		<Button
-			size="sm"
 			variant="accent"
 			disabled={checking || errorId.length > 0 || !newName || !newId}
 			{loading}

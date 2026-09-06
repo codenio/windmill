@@ -2,73 +2,116 @@
 
 Raw apps let you build custom frontends with React, Svelte, or Vue that connect to Windmill backend runnables and datatables.
 
-## Creating a Raw App
+## App shape
 
-```bash
-wmill app new
+A raw app has three logical parts:
+
+- **Frontend** — bundled with esbuild from `index.tsx` as the entrypoint. Files include the entrypoint, components (`App.tsx`), styles, etc.
+- **Backend runnables** — server-side scripts the frontend calls, each addressed by a unique key.
+- **Data** — optional whitelisted datatables (managed PostgreSQL) that the backend runnables can query. The frontend never queries the database directly; backend runnables are the only bridge.
+
+## Frontend
+
+### Entrypoint
+
+The entrypoint is `index.tsx` for React and `index.ts` for Svelte and Vue. It is both the bundling entrypoint (the bundler is esbuild) and the **mount** entrypoint: the preview executes the bundle against an empty `<div id="root">` and auto-renders nothing, so the entrypoint must mount a top-level `App` itself. Keep the UI in `App.tsx` / `App.svelte` / `App.vue` and keep the entrypoint as the mount shim.
+
+React (`index.tsx`):
+
+```tsx
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+
+createRoot(document.getElementById('root')!).render(<App />)
 ```
 
-This interactive command creates a complete app structure with your choice of frontend framework (React, Svelte, or Vue).
+Svelte (`index.ts`): `mount(App, { target: document.getElementById('root')! })`. Vue (`index.ts`): `createApp(App).mount('#root')`.
 
-## App Structure
+**Never replace the entrypoint with a bare component** (`export default function App() { ... }` and no mount call). A component that is defined but never mounted renders a blank screen with **no error thrown** — it never executes, so nothing reaches the console or the error overlay. If an app renders blank, check that the entrypoint still mounts `App` into `#root`.
 
-```
-my_app.raw_app/
-├── AGENTS.md              # AI agent instructions (auto-generated)
-├── DATATABLES.md          # Database schemas (run 'wmill app generate-agents' to refresh)
-├── raw_app.yaml           # App configuration (summary, path, data settings)
-├── index.tsx              # Frontend entry point
-├── App.tsx                # Main React/Svelte/Vue component
-├── index.css              # Styles
-├── package.json           # Frontend dependencies
-├── wmill.ts               # Auto-generated backend type definitions (DO NOT EDIT)
-├── backend/               # Backend runnables (server-side scripts)
-│   ├── <id>.<ext>         # Code file (e.g., get_user.ts)
-│   ├── <id>.yaml          # Optional: config for fields, or to reference existing scripts
-│   └── <id>.lock          # Lock file (run 'wmill app generate-locks' to create)
-└── sql_to_apply/          # SQL migrations (dev only, not synced)
-    └── *.sql              # SQL files to apply via dev server
-```
+**Always begin every React file (`.tsx`/`.jsx`) that uses JSX with `import React from 'react'`.** esbuild uses the classic JSX transform, so `React` must be in scope wherever JSX appears — a missing import compiles fine but throws `React is not defined` at runtime, leaving a blank screen.
 
-## Backend Runnables
+### Generated bindings (`wmill.d.ts` / `wmill.ts`)
 
-Backend runnables are server-side scripts that your frontend can call. They live in the `backend/` folder.
+The frontend imports a generated module that mirrors the backend runnables. **Never write to it directly** — it gets regenerated whenever backend runnables change. Modifying it by hand will be overwritten.
 
-### Creating a Backend Runnable
+### Calling backend runnables
 
-Add a code file to the `backend/` folder:
+Import the generated bindings and call the runnable like a function. `./wmill` is the **only** way the frontend reaches anything server-side — datatables, workspace items, external services. Never `fetch` the Windmill API from frontend code: the bundle holds no token and builds no API URL.
 
-```
-backend/<id>.<ext>
+| Export | Resolves to | Use it for |
+|---|---|---|
+| `backend.<key>(args)` | the runnable's result | the default — run and wait |
+| `backendAsync.<key>(args)` | the **job id** (a string) | long-running work you want to track |
+| `waitJob(jobId)` | the job's **result** (rejects if the job failed) | awaiting a `backendAsync` job |
+| `getJob(jobId)` | a `Job` (`{ type, success, result, duration_ms, ... }`) | polling status without blocking |
+| `streamJob(jobId, onUpdate?)` | the final result, calling `onUpdate` per chunk | showing output as it is produced |
+
+Run and wait — the common case:
+
+```tsx
+import { backend } from './wmill';
+
+const user = await backend.get_user({ user_id: '123' });
 ```
 
-The runnable ID is the filename without extension. For example, `get_user.ts` creates a runnable with ID `get_user`.
+Start a long job, then await it:
 
-### Supported Languages
+```tsx
+import { backendAsync, waitJob } from './wmill';
 
-| Language         | Extension    | Example          |
-|------------------|--------------|------------------|
-| TypeScript       | `.ts`        | `myFunc.ts`      |
-| TypeScript (Bun) | `.bun.ts`    | `myFunc.bun.ts`  |
-| TypeScript (Deno)| `.deno.ts`   | `myFunc.deno.ts` |
-| Python           | `.py`        | `myFunc.py`      |
-| Go               | `.go`        | `myFunc.go`      |
-| Bash             | `.sh`        | `myFunc.sh`      |
-| PowerShell       | `.ps1`       | `myFunc.ps1`     |
-| PostgreSQL       | `.pg.sql`    | `myFunc.pg.sql`  |
-| MySQL            | `.my.sql`    | `myFunc.my.sql`  |
-| BigQuery         | `.bq.sql`    | `myFunc.bq.sql`  |
-| Snowflake        | `.sf.sql`    | `myFunc.sf.sql`  |
-| MS SQL           | `.ms.sql`    | `myFunc.ms.sql`  |
-| GraphQL          | `.gql`       | `myFunc.gql`     |
-| PHP              | `.php`       | `myFunc.php`     |
-| Rust             | `.rs`        | `myFunc.rs`      |
-| C#               | `.cs`        | `myFunc.cs`      |
-| Java             | `.java`      | `myFunc.java`    |
+const jobId = await backendAsync.run_report({ month: '2026-08' }); // a string
+const report = await waitJob(jobId);                               // the result itself
+```
 
-### Example Backend Runnable
+Or poll it without blocking, to render progress:
 
-**backend/get_user.ts:**
+```tsx
+import { getJob } from './wmill';
+
+const job = await getJob(jobId);
+if (job.type === 'CompletedJob') setReport(job.result);
+```
+
+`backendAsync` resolves a job id and nothing else — guard on it before storing or polling. A poll loop started on an `undefined` id never completes and shows as a row stuck "running" forever:
+
+```tsx
+const jobId = await backendAsync.run_report(args);
+if (!jobId) throw new Error('run_report did not start a job');
+```
+
+**Never hand-write a job-polling runnable.** A backend runnable that calls `jobs/list`, or that returns `getResultMaybe(...)` for the frontend to poll, reimplements `backendAsync` + `waitJob` / `getJob` / `streamJob` — and it is what leads to guessing at base URLs and tokens.
+
+### Keeping data out of recorded demos
+
+An app can be demoed by recording a session: every interaction becomes a step carrying a snapshot of the page, replayed publicly or on the Hub. Password inputs are masked automatically. Mark anything else that must not appear with `data-wm-no-record` — the whole marked subtree is dropped from every snapshot, along with its values and the step's own metadata:
+
+```tsx
+<label data-wm-no-record>
+  Customer SSN <input value={ssn} onChange={onSsn} />
+</label>
+```
+
+Apply it to customer data, internal notes and anything else a viewer of the demo should not see. It costs nothing when the app is never recorded.
+
+## Backend runnables
+
+Each runnable has a unique key (used to call it from the frontend) and one of four types:
+
+| Type | What it is |
+|---|---|
+| `inline` | Custom code stored on the app itself. Most common for app-specific logic. |
+| `script` | Reference to an existing workspace script by path. |
+| `flow` | Reference to an existing workspace flow by path. |
+| `hubscript` | Reference to a hub script by path. |
+
+### Inline runnables
+
+Inline runnables carry their own source code. For file-based raw apps, the runnable language is determined by the backend file extension. The script must expose a `main` function as its entrypoint.
+
+**TypeScript example** (`backend/get_user.ts`):
+
 ```typescript
 import * as wmill from 'windmill-client';
 
@@ -79,80 +122,57 @@ export async function main(user_id: string) {
 }
 ```
 
-After creating, generate lock files:
-```bash
-wmill app generate-locks
+**Python example** (`backend/get_user.py`):
+
+```python
+import wmill
+
+def main(user_id: str):
+    db = wmill.datatable()
+    user = db.query('SELECT * FROM users WHERE id = $1', user_id).fetch_one()
+    return user
 ```
 
-### Optional YAML Configuration
+#### The `wmill` client is already authenticated
 
-Add a `<id>.yaml` file to configure fields or static values:
+An inline runnable runs as an ordinary Windmill job. `import * as wmill from 'windmill-client'` (TypeScript) and `import wmill` (Python) are already pointed at this instance and this workspace — there is nothing to configure.
 
-**backend/get_user.yaml:**
-```yaml
-type: inline
-fields:
-  user_id:
-    type: static
-    value: "default_user"
-```
+**Don't read `WM_TOKEN` or `BASE_INTERNAL_URL` and build an API URL to `fetch`.** The client's own `setClient` already reads exactly those, and it also sets the credentials mode a raw app needs (`WM_RAW_APP` suppresses credentials, because a sandboxed bundle calls the API from an opaque origin that can never pair with `Access-Control-Allow-Origin: *`). Rebuilding that by hand drops the parts you can't see. Use `wmill.*` for everything Windmill, and `fetch` only for third-party APIs.
 
-### Referencing Existing Scripts
+Prefer the `wmill` functions that appear in the SDK reference; for an endpoint none of them covers, the generated service classes (`JobService`, `ScriptService`, ...) are importable from `windmill-client`. What is not available is a name you guessed at: `getBaseUrl` and `getWorkspaceToken` are inventions, not API.
 
-To use an existing Windmill script instead of inline code:
+### Path runnables (script / flow / hubscript)
 
-**backend/existing_script.yaml:**
-```yaml
-type: script
-path: f/my_folder/existing_script
-```
+When `type` is `script`, `flow`, or `hubscript`, the runnable just stores a `path` to an existing workspace or hub item — no inline code. The referenced item's input/output schema becomes the runnable's surface.
 
-For flows:
-```yaml
-type: flow
-path: f/my_folder/my_flow
-```
+### Draft code vs deployed code
 
-### Calling Backend from Frontend
+This decides whether an app works before anything is deployed:
 
-Import from the auto-generated `wmill.ts`:
+- **Inline runnables run the app's current code.** The editor sends the runnable's source with each request, so an inline runnable works in the preview with nothing deployed.
+- **Path runnables (`script` / `flow` / `hubscript`) run the DEPLOYED item at that path.** So do `wmill.runFlow`, `wmill.runFlowAsync` and `wmill.runScriptByPath` called from inside a runnable. A draft — including a draft you just created — does not exist for them.
 
-```typescript
-import { backend } from './wmill';
+So an app wired to a flow you just wrote does nothing until **that flow is deployed**. The app itself does NOT have to be deployed for this: the preview runs the app's draft, so the referenced flow is the only thing that has to exist deployed.
 
-// Call a backend runnable
-const user = await backend.get_user({ user_id: '123' });
-```
+That makes the fix a one-item deploy, not a release. Offer to deploy exactly the referenced flow or script and leave the app a draft the user keeps testing in the preview — do not push the whole change set through the review-and-deploy page, and do not ask the user to deploy the app, unless they said they want to ship it.
 
-The `wmill.ts` file provides type-safe access to all backend runnables.
+Do NOT quietly reimplement the flow inside an inline runnable to dodge the deployment: that leaves the user with two copies of the same logic and an app that ignores the flow they asked for. Inline the logic only when the user actually wants it inline.
+
+Prefer a **path runnable of type `flow`** over an inline runnable that calls `wmill.runFlowAsync`. The path runnable gives the frontend the flow's real input schema and works with `backend` / `backendAsync` / `waitJob` like any other runnable; a hand-written wrapper gives up all of that.
+
+### Static inputs
+
+`staticInputs` is an optional `Record<string, any>` for arguments not overridable from the frontend. Useful with path runnables to pre-fill some args while leaving the rest to the frontend caller.
 
 ## Data Tables
 
-Raw apps can query Windmill datatables (PostgreSQL databases managed by Windmill).
+Data tables are PostgreSQL databases managed by Windmill. Backend runnables query them via the `wmill` client; the frontend never queries them directly.
 
-### Critical Rules
+### Critical rules
 
-1. **ONLY USE WHITELISTED TABLES**: You can ONLY query tables listed in `raw_app.yaml` → `data.tables`. Tables not in this list are NOT accessible.
-
-2. **ADD TABLES BEFORE USING**: To use a new table, first add it to `data.tables` in `raw_app.yaml`.
-
-3. **USE CONFIGURED DATATABLE/SCHEMA**: Check the app's `raw_app.yaml` for the default datatable and schema.
-
-### Configuration in raw_app.yaml
-
-```yaml
-data:
-  datatable: main           # Default datatable
-  schema: app_schema        # Default schema (optional)
-  tables:
-    - main/users            # Table in public schema
-    - main/app_schema:items # Table in specific schema
-```
-
-**Table reference formats:**
-- `<datatable>` - All tables in the datatable
-- `<datatable>/<table>` - Specific table in public schema
-- `<datatable>/<schema>:<table>` - Table in specific schema
+1. **Whitelisted tables only**: a runnable can only query tables listed in the app's `data.tables` config. Tables not in this list are not accessible.
+2. **Add tables before using**: queries against unlisted tables fail at runtime. When you introduce a new table, register it in `data.tables` first.
+3. **Use the configured datatable/schema**: the app's `data` config sets the default datatable and schema; reference them consistently across runnables.
 
 ### Querying in TypeScript (Bun/Deno)
 
@@ -193,59 +213,13 @@ def main(user_id: str):
     return user
 ```
 
-## SQL Migrations (sql_to_apply/)
-
-The `sql_to_apply/` folder is for creating/modifying database tables during development.
-
-### Workflow
-
-1. Create `.sql` files in `sql_to_apply/`
-2. Run `wmill app dev` - the dev server watches this folder
-3. When SQL files change, a modal appears in the browser to confirm execution
-4. After creating tables, **add them to `data.tables`** in `raw_app.yaml`
-
-### Example Migration
-
-**sql_to_apply/001_create_users.sql:**
-```sql
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    email TEXT NOT NULL UNIQUE,
-    name TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-After applying, add to `raw_app.yaml`:
-```yaml
-data:
-  tables:
-    - main/users
-```
-
-### Migration Best Practices
-
-- **Use idempotent SQL**: `CREATE TABLE IF NOT EXISTS`, etc.
-- **Number files**: `001_`, `002_` for ordering
-- **Always whitelist tables** after creation
-- This folder is NOT synced - it's for local development only
-
-## CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `wmill app new` | Create a new raw app interactively |
-| `wmill app dev` | Start dev server with live reload |
-| `wmill app generate-agents` | Refresh AGENTS.md and DATATABLES.md |
-| `wmill app generate-locks` | Generate lock files for backend runnables |
-| `wmill sync push` | Deploy app to Windmill |
-| `wmill sync pull` | Pull latest from Windmill |
-
 ## Best Practices
 
-1. **Check DATATABLES.md** for existing tables before creating new ones
-2. **Use parameterized queries** - never concatenate user input into SQL
-3. **Keep runnables focused** - one function per file
-4. **Use descriptive IDs** - `get_user.ts` not `a.ts`
-5. **Always whitelist tables** - add to `data.tables` before querying
-6. **Generate locks** - run `wmill app generate-locks` after adding/modifying backend runnables
+1. **Check existing tables** before creating new ones — reuse beats schema growth.
+2. **Use parameterized queries** — never concatenate user input into SQL.
+3. **Keep runnables focused** — one function per runnable; small surface area.
+4. **Use descriptive keys** — `get_user`, not `a`.
+5. **Always whitelist tables** — adding a runnable that queries a new table requires the table to be in `data.tables` first.
+6. **Mark sensitive UI with `data-wm-no-record`** — it is what keeps that data out of a recorded demo; passwords are handled for you.
+7. **Reach for `backendAsync` + `waitJob`** for long work — never a hand-written job-polling runnable.
+8. **Deploy what a path runnable points at** — a path runnable aimed at a draft fails at runtime; tell the user what needs deploying.

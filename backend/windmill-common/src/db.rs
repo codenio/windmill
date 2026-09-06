@@ -4,6 +4,11 @@ use crate::audit::AuditAuthor;
 
 pub type DB = Pool<Postgres>;
 
+/// Workspace ID resolved by gateway middleware (stored in request extensions).
+/// Used by auth to resolve workspace when the URL path doesn't contain one.
+#[derive(Clone, Debug)]
+pub struct GatewayWorkspaceId(pub String);
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Authed {
     pub email: String,
@@ -15,6 +20,21 @@ pub struct Authed {
     pub folders: Vec<(String, bool, bool)>,
     pub scopes: Option<Vec<String>>,
     pub token_prefix: Option<String>,
+}
+
+impl Authed {
+    pub fn to_authed_ref(&self) -> AuthedRef<'_> {
+        AuthedRef {
+            email: &self.email,
+            username: &self.username,
+            is_admin: &self.is_admin,
+            is_operator: &self.is_operator,
+            groups: &self.groups,
+            folders: &self.folders,
+            scopes: &self.scopes,
+            token_prefix: &self.token_prefix,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -213,6 +233,7 @@ impl UserDB {
         let mut tx = self.db.begin().await?;
 
         if let Some(schema) = PG_SCHEMA.as_ref() {
+            // SAFETY: `schema` is an operator-controlled environment variable (PG_SCHEMA), set at deploy time and never user-supplied.
             sqlx::query(&format!("SET LOCAL search_path TO {}", schema))
                 .execute(&mut *tx)
                 .await?;

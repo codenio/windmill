@@ -1,6 +1,13 @@
 import { getContext, setContext } from 'svelte'
+import { enterpriseLicense } from '$lib/stores'
+import { get } from 'svelte/store'
+import { sendUserToast } from '$lib/toast'
+import { apiErrorMessage } from '$lib/utils'
 import { JobService, WorkspaceService, ResourceService } from '$lib/gen'
-import type { GitRepositorySettings as BackendGitRepositorySettings, GitSyncObjectType } from '$lib/gen'
+import type {
+	GitRepositorySettings as BackendGitRepositorySettings,
+	GitSyncObjectType
+} from '$lib/gen'
 import { jobManager } from '$lib/services/JobManager'
 import hubPaths from '$lib/hubPaths.json'
 import type { SettingsObject } from '$lib/git-sync'
@@ -37,9 +44,9 @@ export type GitSyncSettings = {
 }
 
 export type ModalState = {
-	push: { idx: number, repo: GitSyncRepository, open: boolean } | null
-	pull: { idx: number, repo: GitSyncRepository, open: boolean, settingsOnly?: boolean } | null
-	success: { open: boolean, savedWithoutInit?: boolean } | null
+	push: { idx: number; repo: GitSyncRepository; open: boolean } | null
+	pull: { idx: number; repo: GitSyncRepository; open: boolean; settingsOnly?: boolean } | null
+	success: { open: boolean; savedWithoutInit?: boolean; autoPullOn?: boolean } | null
 }
 
 export type ValidationState = {
@@ -101,10 +108,10 @@ export function createGitSyncContext(workspace: string) {
 		const validationStates = getValidationStates()
 
 		// Check if any individual repositories have changes
-		const individualChanges = validationStates.some(v => v.hasChanges)
+		const individualChanges = validationStates.some((v) => v.hasChanges)
 
 		// Check if any legacy repos were imported
-		const anyLegacyImported = repositories.some(r => r.legacyImported)
+		const anyLegacyImported = repositories.some((r) => r.legacyImported)
 
 		// Check if the set of repositories has changed (added/removed repos)
 		const repositorySetChanged = (() => {
@@ -113,31 +120,33 @@ export function createGitSyncContext(workspace: string) {
 			}
 
 			if (!initialRepositories || initialRepositories.length === 0) {
-				return repositories.filter((_,i) => validationStates[i]?.isValid).length > 0
+				return repositories.filter((_, i) => validationStates[i]?.isValid).length > 0
 			}
 
 			const initialValidPaths = new Set(
 				initialRepositories
-					.filter(r => r.git_repo_resource_path && r.git_repo_resource_path.trim() !== '')
-					.map(r => r.git_repo_resource_path)
+					.filter((r) => r.git_repo_resource_path && r.git_repo_resource_path.trim() !== '')
+					.map((r) => r.git_repo_resource_path)
 			)
 			const currentValidPaths = new Set(
 				repositories
-					.filter((_,i) => validationStates[i]?.isValid)
-					.map(r => r.git_repo_resource_path)
+					.filter((_, i) => validationStates[i]?.isValid)
+					.map((r) => r.git_repo_resource_path)
 			)
 
 			// Check if sets are different (repos added or removed)
-			return initialValidPaths.size !== currentValidPaths.size ||
-				   [...initialValidPaths].some(path => !currentValidPaths.has(path)) ||
-				   [...currentValidPaths].some(path => !initialValidPaths.has(path))
+			return (
+				initialValidPaths.size !== currentValidPaths.size ||
+				[...initialValidPaths].some((path) => !currentValidPaths.has(path)) ||
+				[...currentValidPaths].some((path) => !initialValidPaths.has(path))
+			)
 		})()
 
 		return individualChanges || anyLegacyImported || repositorySetChanged
 	}
 
-	const getAllRepositoriesValid = () => getValidationStates().every(v => v.isValid)
-	const getHasUnsavedConnections = () => repositories.some(repo => repo.isUnsavedConnection)
+	const getAllRepositoriesValid = () => getValidationStates().every((v) => v.isValid)
+	const getHasUnsavedConnections = () => repositories.some((repo) => repo.isUnsavedConnection)
 
 	function validateRepository(repo: GitSyncRepository, idx: number): boolean {
 		if (!repo.git_repo_resource_path) return false
@@ -146,7 +155,9 @@ export function createGitSyncContext(workspace: string) {
 
 	function checkDuplicate(repo: GitSyncRepository, idx: number): boolean {
 		if (!repo.git_repo_resource_path) return false
-		const firstIdx = repositories.findIndex(r => r.git_repo_resource_path === repo.git_repo_resource_path)
+		const firstIdx = repositories.findIndex(
+			(r) => r.git_repo_resource_path === repo.git_repo_resource_path
+		)
 		return firstIdx !== -1 && firstIdx < idx
 	}
 
@@ -157,7 +168,9 @@ export function createGitSyncContext(workspace: string) {
 		// Legacy repositories always have "changes" because they need migration
 		if (repo.legacyImported) return true
 
-		return JSON.stringify(serializeRepository(repo)) !== JSON.stringify(serializeRepository(initial))
+		return (
+			JSON.stringify(serializeRepository(repo)) !== JSON.stringify(serializeRepository(initial))
+		)
 	}
 
 	function serializeRepository(repo: GitSyncRepository) {
@@ -168,25 +181,41 @@ export function createGitSyncContext(workspace: string) {
 			group_by_folder: repo.group_by_folder,
 			settings: repo.settings,
 			exclude_types_override: repo.exclude_types_override,
+			auto_pull: repo.auto_pull,
+			promotion_open_prs: repo.promotion_open_prs,
+			fork_open_prs: repo.fork_open_prs
 		}
 	}
 
 	function addRepository() {
 		repositories.push({
 			git_repo_resource_path: '',
-			script_path: hubPaths.gitSync,
+			script_path: undefined,
 			use_individual_branch: false,
 			group_by_folder: false,
 			settings: {
 				include_path: ['f/**'],
 				exclude_path: [],
 				extra_include_path: [],
-				include_type: ['script', 'flow', 'app', 'folder']
+				include_type: [
+					'script',
+					'flow',
+					'app',
+					'folder',
+					'workspacedependencies',
+					'datatablemigration'
+				]
 			},
 			exclude_types_override: [],
 			legacyImported: false,
 			isUnsavedConnection: true,
-			collapsed: false
+			collapsed: false,
+			// New connections default to pulling changes from Git (webhook with a
+			// polling fallback), forks included. Existing repos load without
+			// auto_pull and stay off until an admin opts in, so upgrades never
+			// start auto-deploying.
+			auto_pull: { enabled: true, mode: 'auto', sync_forks: true },
+			fork_open_prs: true
 		})
 		gitSyncTestJobs.push({
 			jobId: '',
@@ -200,7 +229,7 @@ export function createGitSyncContext(workspace: string) {
 
 		// Check if this repository exists in the initial (saved) state
 		const existsInInitialState = initialRepositories.some(
-			initialRepo => initialRepo.git_repo_resource_path === repo.git_repo_resource_path
+			(initialRepo) => initialRepo.git_repo_resource_path === repo.git_repo_resource_path
 		)
 
 		// Only call backend API if repository exists in the saved state
@@ -214,7 +243,7 @@ export function createGitSyncContext(workspace: string) {
 
 			// Update initial state to remove the deleted repository
 			const initialIdx = initialRepositories.findIndex(
-				initialRepo => initialRepo.git_repo_resource_path === repo.git_repo_resource_path
+				(initialRepo) => initialRepo.git_repo_resource_path === repo.git_repo_resource_path
 			)
 			if (initialIdx !== -1) {
 				initialRepositories.splice(initialIdx, 1)
@@ -261,8 +290,8 @@ export function createGitSyncContext(workspace: string) {
 		closeModal('pull')
 	}
 
-	function showSuccessModal(savedWithoutInit?: boolean) {
-		activeModals.success = { open: true, savedWithoutInit }
+	function showSuccessModal(savedWithoutInit?: boolean, autoPullOn?: boolean) {
+		activeModals.success = { open: true, savedWithoutInit, autoPullOn }
 	}
 
 	function closeSuccessModal() {
@@ -309,45 +338,42 @@ export function createGitSyncContext(workspace: string) {
 			repo._detectionTimestamp = detectionTimestamp
 
 			// Use JobManager for polling - result will be the actual job response
-			await jobManager.runWithProgress(
-				() => Promise.resolve(jobId),
-				{
-					workspace,
-					timeout: 60000,
-					timeoutMessage: 'Detection job timed out after 60s',
-					onProgress: (status) => {
-						// Only update state if this detection is still current
-						if (repo._detectionTimestamp !== detectionTimestamp) {
-							return
-						}
+			await jobManager.runWithProgress(() => Promise.resolve(jobId), {
+				workspace,
+				timeout: 60000,
+				timeoutMessage: 'Detection job timed out after 60s',
+				onProgress: (status) => {
+					// Only update state if this detection is still current
+					if (repo._detectionTimestamp !== detectionTimestamp) {
+						return
+					}
 
-						repo.detectionJobStatus = status.status
+					repo.detectionJobStatus = status.status
 
-						// Process successful detection result
-						if (status.status === 'success' && status.result) {
-							const response = status.result as any
-							if (response.isInitialSetup) {
-								repo.detectionState = 'no-wmill'
-							} else {
-								repo.detectionState = 'has-wmill'
-								// Apply extracted settings from the git repository
-								if (response.local) {
-									repo.extractedSettings = response.local
-									// Auto-apply the extracted settings
-									repo.settings = {
-										...response.local,
-										exclude_path: response.local.exclude_path || [],
-										extra_include_path: response.local.extra_include_path || []
-									}
+					// Process successful detection result
+					if (status.status === 'success' && status.result) {
+						const response = status.result as any
+						if (response.isInitialSetup) {
+							repo.detectionState = 'no-wmill'
+						} else {
+							repo.detectionState = 'has-wmill'
+							// Apply extracted settings from the git repository
+							if (response.local) {
+								repo.extractedSettings = response.local
+								// Auto-apply the extracted settings
+								repo.settings = {
+									...response.local,
+									exclude_path: response.local.exclude_path || [],
+									extra_include_path: response.local.extra_include_path || []
 								}
 							}
-						} else if (status.status === 'failure') {
-							repo.detectionState = 'error'
-							repo.detectionError = status.error || 'Detection failed'
 						}
+					} else if (status.status === 'failure') {
+						repo.detectionState = 'error'
+						repo.detectionError = status.error || 'Detection failed'
 					}
 				}
-			)
+			})
 		} catch (error: any) {
 			// Only set error if this detection is still current
 			if (repo._detectionTimestamp !== detectionTimestamp) {
@@ -355,7 +381,7 @@ export function createGitSyncContext(workspace: string) {
 			}
 
 			repo.detectionState = 'error'
-			repo.detectionError = error?.message || error?.toString() || 'Failed to detect repository'
+			repo.detectionError = apiErrorMessage(error) || 'Failed to detect repository'
 			repo.detectionJobStatus = 'failure'
 		}
 	}
@@ -369,67 +395,101 @@ export function createGitSyncContext(workspace: string) {
 			if (settings.git_sync !== undefined && settings.git_sync !== null) {
 				// Detect workspace-level legacy settings (outside repositories)
 				const workspaceLegacyIncludePath: string[] = (settings.git_sync as any)?.include_path ?? []
-				const workspaceLegacyIncludeTypeRaw: GitSyncObjectType[] = (settings.git_sync as any)?.include_type ?? []
+				const workspaceLegacyIncludeTypeRaw: GitSyncObjectType[] =
+					(settings.git_sync as any)?.include_type ?? []
 				const workspaceLegacyIncludeType: GitSyncObjectType[] = [...workspaceLegacyIncludeTypeRaw]
 
 				// Update legacy workspace state
-				legacyWorkspaceIncludePath.splice(0, legacyWorkspaceIncludePath.length, ...workspaceLegacyIncludePath)
-				legacyWorkspaceIncludeType.splice(0, legacyWorkspaceIncludeType.length, ...workspaceLegacyIncludeType)
+				legacyWorkspaceIncludePath.splice(
+					0,
+					legacyWorkspaceIncludePath.length,
+					...workspaceLegacyIncludePath
+				)
+				legacyWorkspaceIncludeType.splice(
+					0,
+					legacyWorkspaceIncludeType.length,
+					...workspaceLegacyIncludeType
+				)
 
 				if (settings.git_sync.repositories) {
-					repositories.splice(0, repositories.length, ...settings.git_sync.repositories.map(repo => {
-						// Check if this is a legacy repo (no nested settings object)
-						const isRepoLegacy = !repo.settings
-						const repoExcludeTypesOverride = repo.exclude_types_override ?? []
+					repositories.splice(
+						0,
+						repositories.length,
+						...settings.git_sync.repositories.map((repo) => {
+							// Check if this is a legacy repo (no nested settings object)
+							const isRepoLegacy = !repo.settings
+							const repoExcludeTypesOverride = repo.exclude_types_override ?? []
 
-						// Determine default types - use workspace legacy or fallback
-						const defaultTypes: GitSyncObjectType[] = workspaceLegacyIncludeType.length > 0
-							? [...workspaceLegacyIncludeType]
-							: ['script', 'flow', 'app', 'folder']
+							// Determine default types - use workspace legacy or fallback
+							const defaultTypes: GitSyncObjectType[] =
+								workspaceLegacyIncludeType.length > 0
+									? [...workspaceLegacyIncludeType]
+									: [
+											'script',
+											'flow',
+											'app',
+											'folder',
+											'workspacedependencies',
+											'datatablemigration'
+										]
 
-						let repoSettings: SettingsObject
-						if (isRepoLegacy) {
-							// Legacy repo: inherit from workspace-level settings and apply exclude_types_override
-							const inheritedIncludeType = repo.settings?.include_type ?? [...defaultTypes]
-							const effectiveIncludeType = repoExcludeTypesOverride.length > 0
-								? inheritedIncludeType.filter(type => !repoExcludeTypesOverride.includes(type))
-								: inheritedIncludeType
+							let repoSettings: SettingsObject
+							if (isRepoLegacy) {
+								// Legacy repo: inherit from workspace-level settings and apply exclude_types_override
+								const inheritedIncludeType = repo.settings?.include_type ?? [...defaultTypes]
+								const effectiveIncludeType =
+									repoExcludeTypesOverride.length > 0
+										? inheritedIncludeType.filter(
+												(type) => !repoExcludeTypesOverride.includes(type)
+											)
+										: inheritedIncludeType
 
-							repoSettings = {
-								include_path: repo.settings?.include_path ?? [...workspaceLegacyIncludePath],
-								exclude_path: repo.settings?.exclude_path ?? [],
-								extra_include_path: repo.settings?.extra_include_path ?? [],
-								include_type: effectiveIncludeType
+								repoSettings = {
+									include_path: repo.settings?.include_path ?? [...workspaceLegacyIncludePath],
+									exclude_path: repo.settings?.exclude_path ?? [],
+									extra_include_path: repo.settings?.extra_include_path ?? [],
+									include_type: effectiveIncludeType
+								}
+							} else {
+								// New format: use repo's own settings
+								repoSettings = {
+									include_path: repo.settings?.include_path ?? ['f/**'],
+									exclude_path: repo.settings?.exclude_path ?? [],
+									extra_include_path: repo.settings?.extra_include_path ?? [],
+									include_type: repo.settings?.include_type ?? [
+										'script',
+										'flow',
+										'app',
+										'folder',
+										'workspacedependencies',
+										'datatablemigration'
+									]
+								}
 							}
-						} else {
-							// New format: use repo's own settings
-							repoSettings = {
-								include_path: repo.settings?.include_path ?? ['f/**'],
-								exclude_path: repo.settings?.exclude_path ?? [],
-								extra_include_path: repo.settings?.extra_include_path ?? [],
-								include_type: repo.settings?.include_type ?? ['script', 'flow', 'app']
-							}
-						}
 
-						return {
-							...repo,
-							git_repo_resource_path: repo.git_repo_resource_path.replace('$res:', ''),
-							settings: repoSettings,
-							exclude_types_override: repoExcludeTypesOverride,
-							// Mark legacy repos for UI handling
-							legacyImported: isRepoLegacy
-						}
-					}))
+							return {
+								...repo,
+								git_repo_resource_path: repo.git_repo_resource_path.replace('$res:', ''),
+								settings: repoSettings,
+								exclude_types_override: repoExcludeTypesOverride,
+								// Mark legacy repos for UI handling
+								legacyImported: isRepoLegacy
+							}
+						})
+					)
 				}
 			}
 
 			// Store initial state for change tracking
-			initialRepositories.splice(0, initialRepositories.length, ...repositories.map(repo => ({ ...repo })))
+			initialRepositories.splice(
+				0,
+				initialRepositories.length,
+				...repositories.map((repo) => ({ ...repo }))
+			)
 		} finally {
 			loading = false
 		}
 	}
-
 
 	// Migration utility for legacy repositories
 	function migrateLegacyRepository(repo: GitSyncRepository): GitSyncRepository {
@@ -466,7 +526,10 @@ export function createGitSyncContext(workspace: string) {
 					use_individual_branch: repoToSave.use_individual_branch,
 					group_by_folder: repoToSave.group_by_folder,
 					settings: repoToSave.settings,
-					exclude_types_override: repoToSave.exclude_types_override
+					exclude_types_override: repoToSave.exclude_types_override,
+					auto_pull: repoToSave.auto_pull,
+					promotion_open_prs: repoToSave.promotion_open_prs,
+					fork_open_prs: repoToSave.fork_open_prs
 				}
 			}
 		})
@@ -481,11 +544,9 @@ export function createGitSyncContext(workspace: string) {
 			repoToSave.detectionState = undefined
 			repoToSave.extractedSettings = undefined
 			// Show success modal for new connections
-			showSuccessModal(savedWithoutInit)
+			showSuccessModal(savedWithoutInit, repoToSave.auto_pull?.enabled === true)
 		}
 	}
-
-
 
 	// Helper functions for original functionality
 
@@ -495,8 +556,6 @@ export function createGitSyncContext(workspace: string) {
 			repositories[idx] = JSON.parse(JSON.stringify(initial))
 		}
 	}
-
-
 
 	// Reset detection state for a repository
 	function resetDetectionState(idx: number) {
@@ -515,10 +574,9 @@ export function createGitSyncContext(workspace: string) {
 		repo.detectionJobStatus = undefined
 	}
 
-
 	async function runTestJob(idx: number) {
 		const repo = repositories[idx]
-		if (!repo?.git_repo_resource_path || !repo?.script_path) {
+		if (!repo?.git_repo_resource_path) {
 			return
 		}
 
@@ -539,24 +597,25 @@ export function createGitSyncContext(workspace: string) {
 			}
 
 			// Use JobManager for polling
-			await jobManager.runWithProgress(
-				() => Promise.resolve(jobId),
-				{
-					workspace,
-					timeout: 5000,
-					timeoutMessage: 'Git sync test job timed out after 5s',
-					onProgress: (status) => {
-						gitSyncTestJobs[idx].status = status.status === 'success' ? 'success' :
-							status.status === 'failure' ? 'failure' : 'running'
-						if (status.status === 'failure') {
-							gitSyncTestJobs[idx].error = status.error
-						}
+			await jobManager.runWithProgress(() => Promise.resolve(jobId), {
+				workspace,
+				timeout: 10000,
+				timeoutMessage: 'Git sync test job timed out after 10s',
+				onProgress: (status) => {
+					gitSyncTestJobs[idx].status =
+						status.status === 'success'
+							? 'success'
+							: status.status === 'failure'
+								? 'failure'
+								: 'running'
+					if (status.status === 'failure') {
+						gitSyncTestJobs[idx].error = status.error
 					}
 				}
-			)
+			})
 		} catch (error: any) {
 			// Initialize the job entry if it doesn't exist (e.g., job creation failed)
-			const errorMessage = (typeof error?.body === 'string' ? error.body : error?.body?.message) || error?.message || error?.toString() || 'Failed to run test job'
+			const errorMessage = apiErrorMessage(error) || 'Failed to run test job'
 			if (!gitSyncTestJobs[idx]) {
 				gitSyncTestJobs[idx] = {
 					jobId: '',
@@ -570,18 +629,18 @@ export function createGitSyncContext(workspace: string) {
 		}
 	}
 
-	function getPrimarySyncRepository(): { repo: GitSyncRepository, idx: number } | null {
-		const idx = repositories.findIndex(r => !r.use_individual_branch)
+	function getPrimarySyncRepository(): { repo: GitSyncRepository; idx: number } | null {
+		const idx = repositories.findIndex((r) => !r.use_individual_branch)
 		return idx !== -1 ? { repo: repositories[idx], idx } : null
 	}
 
-	function getPrimaryPromotionRepository(): { repo: GitSyncRepository, idx: number } | null {
-		const idx = repositories.findIndex(r => r.use_individual_branch)
+	function getPrimaryPromotionRepository(): { repo: GitSyncRepository; idx: number } | null {
+		const idx = repositories.findIndex((r) => r.use_individual_branch)
 		return idx !== -1 ? { repo: repositories[idx], idx } : null
 	}
 
-	function getSecondarySyncRepositories(): { repo: GitSyncRepository, idx: number }[] {
-		const result: { repo: GitSyncRepository, idx: number }[] = []
+	function getSecondarySyncRepositories(): { repo: GitSyncRepository; idx: number }[] {
+		const result: { repo: GitSyncRepository; idx: number }[] = []
 		let foundFirst = false
 		repositories.forEach((repo, idx) => {
 			if (!repo.use_individual_branch) {
@@ -595,8 +654,8 @@ export function createGitSyncContext(workspace: string) {
 		return result
 	}
 
-	function getSecondaryPromotionRepositories(): { repo: GitSyncRepository, idx: number }[] {
-		const result: { repo: GitSyncRepository, idx: number }[] = []
+	function getSecondaryPromotionRepositories(): { repo: GitSyncRepository; idx: number }[] {
+		const result: { repo: GitSyncRepository; idx: number }[] = []
 		let foundFirst = false
 		repositories.forEach((repo, idx) => {
 			if (repo.use_individual_branch) {
@@ -611,28 +670,42 @@ export function createGitSyncContext(workspace: string) {
 	}
 
 	async function removeRepositoryByPath(resourcePath: string) {
-		const idx = repositories.findIndex(r => r.git_repo_resource_path === resourcePath)
+		const idx = repositories.findIndex((r) => r.git_repo_resource_path === resourcePath)
 		if (idx !== -1) {
 			await removeRepository(idx)
 		}
 	}
 
 	function addSyncRepository() {
+		if (!get(enterpriseLicense) && repositories && repositories.length >= 1) {
+			sendUserToast('Multiple repositories requires Enterprise Edition', true)
+			return
+		}
 		repositories.push({
 			git_repo_resource_path: '',
-			script_path: hubPaths.gitSync,
+			script_path: undefined,
 			use_individual_branch: false,
 			group_by_folder: false,
 			settings: {
 				include_path: ['f/**'],
 				exclude_path: [],
 				extra_include_path: [],
-				include_type: ['script', 'flow', 'app', 'folder']
+				include_type: [
+					'script',
+					'flow',
+					'app',
+					'folder',
+					'workspacedependencies',
+					'datatablemigration'
+				]
 			},
 			exclude_types_override: [],
 			legacyImported: false,
 			isUnsavedConnection: true,
 			collapsed: false
+			// Pull-from-Git defaults are applied by the repository card once the
+			// selected resource resolves: only app-backed repos (instant webhook
+			// delivery) default to auto-pull on; polling is opt-in for token repos.
 		})
 		gitSyncTestJobs.push({
 			jobId: '',
@@ -641,21 +714,35 @@ export function createGitSyncContext(workspace: string) {
 	}
 
 	function addPromotionRepository() {
+		if (!get(enterpriseLicense)) {
+			sendUserToast('Promotion mode requires Enterprise Edition', true)
+			return
+		}
 		repositories.push({
 			git_repo_resource_path: '',
-			script_path: hubPaths.gitSync,
+			script_path: undefined,
 			use_individual_branch: true,
 			group_by_folder: false,
 			settings: {
 				include_path: ['f/**'],
 				exclude_path: [],
 				extra_include_path: [],
-				include_type: ['script', 'flow', 'app', 'folder']
+				include_type: [
+					'script',
+					'flow',
+					'app',
+					'folder',
+					'workspacedependencies',
+					'datatablemigration'
+				]
 			},
 			exclude_types_override: [],
 			legacyImported: false,
 			isUnsavedConnection: true,
-			collapsed: false
+			collapsed: false,
+			// New promotion repos default to opening the PR in-app when a deploy
+			// pushes its wm_deploy/** branch (app-backed repos only at runtime).
+			promotion_open_prs: true
 		})
 		gitSyncTestJobs.push({
 			jobId: '',
@@ -697,20 +784,44 @@ export function createGitSyncContext(workspace: string) {
 	// Return context object
 	return {
 		// State (read-only access)
-		get repositories() { return repositories },
-		get loading() { return loading },
-		get activeModals() { return activeModals },
-		get gitSyncTestJobs() { return gitSyncTestJobs },
-		get initialRepositories() { return initialRepositories },
-		get legacyWorkspaceIncludePath() { return legacyWorkspaceIncludePath },
-		get legacyWorkspaceIncludeType() { return legacyWorkspaceIncludeType },
+		get repositories() {
+			return repositories
+		},
+		get loading() {
+			return loading
+		},
+		get activeModals() {
+			return activeModals
+		},
+		get gitSyncTestJobs() {
+			return gitSyncTestJobs
+		},
+		get initialRepositories() {
+			return initialRepositories
+		},
+		get legacyWorkspaceIncludePath() {
+			return legacyWorkspaceIncludePath
+		},
+		get legacyWorkspaceIncludeType() {
+			return legacyWorkspaceIncludeType
+		},
 
 		// Computed states - use getter functions that compute on access
-		get validationStates() { return getValidationStates() },
-		get hasAnyChanges() { return getHasAnyChanges() },
-		get allRepositoriesValid() { return getAllRepositoriesValid() },
-		get hasUnsavedConnections() { return getHasUnsavedConnections() },
-		get hasWorkspaceLevelSettings() { return hasWorkspaceLevelSettings },
+		get validationStates() {
+			return getValidationStates()
+		},
+		get hasAnyChanges() {
+			return getHasAnyChanges()
+		},
+		get allRepositoriesValid() {
+			return getAllRepositoriesValid()
+		},
+		get hasUnsavedConnections() {
+			return getHasUnsavedConnections()
+		},
+		get hasWorkspaceLevelSettings() {
+			return hasWorkspaceLevelSettings
+		},
 
 		// Methods
 		addRepository,
@@ -741,7 +852,7 @@ export function createGitSyncContext(workspace: string) {
 		getSecondaryPromotionRepositories,
 
 		// Helper methods
-		getTargetBranch,
+		getTargetBranch
 	}
 }
 

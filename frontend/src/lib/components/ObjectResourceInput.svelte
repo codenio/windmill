@@ -18,7 +18,10 @@
 		editor?: SimpleEditor | undefined
 		path?: string
 		disabled?: boolean
+		datatableAsPgResource?: boolean
 		onClear?: () => void
+		/** Workspace the resource picker lists from; defaults to the nav workspace. */
+		workspace?: string
 	}
 
 	let {
@@ -30,16 +33,24 @@
 		defaultValue,
 		editor = $bindable(undefined),
 		disabled = false,
-		onClear = undefined
+		datatableAsPgResource = false,
+		onClear = undefined,
+		workspace = undefined
 	}: Props = $props()
 
 	function isResource() {
-		return isString(value) && value.length >= '$res:'.length
+		return isString(value) && value.startsWith('$res:')
+	}
+
+	function isDatatable(val: any): boolean {
+		return (isString(val) && val.startsWith('datatable://')) || val === 'datatable'
 	}
 
 	function valueToPath() {
 		if (isResource()) {
 			return value.substr('$res:'.length)
+		} else if (isDatatable(value)) {
+			return value
 		}
 	}
 </script>
@@ -47,20 +58,22 @@
 <!-- {JSON.stringify({ value })} -->
 <div class="flex flex-row w-full flex-wrap gap-x-2 gap-y-0.5">
 	{#if format === 'resource-s3_object'}
-		<S3ObjectPicker bind:value />
+		<S3ObjectPicker bind:value {workspace} />
 	{:else if value == undefined || typeof value === 'string'}
 		<ResourcePicker
+			{datatableAsPgResource}
 			{disabled}
 			{selectFirst}
 			{disablePortal}
 			{onClear}
+			{workspace}
 			bind:value={
 				() => valueToPath(),
 				(v) => {
 					if (v == undefined) {
 						value = undefined
 					} else {
-						value = `$res:${v}`
+						value = isDatatable(v) ? v : `$res:${v}`
 					}
 				}
 			}

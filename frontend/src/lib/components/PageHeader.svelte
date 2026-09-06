@@ -1,11 +1,27 @@
 <script lang="ts">
 	import Tooltip from './Tooltip.svelte'
 
-	export let title: string
-	export let tooltip: string = ''
-	export let documentationLink: string | undefined = undefined
-	export let primary: boolean = true
-	export let childrenWrapperDivClasses: string = ''
+	interface Props {
+		title: string
+		tooltip?: string
+		documentationLink?: string | undefined
+		primary?: boolean
+		childrenWrapperDivClasses?: string
+		// Inline actions rendered right after the title (e.g. a copy-id button),
+		// as opposed to `children` which lands on the far right of the header row.
+		titleActions?: import('svelte').Snippet
+		children?: import('svelte').Snippet
+	}
+
+	let {
+		title,
+		tooltip = '',
+		documentationLink = undefined,
+		primary = true,
+		childrenWrapperDivClasses = '',
+		titleActions,
+		children
+	}: Props = $props()
 </script>
 
 <div class="flex flex-row flex-wrap justify-between items-center pb-2 my-4 mr-2 min-h-16">
@@ -19,6 +35,7 @@
 					{tooltip}
 				</Tooltip>
 			{/if}
+			{@render titleActions?.()}
 		</span>
 	{:else}
 		<span class="flex items-center gap-2">
@@ -28,12 +45,13 @@
 					{tooltip}
 				</Tooltip>
 			{/if}
+			{@render titleActions?.()}
 		</span>
 	{/if}
 
-	{#if $$slots.default}
+	{#if children}
 		<div class="my-2 {childrenWrapperDivClasses}">
-			<slot />
+			{@render children?.()}
 		</div>
 	{/if}
 </div>

@@ -2,7 +2,13 @@ import sys
 import os
 from importlib.abc import MetaPathFinder, Loader
 from importlib.machinery import ModuleSpec, SourceFileLoader
+from importlib.util import spec_from_file_location
 import time
+
+# Injected by backend: maps script path -> temp storage hash so preview jobs
+# resolve relative imports from not-yet-deployed local content. Empty ({}) for
+# deployed runs.
+TEMP_SCRIPT_REFS = TEMP_SCRIPT_REFS_PLACEHOLDER
 
 class WindmillLoader(Loader):
     def __init__(self, path):
@@ -33,7 +39,7 @@ class WindmillFinder(MetaPathFinder):
             fullpath = folder + "/" + splitted[-1] + ".py"
 
             if os.path.exists(fullpath):
-                return ModuleSpec(name, SourceFileLoader(name, fullpath))
+                return spec_from_file_location(name, fullpath)
 
 
             import urllib.parse
@@ -48,6 +54,9 @@ class WindmillFinder(MetaPathFinder):
             runnable_id = os.environ.get('WM_RUNNABLE_ID')
             if runnable_id:
                 query_params += f"&cache_key={runnable_id}"
+            temp_hash = TEMP_SCRIPT_REFS.get(script_path) if TEMP_SCRIPT_REFS else None
+            if temp_hash:
+                query_params += f"&temp_script_hash={temp_hash}"
             url = f"{os.environ.get('BASE_INTERNAL_URL')}/api/w/{os.environ.get('WM_WORKSPACE')}/scripts/raw/p/{script_path}.py{query_params}"
 
             req = urllib.request.Request(url, None, headers)
@@ -60,9 +69,13 @@ class WindmillFinder(MetaPathFinder):
                         r = response.read().decode("utf-8")
                         if r == "WINDMILL_IS_FOLDER":
                             return ModuleSpec(name, WindmillLoader(name))
-                        with open(fullpath, "w+") as f:
+                        # Python parses .py as UTF-8 regardless of locale, so the
+                        # file has to be written as UTF-8. Without this the ANSI
+                        # code page on a Windows worker re-encodes every
+                        # non-ASCII literal and the import dies on a SyntaxError.
+                        with open(fullpath, "w+", encoding="utf-8") as f:
                             f.write(r)
-                        return ModuleSpec(name, SourceFileLoader(name, fullpath))
+                        return spec_from_file_location(name, fullpath)
                 except urllib.error.HTTPError as e:
                     duration = time.time() - req_start
                     if e.code != 404:

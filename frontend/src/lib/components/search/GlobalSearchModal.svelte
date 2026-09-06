@@ -3,7 +3,6 @@
 	import {
 		AppService,
 		FlowService,
-		RawAppService,
 		ScriptService,
 		type Flow,
 		type ListableApp,
@@ -41,9 +40,16 @@
 	import { Alert } from '../common'
 	import Popover from '../Popover.svelte'
 	import Logs from 'lucide-svelte/icons/logs'
-	import { AwsIcon, GoogleCloudIcon, KafkaIcon, MqttIcon, NatsIcon } from '../icons'
+	import AwsIcon from '../icons/AwsIcon.svelte'
+	import AzureIcon from '../icons/AzureIcon.svelte'
+	import GoogleCloudIcon from '../icons/GoogleCloudIcon.svelte'
+	import KafkaIcon from '../icons/KafkaIcon.svelte'
+	import MqttIcon from '../icons/MqttIcon.svelte'
+	import AmqpIcon from '../icons/AmqpIcon.svelte'
+	import NatsIcon from '../icons/NatsIcon.svelte'
 	import RunsSearch from './RunsSearch.svelte'
 	import AskAiButton from '../copilot/AskAiButton.svelte'
+	import { copilotInfo } from '$lib/aiStore'
 
 	let open: boolean = $state(false)
 
@@ -140,10 +146,24 @@
 			disabled: $userStore?.operator
 		},
 		{
+			search_id: 'nav:azure_event_grid',
+			label: 'Go to Azure Event Grid' + (!$enterpriseLicense ? '' : ' (EE)'),
+			action: (newtab: boolean = false) => gotoPage('/azure_triggers', newtab),
+			icon: AzureIcon,
+			disabled: $userStore?.operator
+		},
+		{
 			search_id: 'nav:mqtt_triggers',
 			label: 'Go to MQTT triggers',
 			action: (newtab: boolean = false) => gotoPage('/mqtt_triggers', newtab),
 			icon: MqttIcon,
+			disabled: $userStore?.operator
+		},
+		{
+			search_id: 'nav:amqp_triggers',
+			label: 'Go to AMQP triggers',
+			action: (newtab: boolean = false) => gotoPage('/amqp_triggers', newtab),
+			icon: AmqpIcon,
 			disabled: $userStore?.operator
 		},
 		{
@@ -466,7 +486,6 @@
 		type?: U
 		time?: number
 		starred?: boolean
-		has_draft?: boolean
 	}
 
 	// interface SelectableSearchMenuItem {
@@ -492,7 +511,6 @@
 			withoutDescription: true
 		})
 		const apps = await AppService.listApps({ workspace: $workspaceStore! })
-		const raw_apps = await RawAppService.listRawApps({ workspace: $workspaceStore! })
 
 		let combinedItems: (TableScript | TableFlow | TableApp | TableRawApp)[] | undefined = [
 			...flows.map((x) => ({
@@ -501,21 +519,19 @@
 				time: new Date(x.edited_at).getTime(),
 				search_id: x.path
 			})),
-			...scripts.map((x) => ({
-				...x,
-				type: 'script' as 'script',
-				time: new Date(x.created_at).getTime(),
-				search_id: x.path
-			})),
+			// Pipeline-member scripts (`auto_kind='pipeline'`) are reached through
+			// their pipeline, not searched individually.
+			...scripts
+				.filter((x) => x.auto_kind !== 'pipeline')
+				.map((x) => ({
+					...x,
+					type: 'script' as 'script',
+					time: new Date(x.created_at).getTime(),
+					search_id: x.path
+				})),
 			...apps.map((x) => ({
 				...x,
 				type: 'app' as 'app',
-				time: new Date(x.edited_at).getTime(),
-				search_id: x.path
-			})),
-			...raw_apps.map((x) => ({
-				...x,
-				type: 'raw_app' as 'raw_app',
 				time: new Date(x.edited_at).getTime(),
 				search_id: x.path
 			}))
@@ -633,7 +649,7 @@
 							{placeholderFromPrefix(searchTerm)}
 						</label>
 					</div>
-					{#if (itemMap[tab] ?? []).length === 0 && searchTerm.length > 0}
+					{#if (itemMap[tab] ?? []).length === 0 && searchTerm.length > 0 && !$copilotInfo.workspaceDisabled}
 						<AskAiButton
 							bind:this={askAiButton}
 							label="Ask AI"
@@ -709,16 +725,18 @@
 
 						{#if (itemMap[tab] ?? []).length === 0}
 							<div class="p-2">
-								<QuickMenuItem
-									onselect={() => {
-										askAiButton?.onClick()
-									}}
-									id={'ai:no-results-ask-ai'}
-									hovered={true}
-									label={`Try asking \`${searchTerm}\` to AI`}
-									icon={WandSparkles}
-									bind:mouseMoved
-								/>
+								{#if !$copilotInfo.workspaceDisabled}
+									<QuickMenuItem
+										onselect={() => {
+											askAiButton?.onClick()
+										}}
+										id={'ai:no-results-ask-ai'}
+										hovered={true}
+										label={`Try asking \`${searchTerm}\` to AI`}
+										icon={WandSparkles}
+										bind:mouseMoved
+									/>
+								{/if}
 								<div class="flex w-full justify-center items-center">
 									<div class="text-primary text-center">
 										<div class="pt-1 text-sm">Tip: press `esc` to quickly clear the search bar</div>

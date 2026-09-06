@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { createEventDispatcher, getContext, tick } from 'svelte'
+	import { createEventDispatcher, getContext, tick, untrack } from 'svelte'
 	import type { AppInput } from '../../../inputType'
 	import type { AppViewerContext } from '../../../types'
 	import type RunnableComponent from '../../helpers/RunnableComponent.svelte'
@@ -18,7 +18,7 @@
 
 	const { worldStore } = getContext<AppViewerContext>('AppViewerContext')
 
-	let outputs = initOutput($worldStore, `${id}_insert`, {
+	let outputs = initOutput($worldStore, `${untrack(() => id)}_insert`, {
 		result: undefined,
 		loading: false,
 		jobId: undefined
@@ -59,8 +59,8 @@
 				onCancel: () => {
 					sendUserToast('Error inserting row', true)
 				},
-				onError: () => {
-					sendUserToast('Error inserting row', true)
+				onError: (e) => {
+					sendUserToast(`Error inserting row: ${e?.message ?? e}`, true)
 				}
 			})
 		}

@@ -5,7 +5,7 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 
 const execAsync = promisify(exec)
-const VERSION = '1.0.12'
+const VERSION = '1.0.13'
 
 export default defineConfig({
 	build: {
@@ -16,7 +16,7 @@ export default defineConfig({
 			formats: ['es']
 		},
 		outDir: 'dist/sharedUtils',
-		rollupOptions: {
+		rolldownOptions: {
 			external: [],
 			output: {
 				globals: {}

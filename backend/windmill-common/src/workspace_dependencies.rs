@@ -18,8 +18,6 @@ use phf::phf_set;
 
 pub static BLACKLIST: phf::Set<&'static str> = phf_set! {
     "u/admin/hub_sync",
-    "g/all/setup_app/app",
-    "g/all/setup_app"
 };
 
 lazy_static::lazy_static! {
@@ -386,8 +384,11 @@ impl WorkspaceDependenciesPrefetched {
 
         Box::pin(async {
             let r = if let Some(wdar) =
-                language.extract_workspace_dependencies_annotated_refs(code, runnable_path)
-            {
+                crate::scripts::extract_workspace_dependencies_annotated_refs(
+                    &language,
+                    code,
+                    runnable_path,
+                ) {
                 tracing::debug!(workspace_id, ?language, "found explicit annotations");
 
                 let expanded = wdar
@@ -509,7 +510,7 @@ impl WorkspaceDependenciesPrefetched {
         //                 external.get(0).map(|wd| dbg!(wd.content.clone())).or(Some(
         //                     "
         // module mymod
-        // go 1.25
+        // go 1.26
         // require ()
         //                         "
         //                     .to_owned(),
@@ -541,6 +542,23 @@ impl WorkspaceDependenciesPrefetched {
                     .get(0)
                     .map(|wd| wd.content.clone())
                     .or(Some(r#"{"require": {}}"#.to_owned()))
+            }
+            Implicit { workspace_dependencies, .. } => Some(workspace_dependencies.content.clone()),
+            None => Option::None,
+        })
+    }
+
+    pub fn get_powershell(&self) -> error::Result<Option<String>> {
+        use WorkspaceDependenciesPrefetchedInternal::*;
+        self.internal.assert_no_extra_mode().map_err(map_err)?;
+        Ok(match &self.internal {
+            Explicit(wdar @ WorkspaceDependenciesAnnotatedRefs { external, .. }) => {
+                wdar.assert_no_inline().map_err(map_err)?;
+                wdar.assert_external_less_than(2).map_err(map_err)?;
+                external
+                    .get(0)
+                    .map(|wd| wd.content.clone())
+                    .or(Some(r#"{"modules": {}}"#.to_owned()))
             }
             Implicit { workspace_dependencies, .. } => Some(workspace_dependencies.content.clone()),
             None => Option::None,
@@ -587,7 +605,9 @@ impl WorkspaceDependenciesPrefetched {
         use WorkspaceDependenciesPrefetchedInternal::*;
         match (self.language, &self.internal) {
             // These languages except for python had none of this functionality
-            (Php | Bun | Bunnative | Go, wdp) => wdp.assert_no_workspace_dependencies()?,
+            (Php | Bun | Bunnative | Go | Powershell, wdp) => {
+                wdp.assert_no_workspace_dependencies()?
+            }
 
             // Python, had #(extra_)requirements:
             // but it had no external requirements.
@@ -871,16 +891,29 @@ impl WorkspaceDependenciesAnnotatedRefs<String> {
         validity_re_o: Option<&Regex>,
         runnable_path: &str,
     ) -> Option<Self> {
-        let (extra_deps, manual_deps) = (format!("extra_{keyword}:"), format!("{keyword}:"));
+        let extra_deps_underscore = format!("extra_{keyword}:");
+        let extra_deps_hyphen = format!("extra-{keyword}:");
+        let manual_deps = format!("{keyword}:");
 
-        let Some((pos, mat)) = code.lines().find_position(|l| {
-            l.starts_with(&comment) && (l.contains(&extra_deps) || l.contains(&manual_deps))
-        }) else {
+        let is_extra = |l: &str| {
+            l.strip_prefix(comment)
+                .map(str::trim_start)
+                .is_some_and(|s| {
+                    s.starts_with(&extra_deps_underscore) || s.starts_with(&extra_deps_hyphen)
+                })
+        };
+        let is_manual = |l: &str| {
+            l.strip_prefix(comment)
+                .map(str::trim_start)
+                .is_some_and(|s| s.starts_with(&manual_deps))
+        };
+
+        let Some((pos, mat)) = code.lines().find_position(|l| is_extra(l) || is_manual(l)) else {
             return None;
         };
         let mut lines_it = code.lines().skip(pos);
 
-        let mode = if mat.contains(&extra_deps) {
+        let mode = if is_extra(mat) {
             Mode::extra
         } else {
             Mode::manual
@@ -903,7 +936,9 @@ impl WorkspaceDependenciesAnnotatedRefs<String> {
                     .map(|s| {
                         match mode {
                             Mode::manual => s.replace(&manual_deps, ""),
-                            Mode::extra => s.replace(&extra_deps, ""),
+                            Mode::extra => s
+                                .replace(&extra_deps_underscore, "")
+                                .replace(&extra_deps_hyphen, ""),
                         }
                         .replace(comment, "")
                     })
@@ -990,6 +1025,29 @@ def main():
     fn test_parse_annotation_python_extra_requirements_mode() {
         let code = r#"
 # extra_requirements: utils
+#numpy>=1.24.0
+
+def main():
+    pass
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "requirements",
+            code,
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(result.mode, Mode::extra));
+        assert_eq!(result.external, vec!["utils".to_owned()]);
+        assert_eq!(result.inline.as_ref().unwrap(), "numpy>=1.24.0");
+    }
+
+    #[test]
+    fn test_parse_annotation_python_extra_requirements_hyphen() {
+        let code = r#"
+# extra-requirements: utils
 #numpy>=1.24.0
 
 def main():
@@ -1222,6 +1280,130 @@ def main():
         assert!(result.external.is_empty());
         assert!(result.inline.is_none());
     }
+    #[test]
+    fn test_parse_annotation_powershell_modules_json_manual_mode() {
+        let code = r#"
+# modules_json: default
+param()
+Write-Host "Hello"
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "modules_json",
+            code,
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(result.mode, Mode::manual));
+        assert_eq!(result.external, vec!["default".to_owned()]);
+        assert!(result.inline.is_none());
+    }
+
+    #[test]
+    fn test_parse_annotation_powershell_modules_json_extra_mode() {
+        let code = r#"
+# extra_modules_json: my_deps
+param()
+Write-Host "Hello"
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "modules_json",
+            code,
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(result.mode, Mode::extra));
+        assert_eq!(result.external, vec!["my_deps".to_owned()]);
+        assert!(result.inline.is_none());
+    }
+
+    #[test]
+    fn test_parse_annotation_powershell_modules_json_extra_hyphen() {
+        let code = r#"
+# extra-modules_json: my_deps
+param()
+Write-Host "Hello"
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "modules_json",
+            code,
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(result.mode, Mode::extra));
+        assert_eq!(result.external, vec!["my_deps".to_owned()]);
+    }
+
+    #[test]
+    fn test_parse_annotation_powershell_modules_json_multiple_refs() {
+        let code = r#"
+# modules_json: default, extra_modules
+param()
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "modules_json",
+            code,
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(result.mode, Mode::manual));
+        assert_eq!(
+            result.external,
+            vec!["default".to_owned(), "extra_modules".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_parse_annotation_powershell_no_match() {
+        let code = r#"
+param()
+Import-Module PSWriteColor
+Write-Host "Hello"
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "modules_json",
+            code,
+            None,
+            "",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_annotation_powershell_modules_json_with_inline() {
+        let code = r#"
+# modules_json: default
+#{ "modules": { "Extra": "1.0" } }
+param()
+"#;
+
+        let result = WorkspaceDependenciesAnnotatedRefs::<String>::parse(
+            "#",
+            "modules_json",
+            code,
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(result.mode, Mode::manual));
+        assert_eq!(result.external, vec!["default".to_owned()]);
+        assert!(result.inline.is_some());
+        assert!(result.inline.as_ref().unwrap().contains("Extra"));
+    }
+
     #[test]
     fn test_parse_annotation_blacklisted() {
         let code = r#"

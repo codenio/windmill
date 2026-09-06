@@ -1,17 +1,19 @@
 {
-	"name": "windmill-components",
-	"version": "1.628.3",
+	"name": "@windmill-labs/components",
+	"version": "1.804.0",
 	"scripts": {
 		"dev": "vite dev",
+		"dev:ui-builder": "mv static/ui_builder static/ui_builder.dev-disabled 2>/dev/null || true ; trap 'mv static/ui_builder.dev-disabled static/ui_builder 2>/dev/null || true' EXIT ; vite dev",
 		"build": "vite build",
 		"build:utils": "vite build --config sharedUtils/vite.sharedUtils.config.js",
 		"preview": "vite preview",
 		"postinstall": "node -e \"if (require('fs').existsSync('./scripts/untar_ui_builder.js')) { require('child_process').execSync('node ./scripts/untar_ui_builder.js', {stdio: 'inherit'}) }\"",
+		"check:fast": "bun --bun svelte-fast-check --no-svelte-warnings --incremental",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --threshold warning",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"lint": "prettier --ignore-path .gitignore --check --plugin-search-dir=. . && eslint --ignore-path .gitignore .",
 		"format": "prettier --ignore-path .gitignore --write --plugin-search-dir=. .",
-		"package": "svelte-package -o package && node scripts/package-system-prompts.js",
+		"package": "svelte-package -o package && node scripts/package-system-prompts.js && node scripts/fix-svelte-module-imports.js",
 		"generate-backend-client": "openapi-ts --input ../backend/windmill-api/openapi.yaml --output ./src/lib/gen --useOptions --enums javascript --format false",
 		"generate-backend-client-mac": "openapi-ts --input ../backend/windmill-api/openapi.yaml --output ./src/lib/gen --useOptions --enums javascript",
 		"pretest": "tsc --incremental -p tests/tsconfig.json",
@@ -26,9 +28,9 @@
 		"@melt-ui/svelte": "^0.86.2",
 		"@playwright/test": "^1.57.0",
 		"@sveltejs/adapter-static": "^3.0.6",
-		"@sveltejs/kit": "^2.49.2",
-		"@sveltejs/package": "^2.3.7",
-		"@sveltejs/vite-plugin-svelte": "^6.2.1",
+		"@sveltejs/kit": "^2.53.4",
+		"@sveltejs/package": "^2.5.7",
+		"@sveltejs/vite-plugin-svelte": "^7.0.0",
 		"@tailwindcss/forms": "^0.5.3",
 		"@tailwindcss/typography": "^0.5.8",
 		"@types/d3": "^7.4.0",
@@ -46,6 +48,8 @@
 		"eslint": "^8.47.0",
 		"eslint-config-prettier": "^8.6.0",
 		"eslint-plugin-svelte": "^2.45.1",
+		"fake-indexeddb": "^6.2.5",
+		"jsdom": "^29.1.1",
 		"json-refs": "^3.0.15",
 		"json-schema-to-zod": "^2.7.0",
 		"path-browserify": "^1.0.1",
@@ -55,9 +59,10 @@
 		"prettier-plugin-svelte": "^3.3.3",
 		"style-to-object": "^0.4.1",
 		"stylelint-config-recommended": "^13.0.0",
-		"svelte": "^5.38.0",
+		"svelte": "^5.53.5",
 		"svelte-awesome-color-picker": "^3.0.4",
-		"svelte-check": "^4.0.0",
+		"svelte-check": "^4.4.3",
+		"svelte-fast-check": "^0.4.5",
 		"svelte-floating-ui": "^1.5.8",
 		"svelte-highlight": "^7.6.0",
 		"svelte-popperjs": "^1.3.2",
@@ -65,18 +70,19 @@
 		"svelte-range-slider-pips": "^2.3.1",
 		"svelte-splitpanes": "^8.0.9",
 		"tailwindcss": "^3.4.1",
-		"tar": "^7.4.3",
+		"tar": "^7.5.4",
 		"tslib": "^2.6.1",
 		"typescript": "^5.5.0",
-		"vite": "npm:rolldown-vite@7.3.0",
-		"vite-plugin-mkcert": "^1.17.5",
-		"vitest": "^4.0.10",
+		"vite": "^8.2.0",
+		"vite-plugin-mkcert": "^2.0.0",
+		"vitest": "^4.1.0",
 		"vitest-browser-svelte": "^2.0.1"
 	},
 	"overrides": {
 		"monaco-graphql": {
 			"monaco-editor": "$monaco-editor"
-		}
+		},
+		"tar": "$tar"
 	},
 	"type": "module",
 	"dependencies": {
@@ -91,6 +97,7 @@
 		"@codingame/monaco-vscode-standalone-typescript-language-features": "=25.0.0",
 		"@json2csv/plainjs": "^7.0.6",
 		"@leeoniya/ufuzzy": "^1.0.8",
+		"@popperjs/core": "^2.11.8",
 		"@redocly/json-to-json-schema": "^0.0.1",
 		"@scalar/openapi-parser": "^0.15.0",
 		"@tanstack/svelte-table": "npm:tanstack-table-8-svelte-5@^0.1",
@@ -98,6 +105,7 @@
 		"@windmill-labs/svelte-dnd-action": "^0.9.44",
 		"@xterm/addon-fit": "^0.10.0",
 		"@xyflow/svelte": "^1.0.0",
+		"acorn": "^8.15.0",
 		"ag-charts-community": "^9.0.1",
 		"ag-charts-enterprise": "^9.0.1",
 		"ag-grid-community": "^31.3.4",
@@ -110,6 +118,7 @@
 		"d3-zoom": "^3.0.0",
 		"date-fns": "^2.30.0",
 		"diff": "^7.0.0",
+		"dompurify": "^3.3.1",
 		"driver.js": "^1.3.0",
 		"esm-env": "^1.0.0",
 		"fast-equals": "^5.0.1",
@@ -120,7 +129,10 @@
 		"jszip": "^3.10.1",
 		"lru-cache": "^11.1.0",
 		"lucide-svelte": "^0.540.0",
+		"mdast-util-find-and-replace": "^3.0.2",
+		"mermaid": "^11.15.0",
 		"minimatch": "^10.0.1",
+		"modern-screenshot": "^4.7.0",
 		"monaco-editor": "npm:@codingame/monaco-vscode-editor-api@=25.0.0",
 		"monaco-languageclient": "10.6.0",
 		"monaco-vim": "^0.4.1",
@@ -134,29 +146,34 @@
 		"quill": "^1.3.7",
 		"rehype-github-alerts": "^3.0.0",
 		"rehype-raw": "^7.0.0",
+		"rehype-sanitize": "^6.0.0",
 		"rfc4648": "^1.5.3",
 		"runed": "^0.36.0",
 		"svelte-carousel": "^1.0.25",
 		"svelte-exmarkdown": "^5.0.0",
 		"svelte-infinite-loading": "^1.4.0",
 		"tailwind-merge": "^1.13.2",
+		"unist-util-visit": "^5.0.0",
 		"vscode": "npm:@codingame/monaco-vscode-extension-api@=25.0.0",
 		"vscode-languageclient": "~9.0.1",
 		"vscode-uri": "~3.1.0",
 		"vscode-ws-jsonrpc": "~3.5.0",
+		"windmill-parser-wasm-asset": "1.753.0",
 		"windmill-parser-wasm-csharp": "1.510.1",
-		"windmill-parser-wasm-go": "1.510.1",
+		"windmill-parser-wasm-go": "1.761.0",
 		"windmill-parser-wasm-java": "1.510.1",
 		"windmill-parser-wasm-nu": "1.510.1",
-		"windmill-parser-wasm-php": "1.574.1",
-		"windmill-parser-wasm-py": "1.623.1",
-		"windmill-parser-wasm-regex": "1.625.0",
+		"windmill-parser-wasm-php": "1.647.1",
+		"windmill-parser-wasm-py": "1.782.0",
+		"windmill-parser-wasm-r": "1.668.1",
+		"windmill-parser-wasm-regex": "1.764.0",
 		"windmill-parser-wasm-ruby": "1.526.1",
-		"windmill-parser-wasm-rust": "1.558.1",
-		"windmill-parser-wasm-ts": "1.623.1",
-		"windmill-parser-wasm-yaml": "1.593.0",
+		"windmill-parser-wasm-rust": "1.647.1",
+		"windmill-parser-wasm-ts": "1.695.0",
+		"windmill-parser-wasm-wac": "1.668.6",
+		"windmill-parser-wasm-yaml": "1.770.0",
 		"windmill-sql-datatype-parser-wasm": "1.512.0",
-		"windmill-utils-internal": "^1.3.2",
+		"windmill-utils-internal": "1.8.2",
 		"xterm": "^5.3.0",
 		"xterm-readline": "^1.1.2",
 		"y-monaco": "^0.1.4",
@@ -279,6 +296,38 @@
 			"svelte": "./package/components/FlowStatusViewer.svelte",
 			"default": "./package/components/FlowStatusViewer.svelte"
 		},
+		"./components/FlowRecordingReplay.svelte": {
+			"types": "./package/components/recording/FlowRecordingReplay.svelte.d.ts",
+			"svelte": "./package/components/recording/FlowRecordingReplay.svelte",
+			"default": "./package/components/recording/FlowRecordingReplay.svelte"
+		},
+		"./components/ScriptRecordingReplay.svelte": {
+			"types": "./package/components/recording/ScriptRecordingReplay.svelte.d.ts",
+			"svelte": "./package/components/recording/ScriptRecordingReplay.svelte",
+			"default": "./package/components/recording/ScriptRecordingReplay.svelte"
+		},
+		"./components/PipelineRecordingReplay.svelte": {
+			"types": "./package/components/recording/PipelineRecordingReplay.svelte.d.ts",
+			"svelte": "./package/components/recording/PipelineRecordingReplay.svelte",
+			"default": "./package/components/recording/PipelineRecordingReplay.svelte"
+		},
+		"./components/RawAppRecordingReplay.svelte": {
+			"types": "./package/components/recording/RawAppRecordingReplay.svelte.d.ts",
+			"svelte": "./package/components/recording/RawAppRecordingReplay.svelte",
+			"default": "./package/components/recording/RawAppRecordingReplay.svelte"
+		},
+		"./components/recording/types": {
+			"types": "./package/components/recording/types.d.ts",
+			"default": "./package/components/recording/types.js"
+		},
+		"./components/recording/rawAppRecordingLoad": {
+			"types": "./package/components/recording/rawAppRecordingLoad.d.ts",
+			"default": "./package/components/recording/rawAppRecordingLoad.js"
+		},
+		"./components/recording/rawAppSnapshot": {
+			"types": "./package/components/recording/rawAppSnapshot.d.ts",
+			"default": "./package/components/recording/rawAppSnapshot.js"
+		},
 		"./components/FlowWrapper.svelte": {
 			"types": "./package/components/FlowWrapper.svelte.d.ts",
 			"svelte": "./package/components/FlowWrapper.svelte",
@@ -358,6 +407,10 @@
 			"types": "./package/stores.d.ts",
 			"default": "./package/stores.js"
 		},
+		"./externalDomain": {
+			"types": "./package/externalDomain.d.ts",
+			"default": "./package/externalDomain.js"
+		},
 		"./gen": {
 			"types": "./package/gen/index.d.ts",
 			"default": "./package/gen/index.js"
@@ -405,6 +458,21 @@
 		"./tailwindUtils": {
 			"types": "./package/components/apps/editor/componentsPanel/tailwindUtils.d.ts",
 			"default": "./package/components/apps/editor/componentsPanel/tailwindUtils.js"
+		},
+		"./components/DarkModeObserver.svelte": {
+			"types": "./package/components/DarkModeObserver.svelte.d.ts",
+			"svelte": "./package/components/DarkModeObserver.svelte",
+			"default": "./package/components/DarkModeObserver.svelte"
+		},
+		"./components/text_input/TextInput.svelte": {
+			"types": "./package/components/text_input/TextInput.svelte.d.ts",
+			"svelte": "./package/components/text_input/TextInput.svelte",
+			"default": "./package/components/text_input/TextInput.svelte"
+		},
+		"./components/common/badge/Badge.svelte": {
+			"types": "./package/components/common/badge/Badge.svelte.d.ts",
+			"svelte": "./package/components/common/badge/Badge.svelte",
+			"default": "./package/components/common/badge/Badge.svelte"
 		}
 	},
 	"files": [
@@ -477,6 +545,18 @@
 			],
 			"components/FlowStatusViewer.svelte": [
 				"./package/components/FlowStatusViewer.svelte.d.ts"
+			],
+			"components/FlowRecordingReplay.svelte": [
+				"./package/components/recording/FlowRecordingReplay.svelte.d.ts"
+			],
+			"components/ScriptRecordingReplay.svelte": [
+				"./package/components/recording/ScriptRecordingReplay.svelte.d.ts"
+			],
+			"components/PipelineRecordingReplay.svelte": [
+				"./package/components/recording/PipelineRecordingReplay.svelte.d.ts"
+			],
+			"components/recording/types": [
+				"./package/components/recording/types.d.ts"
 			],
 			"components/FlowBuilder.svelte": [
 				"./package/components/FlowBuilder.svelte.d.ts"
@@ -555,11 +635,19 @@
 			],
 			"components/custom_ui": [
 				"./package/components/custom_ui.d.ts"
+			],
+			"components/DarkModeObserver.svelte": [
+				"./package/components/DarkModeObserver.svelte.d.ts"
+			],
+			"components/text_input/TextInput.svelte": [
+				"./package/components/text_input/TextInput.svelte.d.ts"
+			],
+			"components/common/badge/Badge.svelte": [
+				"./package/components/common/badge/Badge.svelte.d.ts"
 			]
 		}
 	},
 	"optionalDependencies": {
-		"@rollup/rollup-linux-x64-gnu": "^4.35.0",
 		"fsevents": "^2.3.3"
 	}
 }

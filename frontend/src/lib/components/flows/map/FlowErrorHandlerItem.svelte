@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { FlowEditorContext } from '../types'
+	import { refreshStateStore } from '$lib/svelte5Utils.svelte'
 	import type { FlowDiffManager } from '../flowDiffManager.svelte'
 	import { createEventDispatcher, getContext } from 'svelte'
 	import { Bug, X } from 'lucide-svelte'
@@ -7,7 +8,6 @@
 	import { insertNewFailureModule } from '$lib/components/flows/flowStateUtils.svelte'
 	import type { RawScript, ScriptLang } from '$lib/gen'
 	import { twMerge } from 'tailwind-merge'
-	import { refreshStateStore } from '$lib/svelte5Utils.svelte'
 	import Button from '$lib/components/common/button/Button.svelte'
 	import DiffActionBar from './DiffActionBar.svelte'
 	import { getNodeColorClasses, aiActionToNodeState } from '$lib/components/graph'
@@ -15,18 +15,20 @@
 	let {
 		disableAi,
 		small,
-		diffManager
+		diffManager,
+		compact = false
 	}: {
 		small: boolean
 		disableAi?: boolean
 		diffManager?: FlowDiffManager
+		compact?: boolean
 	} = $props()
 
 	const dispatch = createEventDispatcher<{
 		generateStep: { moduleId: string; instructions: string; lang: ScriptLang }
 	}>()
 
-	const { selectionManager, flowStateStore, flowStore } =
+	const { selectionManager, flowStateStore, flowStore, opWorkspace } =
 		getContext<FlowEditorContext>('FlowEditorContext')
 
 	const failureModuleId = $derived(flowStore.val?.value?.failure_module?.id)
@@ -45,7 +47,7 @@
 		},
 		wsScript?: { path: string; summary: string; hash: string | undefined }
 	) {
-		await insertNewFailureModule(flowStore, flowStateStore, inlineScript, wsScript)
+		await insertNewFailureModule(flowStore, flowStateStore, inlineScript, wsScript, opWorkspace?.())
 
 		if (inlineScript?.instructions) {
 			dispatch('generateStep', {
@@ -58,6 +60,15 @@
 		selectionManager.selectId('failure')
 		refreshStateStore(flowStore)
 	}
+
+	function deleteFailureModule() {
+		flowStore.val.value.failure_module = undefined
+		// The panel has to land somewhere once the error handler is gone, but that is a
+		// consequence of the delete — not a request to see the flow's settings.
+		selectionManager.selectId('settings-metadata', { openPanel: false })
+	}
+
+	const smallFailureModule = $derived(!(failureModuleId && diffManager && moduleAction) && compact)
 </script>
 
 {#if flowStore.val?.value?.failure_module}
@@ -67,7 +78,7 @@
 		<Button
 			variant="default"
 			unifiedSize="sm"
-			wrapperClasses={twMerge('min-w-36', small ? 'max-w-52' : 'max-w-64')}
+			wrapperClasses={compact ? undefined : twMerge('min-w-36', small ? 'max-w-52' : 'max-w-64')}
 			id="flow-editor-error-handler"
 			selected={selectionManager.getSelectedId()?.includes('failure')}
 			onClick={() => {
@@ -87,26 +98,34 @@
 				/>
 			{/if}
 			<Bug size={14} class="shrink-0" />
+			{#if !smallFailureModule}
+				<div class="truncate grow min-w-0 text-center text-xs">
+					{flowStore.val.value.failure_module?.summary ||
+						(flowStore.val.value.failure_module?.value.type === 'rawscript'
+							? `${flowStore.val.value.failure_module?.value.language}`
+							: 'TBD')}
+				</div>
 
-			<div class="truncate grow min-w-0 text-center text-xs">
-				{flowStore.val.value.failure_module?.summary ||
-					(flowStore.val.value.failure_module?.value.type === 'rawscript'
-						? `${flowStore.val.value.failure_module?.value.language}`
-						: 'TBD')}
-			</div>
-
+				<button
+					title="Delete failure script"
+					type="button"
+					class="ml-1"
+					onclick={deleteFailureModule}
+				>
+					<X size={12} />
+				</button>
+			{/if}
+		</Button>
+		{#if smallFailureModule}
 			<button
 				title="Delete failure script"
 				type="button"
-				class="ml-1"
-				onclick={() => {
-					flowStore.val.value.failure_module = undefined
-					selectionManager.selectId('settings-metadata')
-				}}
+				class="absolute -top-1.5 -right-1.5 rounded-full bg-surface border border-border p-0.5 hover:bg-surface-hover"
+				onclick={deleteFailureModule}
 			>
-				<X size={12} />
+				<X size={10} />
 			</button>
-		</Button>
+		{/if}
 	</div>
 {:else}
 	<!-- Index 0 is used by the tutorial to identify the first "Add step" -->
@@ -124,14 +143,17 @@
 		{#snippet trigger()}
 			<Button
 				unifiedSize="sm"
-				wrapperClasses="min-w-36"
+				wrapperClasses={compact ? undefined : 'min-w-36'}
 				title={`Add failure module`}
 				variant="default"
 				id={`flow-editor-add-step-error-handler-button`}
 				nonCaptureEvent
 				startIcon={{ icon: Bug }}
+				iconOnly={compact}
 			>
-				Error Handler
+				{#if !compact}
+					Error Handler
+				{/if}
 			</Button>
 		{/snippet}
 	</InsertModulePopover>

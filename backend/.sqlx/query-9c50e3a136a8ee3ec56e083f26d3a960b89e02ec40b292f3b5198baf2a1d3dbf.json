@@ -32,7 +32,11 @@
                 "mqtt",
                 "gcp",
                 "default_email",
-                "nextcloud"
+                "nextcloud",
+                "google",
+                "github",
+                "azure",
+                "amqp"
               ]
             }
           }

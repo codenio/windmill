@@ -1,30 +1,34 @@
 <script lang="ts">
 	import { mergeSchema } from '$lib/common'
 	import { type Job, JobService } from '$lib/gen'
-	import { workspaceStore } from '$lib/stores'
 	import { sendUserToast } from '$lib/toast'
-	import { X } from 'lucide-svelte'
+	import { ExternalLink, X } from 'lucide-svelte'
 	import DisplayResult from './DisplayResult.svelte'
 	import Tooltip from './Tooltip.svelte'
 	import { Button } from './common'
 	import SchemaForm from './SchemaForm.svelte'
 	import { twMerge } from 'tailwind-merge'
 	import { untrack } from 'svelte'
+	import { isReplaying } from './recording/offlineReplay.svelte'
 
 	interface Props {
 		isOwner: boolean
+		/** The workspace the job ran in — pass `job.workspace_id`, never the navigation
+		 *  workspace, which differs whenever the editor is embedded. */
 		workspaceId: string | undefined
 		job: Job
 		light?: boolean
+		/** Fired after a successful resume/reject, before the next poll observes it —
+		 * lets a host (e.g. the AI chat jobs tray) close its modal optimistically. */
+		onAction?: (approved: boolean) => void
 	}
 
-	let { isOwner, workspaceId, job, light = false }: Props = $props()
+	let { isOwner: _isOwner, workspaceId, job, light = false, onAction }: Props = $props()
 
 	let default_payload: object = $state({})
-	let resumeUrl: string | undefined = $state(undefined)
-	let cancelUrl: string | undefined = $state(undefined)
 	let description: any = $state(undefined)
 	let hide_cancel = $state(false)
+	let approvalPageUrl: string | undefined = $state(undefined)
 
 	let defaultValues = $state({})
 
@@ -36,12 +40,12 @@
 		if (jobId === lastJobId) {
 			return
 		}
-		if (!jobId) {
+		if (!jobId || !workspaceId) {
 			return {}
 		}
 		lastJobId = jobId
 		let job_result = (await JobService.getCompletedJobResult({
-			workspace: workspaceId ?? $workspaceStore ?? '',
+			workspace: workspaceId,
 			id: jobId
 		})) as any
 		const args = job_result?.default_args ?? {}
@@ -49,8 +53,8 @@
 		defaultValues = JSON.parse(JSON.stringify(args))
 		default_payload = args
 
-		resumeUrl = job_result?.['resume']
-		cancelUrl = job_result?.['cancel']
+		approvalPageUrl = job_result?.['approvalPage']
+		actionTaken = false
 		hide_cancel = job?.raw_flow?.modules?.[approvalStep]?.suspend?.hide_cancel ?? false
 		schema = mergeSchema(
 			job?.raw_flow?.modules?.[approvalStep]?.suspend?.resume_form?.schema ?? {},
@@ -59,88 +63,61 @@
 	}
 
 	let loading = $state(false)
+	let actionTaken = $state(false)
 	async function continu(approve: boolean) {
+		if (!workspaceId) {
+			sendUserToast('Cannot resume: the job has no workspace', true)
+			return
+		}
 		loading = true
-		if ((resumeUrl && approve) || (cancelUrl && !approve)) {
-			let split = (approve ? resumeUrl : cancelUrl)!.split('/')
-			let signatureUrl = split.pop() ?? ''
-			const regex = /([^?]+)(?:\?[^=]+=(\w+))?/
-
-			const matches = signatureUrl.match(regex)
-
-			const signature = matches?.[1]
-			if (!signature) {
-				sendUserToast(`Could not parse signature: ${signatureUrl}`, true)
-				return
-			}
-			const approver = matches?.[2] || undefined
-
-			let resumeId = -1
-			let parsedResumeId = split.pop() ?? ''
-			try {
-				resumeId = new Number(parsedResumeId).valueOf()
-			} catch (e) {
-				console.error(`Could not parse resume id: ${parsedResumeId}`)
-			}
-			let jobId = split.pop() ?? ''
-			if (approve) {
-				await JobService.resumeSuspendedJobPost({
-					workspace: workspaceId ?? $workspaceStore ?? '',
-					id: jobId,
-					requestBody: default_payload as any,
-					resumeId,
-					signature,
-					approver
-				})
-			} else {
-				await JobService.cancelSuspendedJobPost({
-					workspace: workspaceId ?? $workspaceStore ?? '',
-					id: jobId,
-					resumeId,
-					signature,
-					approver,
-					requestBody: {}
-				})
-			}
-		} else {
-			if (approve) {
-				await JobService.resumeSuspendedFlowAsOwner({
-					workspace: workspaceId ?? $workspaceStore ?? '',
-					id: job?.id ?? '',
-					requestBody: default_payload as any
-				})
-			} else {
-				await JobService.cancelQueuedJob({
-					workspace: workspaceId ?? $workspaceStore ?? '',
-					id: job?.id ?? '',
-					requestBody: {}
-				})
-			}
+		try {
+			await JobService.resumeSuspended({
+				workspace: workspaceId,
+				jobId: job?.id ?? '',
+				requestBody: {
+					payload: approve ? (default_payload as any) : undefined,
+					approved: approve
+				}
+			})
+			actionTaken = true
+			onAction?.(approve)
+		} catch (e: any) {
+			sendUserToast(e?.body ?? e?.message ?? 'Failed', true)
+		} finally {
+			loading = false
 		}
 	}
 	let approvalStep = $derived((job?.flow_status?.step ?? 1) - 1)
+	// Everything this panel shows (description, resume form enums, approval page) is
+	// fetched from the suspended job — a recording carries none of it — and Resume /
+	// Cancel act on a job that only exists in the recording. So a replay states the
+	// recorded fact and offers nothing to click.
+	let replaying = $derived(isReplaying())
 	$effect(() => {
-		job && untrack(() => getDefaultArgs())
+		if (!replaying) {
+			job && untrack(() => getDefaultArgs())
+		}
 	})
 </script>
 
-<div class="w-full h-full text-xs text-primary">
-	{#if description != undefined}
-		<DisplayResult {workspaceId} noControls result={description} language={job?.language} />
-		<div class="mt-2"></div>
-	{/if}
-	<div>
-		{#if isOwner || resumeUrl}
-			<div class={twMerge('flex gap-2', light ? 'flex-col' : 'flex-row ')}>
+{#if replaying}
+	<div class="w-full text-xs text-secondary">This step was waiting for approval.</div>
+{:else}
+	<div class="w-full h-full text-xs text-primary">
+		{#if description != undefined}
+			<DisplayResult {workspaceId} noControls result={description} language={job?.language} />
+			<div class="mt-2"></div>
+		{/if}
+		<div>
+			<div class={twMerge('flex gap-2 items-center', light ? 'flex-col' : 'flex-row ')}>
 				{#if !hide_cancel}
 					<div>
 						<Button
 							title="Cancel the step"
-							{loading}
 							iconOnly
 							startIcon={{ icon: X }}
 							variant="default"
-							disabled={!cancelUrl}
+							disabled={loading || actionTaken}
 							destructive
 							unifiedSize="md"
 							on:click={() => continu(false)}
@@ -148,14 +125,27 @@
 					</div>
 				{/if}
 				<div>
-					<Button variant="accent" onClick={() => continu(true)} {loading} unifiedSize="md">
+					<Button
+						variant="accent"
+						onClick={() => continu(true)}
+						disabled={loading || actionTaken}
+						unifiedSize="md"
+					>
 						Resume
-						<Tooltip class="text-white">
-							Since you are an owner of this flow, you can send resume events without necessarily
-							knowing the resume id sent by the approval step
-						</Tooltip>
+						<Tooltip class="text-white">Resume or approve this suspended step</Tooltip>
 					</Button>
 				</div>
+
+				{#if approvalPageUrl}
+					<a
+						href={approvalPageUrl}
+						target="_blank"
+						rel="noreferrer"
+						class="text-accent flex items-center gap-1 whitespace-nowrap"
+					>
+						Approval page <ExternalLink size={12} />
+					</a>
+				{/if}
 
 				{#if job?.raw_flow?.modules?.[approvalStep]?.suspend?.resume_form?.schema}
 					<div
@@ -172,9 +162,6 @@
 					</Tooltip>
 				{/if}
 			</div>
-		{:else}
-			You cannot resume the flow yourself without receiving the resume secret since you are not an
-			owner of {job.script_path} and the approval step did not contain the resume url at key `resume`
-		{/if}
+		</div>
 	</div>
-</div>
+{/if}

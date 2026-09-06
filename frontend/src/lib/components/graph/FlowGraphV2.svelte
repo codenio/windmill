@@ -1,6 +1,13 @@
 <script lang="ts">
+	import GraphZoomControls from './GraphZoomControls.svelte'
+	import FlowPanelPlacementPicker from '$lib/components/flows/common/FlowPanelPlacementPicker.svelte'
+	import { overlayStack } from '$lib/components/common/overlayHost.svelte'
 	import { FlowService, type FlowModule, type FlowNote, type Job, type OpenFlow } from '../../gen'
+	import { findStepPath, parseExpandedSubflowId } from '$lib/components/restartFromStepPath'
+	import { expandedSubflowParentId } from '../flows/expandedSubflowStep'
+	import { sendUserToast } from '$lib/utils'
 	import { AI_OR_ASSET_NODE_TYPES, NODE, type GraphModuleState } from '.'
+	import { isTriggerStep } from '$lib/components/flows/flowStepSettings'
 	import { getContext, onDestroy, onMount, tick, untrack, type Snippet } from 'svelte'
 	import { createFlowDiffManager } from '../flows/flowDiffManager.svelte'
 
@@ -19,15 +26,14 @@
 	} from '@xyflow/svelte'
 	import {
 		graphBuilder,
-		isTriggerStep,
-		topologicalSort,
 		type InlineScript,
 		type InsertKind,
 		type NodeLayout,
-		type onSelectedIteration,
+		type OnSelectedIteration,
 		type SimplifiableFlow
 	} from './graphBuilder.svelte'
 	import ModuleNode from './renderers/nodes/ModuleNode.svelte'
+	import FailureModuleNode from './renderers/nodes/FailureModuleNode.svelte'
 	import InputNode from './renderers/nodes/InputNode.svelte'
 	import BranchAllStart from './renderers/nodes/BranchAllStart.svelte'
 	import BranchAllEndNode from './renderers/nodes/BranchAllEndNode.svelte'
@@ -36,7 +42,6 @@
 	import ResultNode from './renderers/nodes/ResultNode.svelte'
 	import BaseEdge from './renderers/edges/BaseEdge.svelte'
 	import EmptyEdge from './renderers/edges/EmptyEdge.svelte'
-	import { sugiyama, dagStratify, coordCenter, decrossTwoLayer, decrossOpt } from 'd3-dag'
 	import { Expand, MousePointer, Hand } from 'lucide-svelte'
 	import Toggle from '../Toggle.svelte'
 	import DataflowEdge from './renderers/edges/DataflowEdge.svelte'
@@ -59,29 +64,61 @@
 	import AssetsOverflowedNode from './renderers/nodes/AssetsOverflowedNode.svelte'
 	import type { FlowGraphAssetContext } from '../flows/types'
 	import AiToolNode, { computeAIToolNodes } from './renderers/nodes/AIToolNode.svelte'
+	import {
+		linkedAgentToolsForScope,
+		linkedAgentToolsVersion,
+		linkedToolsScope,
+		releaseLinkedToolsScope,
+		retainLinkedToolsScope
+	} from '$lib/components/flows/linkedAgentToolsStore.svelte'
 	import NewAiToolNode from './renderers/nodes/NewAIToolNode.svelte'
 	import NoteNode from './renderers/nodes/NoteNode.svelte'
+	import CollapsedGroupNode from './renderers/nodes/CollapsedGroupNode.svelte'
+	import GroupHeadNode from './renderers/nodes/GroupHeadNode.svelte'
+	import GroupEndNode from './renderers/nodes/GroupEndNode.svelte'
 	import NoteTool from './NoteTool.svelte'
 	import SelectionBoundingBox from './SelectionBoundingBox.svelte'
+	import GroupOverlay from './GroupOverlay.svelte'
+	import {
+		GroupDisplayState,
+		getGroupEditorContext,
+		groupKey,
+		type FlowGroup
+	} from './groupEditor.svelte'
+	import { buildStructureTree, computeGroupDepths, type FlowStructureNode } from './flowStructure'
+	import { stateSnapshot } from '$lib/svelte5Utils.svelte'
+	import { computeGroupModuleIds } from './groupDetectionUtils'
+	import { getAllModules } from '../flows/flowExplorer'
 	import SelectionTool from './SelectionTool.svelte'
 	import PaneContextMenu from './PaneContextMenu.svelte'
-	import { SelectionManager } from './selectionUtils.svelte'
+	import { SelectionManager, isFlowLevelPanelTarget } from './selectionUtils.svelte'
 	import { ChangeTracker } from '$lib/svelte5Utils.svelte'
 	import { NoteManager } from './noteManager.svelte'
-	import type { ModulesTestStates } from '../modulesTest.svelte'
+	import type { MoveManager } from './moveManager.svelte'
+	import DragCoordinator from './DragCoordinator.svelte'
+	import { jobToGraphModuleState, type ModulesTestStates } from '../modulesTest.svelte'
+	import { compoundLayout } from './compoundLayout'
 	import { deepEqual } from 'fast-equals'
 	import type { AssetWithAltAccessType } from '../assets/lib'
+	import { computeNodeExtraSpace } from './nodeExtraSpace'
 	import type { ModuleActionInfo } from '$lib/components/flows/flowDiff'
 	import { setGraphContext } from './graphContext'
+	import { setFlowRunStatusContext } from './flowRunStatus.svelte'
 	import { computeNoteNodes } from './noteUtils.svelte'
 	import { Tooltip } from '../meltComponents'
 	import { getNoteEditorContext } from './noteEditor.svelte'
+	import {
+		resolveSelectedModuleIds,
+		locateModules,
+		areContiguousSiblings
+	} from '../flows/multiSelectUtils'
 
 	let useDataflow: Writable<boolean | undefined> = writable<boolean | undefined>(false)
 	let showAssets: Writable<boolean | undefined> = writable<boolean | undefined>(true)
 	let showNotes = $state(true)
 
 	const triggerContext = getContext<TriggerContext>('TriggerContext')
+	const overlays = overlayStack()
 
 	// Create diffManager instance for this FlowGraphV2
 	const diffManager = createFlowDiffManager()
@@ -94,6 +131,8 @@
 	interface Props {
 		success?: boolean | undefined
 		modules?: FlowModule[] | undefined
+		groupedModules?: FlowStructureNode[]
+		groupError?: unknown
 		failureModule?: FlowModule | undefined
 		preprocessorModule?: FlowModule | undefined
 		minHeight?: number
@@ -104,12 +143,15 @@
 		moduleActions?: Record<string, ModuleActionInfo>
 		selectionManager?: SelectionManager
 		path?: string | undefined
+		// Flow path for the linked-agent tools bucket. Separate from `path` because that one also
+		// drives the Trigger node, which read-only viewers must not render.
+		linkedToolsPath?: string | undefined
 		newFlow?: boolean
 		insertable?: boolean
 		earlyStop?: boolean
 		cache?: boolean
 		scroll?: boolean
-		moving?: string | undefined
+		moveManager?: MoveManager
 		// Download: display a top level button to open the graph in a new tab
 		download?: boolean
 		fullSize?: boolean
@@ -118,7 +160,7 @@
 		workspace?: string
 		editMode?: boolean
 		allowSimplifiedPoll?: boolean
-		expandedSubflows?: Record<string, FlowModule[]>
+		expandedSubflows?: Record<string, { modules: FlowModule[]; groups?: FlowGroup[] }>
 		isOwner?: boolean
 		isRunning?: boolean
 		individualStepTests?: boolean
@@ -127,9 +169,18 @@
 		suspendStatus?: Record<string, { job: Job; nb: number }>
 		noteMode?: boolean
 		notes?: FlowNote[]
+		groups?: FlowGroup[]
+		groupDisplayState?: GroupDisplayState
 		chatInputEnabled?: boolean
 		multiSelectEnabled?: boolean
+		onDeleteMultiple?: (ids: string[]) => void
+		onDuplicateMultiple?: (ids: string[]) => void
+		onMoveMultiple?: (ids: string[]) => void
+		movingIds?: string[]
 		onDelete?: (id: string) => void
+		/** Forget the run state of a node that only mirrors a run (the error handler marker), so it
+		 * stops being rendered. Must not touch the flow itself. */
+		onDismissRunNode?: (id: string) => void
 		onInsert?: (detail: {
 			sourceId?: string
 			targetId?: string
@@ -141,16 +192,20 @@
 			inlineScript?: InlineScript
 			script?: { path: string; summary: string; hash: string | undefined }
 			flow?: { path: string; summary: string }
+			/** Saved `ai_agent` resource the inserted agent step links to, for `kind: 'aiagent'`. */
+			agentPath?: string
 			kind: InsertKind
+			expandGroup?: { groupId: string; position: 'top' | 'bottom' }
 		}) => Promise<void>
 		onNewBranch?: (id: string) => Promise<void>
 		onSelect?: (id: string | FlowModule) => void
 		onDeleteBranch?: (detail: { id: string; index: number }) => Promise<void>
 		onChangeId?: (detail: { id: string; newId: string; deps: Record<string, string[]> }) => void
 		onMove?: (id: string) => void
+		onDuplicate?: (id: string) => void
 		onUpdateMock?: (detail: { mock: FlowModule['mock']; id: string }) => void
 		onTestUpTo?: ((id: string) => void) | undefined
-		onSelectedIteration?: onSelectedIteration
+		onSelectedIteration?: OnSelectedIteration
 		onEditInput?: (moduleId: string, key: string) => void
 		onTestFlow?: () => void
 		onCancelTestFlow?: () => void
@@ -167,12 +222,19 @@
 		diffBeforeFlow?: OpenFlow
 		currentInputSchema?: Record<string, any>
 		markRemovedAsShadowed?: boolean
+		controlsPosition?: 'top' | 'bottom'
+		outerDivClass?: string
+		/** Fires when the computed graph height changes. Diff views can use
+		 * this to equalize heights of side-by-side graphs. */
+		onHeight?: (height: number) => void
 	}
 
 	let {
 		onInsert = undefined,
 		onDelete = undefined,
+		onDismissRunNode = undefined,
 		onMove = undefined,
+		onDuplicate = undefined,
 		onDeleteBranch = undefined,
 		onNewBranch = undefined,
 		onSelect = undefined,
@@ -181,6 +243,8 @@
 		onSelectedIteration = undefined,
 		success = undefined,
 		modules = [],
+		groupedModules: groupedModulesProp = undefined,
+		groupError = undefined,
 		failureModule = undefined,
 		preprocessorModule = undefined,
 		minHeight = 0,
@@ -191,12 +255,13 @@
 		moduleActions = undefined,
 		selectionManager: selectionManagerProp = undefined,
 		path = undefined,
+		linkedToolsPath = undefined,
 		newFlow = false,
 		insertable = false,
 		earlyStop = false,
 		cache = false,
 		scroll = false,
-		moving = undefined,
+		moveManager = undefined,
 		download = false,
 		fullSize = false,
 		disableAi = false,
@@ -220,6 +285,8 @@
 		flowHasChanged = false,
 		noteMode = false,
 		notes = undefined,
+		groups = undefined,
+		groupDisplayState: groupDisplayStateProp = undefined,
 		exitNoteMode = undefined,
 		onNotePositionUpdate = undefined,
 		chatInputEnabled = false,
@@ -229,8 +296,23 @@
 		diffBeforeFlow = undefined,
 		currentInputSchema = undefined,
 		markRemovedAsShadowed = false,
-		multiSelectEnabled = false
+		multiSelectEnabled = false,
+		onDeleteMultiple = undefined,
+		onDuplicateMultiple = undefined,
+		onMoveMultiple = undefined,
+		movingIds = undefined,
+		controlsPosition = 'top',
+		outerDivClass = '',
+		onHeight = undefined
 	}: Props = $props()
+
+	// Hold the scope this graph draws from while it is mounted: the store's cap must never drop a
+	// bucket that something on screen is reading, and nothing would refetch it afterwards.
+	$effect(() => {
+		const scope = linkedToolsScope(workspace, linkedToolsPath ?? path)
+		retainLinkedToolsScope(scope)
+		return () => releaseLinkedToolsScope(scope)
+	})
 
 	// Initialize note manager with fine-grained reactivity
 	const noteManager = new NoteManager(
@@ -241,6 +323,9 @@
 		() => nodes
 	)
 
+	const groupDisplayState =
+		untrack(() => groupDisplayStateProp) ?? new GroupDisplayState(() => groups ?? [])
+
 	// Runtime text height tracking for notes (not stored in FlowNote)
 	let noteTextHeights = $state<Record<string, number>>({})
 
@@ -248,8 +333,10 @@
 	let paneContextMenu: PaneContextMenu | undefined = $state(undefined)
 	let flowContainer: HTMLDivElement | undefined = $state(undefined)
 
+	// Hover tracking for group overlay
+
 	// Selection manager - create one if not provided
-	let selectionManager = selectionManagerProp || new SelectionManager()
+	let selectionManager = untrack(() => selectionManagerProp) || new SelectionManager()
 	const selectedId = $derived(selectionManager.getSelectedId())
 
 	const noteEditorContext = getNoteEditorContext()
@@ -271,21 +358,55 @@
 	}
 
 	// Calculate note gap based on current nodes and notes
-	const topPadding = editMode ? 100 : 24
-	const yOffset = calculateNoteGap(notes) + topPadding
+	const topPadding = untrack(() => editMode) ? 100 : 24
+	const yOffset = calculateNoteGap(untrack(() => notes)) + topPadding
 
 	setGraphContext({
 		selectionManager: selectionManager,
 		useDataflow,
 		showAssets,
 		noteManager,
+		moveManager: untrack(() => moveManager),
 		clearFlowSelection,
 		yOffset,
-		diffManager
+		diffManager,
+		getFlowNodes: () => currentGraphNodeDeps,
+		groupDisplayState
 	} as any)
 
-	if (triggerContext && allowSimplifiedPoll) {
-		if (isSimplifiable(modules)) {
+	const flowRunStatus = setFlowRunStatusContext()
+	$effect(() => {
+		flowRunStatus.flowJob = flowJob
+	})
+	$effect(() => {
+		flowRunStatus.suspendStatus = suspendStatus
+	})
+	$effect(() => {
+		// Each step's state object is replaced rather than mutated, so reading the top level
+		// catches every status change. Walking deeper would subscribe to every step's args and
+		// result on the hottest path in the graph.
+		Object.values(flowModuleStates ?? {})
+		// The loader mutates `flow_status` on the job it already handed us, so subscribing to the
+		// test state alone would never see an agent's calls land.
+		Object.values(testModuleStates?.states ?? {}).forEach((s) => [
+			s.loading,
+			s.testJob?.['flow_status']?.modules?.[0]?.agent_actions?.length
+		])
+		untrack(() => {
+			// Testing one step is its own small run, and its agent calls arrive on the test job
+			// rather than the flow's states. Fold them in so the renderers keep a single source.
+			let states = flowModuleStates
+			for (const [id, testState] of Object.entries(testModuleStates?.states ?? {})) {
+				const tested = jobToGraphModuleState(testState)
+				if (!tested?.agent_actions) continue
+				states = { ...(states ?? {}), [id]: { ...(states?.[id] ?? {}), ...tested } }
+			}
+			flowRunStatus.setModuleStates(states)
+		})
+	})
+
+	if (triggerContext && untrack(() => allowSimplifiedPoll)) {
+		if (isSimplifiable(untrack(() => modules))) {
 			triggerContext?.simplifiedPoll?.set(true)
 		}
 		triggerContext?.simplifiedPoll.subscribe((value) => {
@@ -315,15 +436,36 @@
 	type NodeDep = {
 		id: string
 		parentIds?: string[]
-		offset?: number
-		data?: { assets?: AssetWithAltAccessType[] }
+		data?: { assets?: AssetWithAltAccessType[]; module?: any }
 	}
 	type NodePos = { position: { x: number; y: number } }
-	let lastNodes: [NodeDep[], (NodeDep & NodePos)[]] | undefined = undefined
+	let lastNodes:
+		| [NodeDep[], Map<string, { top: number; bottom: number }> | undefined, (NodeDep & NodePos)[]]
+		| undefined = undefined
+	let currentGraphNodeDeps: { id: string; parentIds?: string[] }[] = $state([])
 
-	function layoutNodes(nodes: NodeDep[]): (NodeDep & NodePos)[] {
-		let lastResult = lastNodes?.[1]
-		if (lastResult && deepEqual(nodes, lastNodes?.[0])) {
+	// Keep canCreateGroup in sync for consumers (SelectionBoundingBox, FlowSelectionPanel, etc.)
+	const groupEditorCtx = getGroupEditorContext()
+
+	$effect(() => {
+		if (!groupEditorCtx) return
+		const ids = selectionManager.selectedIds
+		groupEditorCtx.canCreateGroup.val =
+			ids.length >= 1 && groupEditorCtx.groupEditor.canCreateGroup(ids, currentGraphNodeDeps)
+	})
+
+	let lastGroupDimensions: Map<string, { width: number; height: number }> | undefined = undefined
+
+	function layoutNodes(
+		nodes: NodeDep[],
+		nodeExtraSpace?: Map<string, { top: number; bottom: number; left: number; right: number }>
+	): (NodeDep & NodePos)[] {
+		let lastResult = lastNodes?.[2]
+		if (
+			lastResult &&
+			deepEqual(nodes, lastNodes?.[0]) &&
+			deepEqual(nodeExtraSpace, lastNodes?.[1])
+		) {
 			console.debug('layoutNodes', 'same nodes')
 			return lastResult
 		}
@@ -336,63 +478,32 @@
 			seenId.push(n.id)
 		}
 
-		let nodeWidths: Record<string, number> = {}
-		const nodes2: (NodeDep & NodePos)[] = nodes.map((n) => {
-			return { ...n, position: { x: 0, y: 0 } }
-		})
-		for (const n of topologicalSort(nodes)) {
-			const endId = n.id + '-end'
+		// Run recursive compound layout with pre-computed extra space
+		const layoutResult = compoundLayout(
+			nodes,
+			{
+				nodeWidth: NODE.width,
+				nodeHeight: NODE.height,
+				gapH: NODE.gap.horizontal,
+				gapV: NODE.gap.vertical
+			},
+			nodeExtraSpace
+		)
+		const { positions, bbox } = layoutResult
+		lastGroupDimensions = layoutResult.groupDimensions
 
-			if (nodeWidths[endId] != undefined) {
-				nodeWidths[n.id] = Math.max(nodeWidths[n.id] ?? 0, nodeWidths[endId])
-			}
-			if (n.parentIds && n.parentIds?.length == 1) {
-				const parent = n.parentIds[0]
-				const nodeWidth = nodeWidths[n.id] ?? 1
-				nodeWidths[parent] = (nodeWidths[parent] ?? 0) + nodeWidth
-			}
-		}
+		const xCenter = (fullSize ? fullWidth : width) / 2 - bbox.width / 2 - (width - fullWidth) / 2
 
-		const dag = dagStratify().id(({ id }: NodeDep & NodePos) => id)(nodes2)
-
-		let boxSize: any
-		try {
-			const layout = sugiyama()
-				.decross(nodes.length > 20 ? decrossTwoLayer() : decrossOpt())
-				.coord(coordCenter())
-				.nodeSize((d) => {
-					return [
-						(nodeWidths[d?.data?.['id'] ?? ''] ?? 1) * (NODE.width + NODE.gap.horizontal * 1),
-						NODE.height + NODE.gap.vertical
-					] as readonly [number, number]
-				})
-			boxSize = layout(dag as any)
-		} catch {
-			const layout = sugiyama()
-				.decross(decrossTwoLayer())
-				.coord(coordCenter())
-				.nodeSize(() => [NODE.width + NODE.gap.horizontal, NODE.height + NODE.gap.vertical])
-			boxSize = layout(dag as any)
-		}
-
-		const newNodes = dag.descendants().map((des) => ({
-			id: des.data.id,
+		// Center horizontally
+		const newNodes = nodes.map((n) => ({
+			id: n.id,
 			position: {
-				x: des.x
-					? // @ts-ignore
-						(des.data.offset ?? 0) +
-						// @ts-ignore
-						des.x +
-						(fullSize ? fullWidth : width) / 2 -
-						boxSize.width / 2 -
-						NODE.width / 2 -
-						(width - fullWidth) / 2
-					: 0,
-				y: des.y || 0
+				x: (positions.get(n.id)?.x ?? 0) + xCenter - NODE.width / 2,
+				y: positions.get(n.id)?.y ?? 0
 			}
 		}))
 
-		lastNodes = [nodes, newNodes]
+		lastNodes = [nodes, nodeExtraSpace, newNodes]
 		return newNodes
 	}
 
@@ -404,10 +515,15 @@
 		insert: (detail) => {
 			onInsert?.(detail)
 		},
-		select: (modId) => {
+		select: (modId, opts) => {
 			// AI tools are not selectable by the flow. Selection has to be refactored to be simplier.
-			if (nodes.find((n) => n.data?.moduleId === modId)?.type === 'aiTool' || modId === 'Trigger') {
-				selectionManager.selectId(modId)
+			// Flow-level panels reach selection only through here, so they must go through
+			// selectId or their intent (and the modal panel) never fires.
+			if (
+				nodes.find((n) => n.data?.moduleId === modId)?.type === 'aiTool' ||
+				isFlowLevelPanelTarget(modId)
+			) {
+				selectionManager.selectId(modId, opts)
 			}
 			if (!notSelectable) {
 				onSelect?.(modId)
@@ -425,6 +541,9 @@
 		move: (detail) => {
 			onMove?.(detail.id)
 		},
+		duplicate: (detail) => {
+			onDuplicate?.(detail.id)
+		},
 		selectedIteration: (detail) => {
 			onSelectedIteration?.(detail)
 		},
@@ -432,13 +551,34 @@
 			triggerContext?.simplifiedPoll.set(detail)
 		},
 		expandSubflow: async (id: string, path: string) => {
-			const flow = await FlowService.getFlowByPath({ workspace: workspace, path })
-			expandedSubflows[id] = flow.value.modules
+			// Reads the subflow's *current* definition, which a share link deliberately does
+			// not cover: it authorizes the run's job subtree, not the workspace's flow
+			// library. So a share-link viewer (and any anonymous one) is refused here — name
+			// that case, but only when the error actually says so.
+			let flow: OpenFlow
+			try {
+				flow = await FlowService.getFlowByPath({ workspace: workspace, path })
+			} catch (err) {
+				const denied = err?.status === 401 || err?.status === 403
+				sendUserToast(
+					`Could not expand subflow ${path}: ${
+						denied
+							? "viewing a subflow's definition requires being logged in with access to it"
+							: (err?.body ?? err)
+					}`,
+					true
+				)
+				return
+			}
+			expandedSubflows[id] = { modules: flow.value.modules, groups: flow.value.groups }
 			expandedSubflows = expandedSubflows
 		},
 		minimizeSubflow: (id: string) => {
 			delete expandedSubflows[id]
 			expandedSubflows = expandedSubflows
+		},
+		expandGroup: (groupId: string) => {
+			groupDisplayState.expandGroup(groupId)
 		},
 		updateMock: (detail) => {
 			onUpdateMock?.(detail)
@@ -460,6 +600,9 @@
 		},
 		hideJobStatus: () => {
 			onHideJobStatus?.()
+		},
+		dismissRunNode: (id: string) => {
+			onDismissRunNode?.(id)
 		}
 	}
 
@@ -505,6 +648,15 @@
 
 	let canUseDiffDrawer = $derived(diffBeforeFlow || moduleActions || editMode)
 
+	// Derived state for multi-select operations
+	let resolvedModuleIds = $derived(
+		resolveSelectedModuleIds(selectionManager.selectedIds, effectiveModules ?? [])
+	)
+	let canMoveSelected = $derived(
+		resolvedModuleIds.length > 0 &&
+			areContiguousSiblings(locateModules(resolvedModuleIds, effectiveModules ?? []))
+	)
+
 	// Initialize moduleTracker with effectiveModules
 	let moduleTracker = $state(new ChangeTracker<FlowModule[]>([]))
 
@@ -513,20 +665,58 @@
 
 	let height = $state(0)
 
+	/**
+	 * A run only changes what the steps display, never the shape of the graph, but every
+	 * status poll rebuilds these arrays from scratch. xyflow re-measures every node it is
+	 * handed a new object for, and Svelte destroys and re-creates every edge, so handing
+	 * back fresh identities re-renders a graph that did not change. Reuse the previous
+	 * object wherever it still deep-equals the new one.
+	 */
+	function reuseUnchanged<T extends { id: string }>(previous: T[], next: T[]): T[] {
+		const previousById = new Map(previous.map((item) => [item.id, item]))
+		let changed = previous.length !== next.length
+		const reconciled = next.map((item, index) => {
+			const before = previousById.get(item.id)
+			if (before && deepEqual(before, item)) {
+				changed ||= previous[index] !== before
+				return before
+			}
+			changed = true
+			return item
+		})
+		return changed ? reconciled : previous
+	}
+
+	// Keyed by the source node, so a node that survived reconciliation keeps its offset
+	// object too — remapping every node would undo the identity reuse above.
+	let offsetNodeCache = new WeakMap<Node, Node>()
+	let offsetCacheKey: string | undefined = undefined
+
 	// Derived nodes with yOffset applied to all nodes uniformly and selectable flag set to false if notSelectable is true
 	const nodesWithOffset = $derived.by(() => {
+		const cacheKey = `${yOffset}:${notSelectable}`
+		if (cacheKey !== offsetCacheKey) {
+			offsetNodeCache = new WeakMap<Node, Node>()
+			offsetCacheKey = cacheKey
+		}
 		return nodes.map((node) => {
-			if (node.type && !AI_OR_ASSET_NODE_TYPES.includes(node.type)) {
-				return {
-					...node,
-					position: { ...node.position, y: node.position.y + yOffset },
-					selectable: notSelectable ? false : node.selectable
-				}
+			const cached = offsetNodeCache.get(node)
+			if (cached) {
+				return cached
 			}
-			return {
-				...node,
-				selectable: notSelectable ? false : node.selectable
-			}
+			const mapped =
+				node.type && !AI_OR_ASSET_NODE_TYPES.includes(node.type)
+					? {
+							...node,
+							position: { ...node.position, y: node.position.y + yOffset },
+							selectable: notSelectable ? false : node.selectable
+						}
+					: {
+							...node,
+							selectable: notSelectable ? false : node.selectable
+						}
+			offsetNodeCache.set(node, mapped)
+			return mapped
 		})
 	})
 
@@ -546,6 +736,10 @@
 
 	// Clear SvelteFlow's internal selection by creating new nodes array
 	function clearFlowSelection() {
+		// xyflow owns `selected` on the objects it was handed, and drops it only when it sees a
+		// node it does not recognise. Serving the cached mapping back would hand it the very
+		// object it marked selected, so the clear has to go through fresh objects.
+		offsetNodeCache = new WeakMap<Node, Node>()
 		nodes = nodes.map((node) => {
 			if (node.selected) {
 				return { ...node, selected: false }
@@ -556,11 +750,42 @@
 
 	// Keyboard event handling
 	function handleKeyDown(event: KeyboardEvent) {
+		// Escape belongs to the topmost overlay. This listener is on `document` and theirs
+		// are on `window`, so this one always runs first — without the guard, dismissing a
+		// modal or picker would also clear the selection under it and lose the user's step.
+		if (event.key === 'Escape' && overlays.val.length > 0) {
+			return
+		}
 		selectionManager.handleKeyDown(event)
 		noteManager.handleKeyDown(event)
 		if (event.key === 'Escape') {
 			if (noteMode) {
 				exitNoteMode?.()
+			}
+		}
+		if ((event.key === 'Backspace' || event.key === 'Delete') && editMode) {
+			const active = document.activeElement
+			if (active && active !== document.body && !flowContainer?.contains(active)) {
+				return
+			}
+			if (
+				active instanceof HTMLInputElement ||
+				active instanceof HTMLTextAreaElement ||
+				active?.getAttribute('contenteditable') === 'true'
+			) {
+				return
+			}
+			if (noteManager.selectedNoteId && noteEditorContext) {
+				noteEditorContext.noteEditor.deleteNote(noteManager.selectedNoteId)
+				noteManager.clearNoteSelection()
+				return
+			}
+			if (resolvedModuleIds.length > 1) {
+				onDeleteMultiple?.(resolvedModuleIds)
+			} else if (resolvedModuleIds.length === 1) {
+				onDelete?.(resolvedModuleIds[0])
+			} else if (selectedId) {
+				onDelete?.(selectedId)
 			}
 		}
 	}
@@ -570,18 +795,41 @@
 			return
 		}
 
-		// console.log('compute')
+		const graphNodeDeps = Object.values(graph.nodes).map((n) => ({
+			id: n.id,
+			parentIds: n.parentIds,
+			data: { assets: (n.data as any).assets, module: (n.data as any).module }
+		}))
+		currentGraphNodeDeps = graphNodeDeps
 
-		let layoutedNodes = layoutNodes(
-			Object.values(graph.nodes).map((n) => ({
-				id: n.id,
-				parentIds: n.parentIds,
-				offset: n.data.offset ?? 0,
-				data: { assets: (n.data as any).assets }
-			}))
+		// Pre-compute extra space per node for assets, AI tools, group notes, group headers
+		const resolvedLinkedTools = linkedAgentToolsForScope(
+			linkedToolsScope(workspace, linkedToolsPath ?? path)
 		)
-		let newNodes: (Node & NodeLayout)[] = layoutedNodes.map((n) => ({ ...n, ...graph.nodes[n.id] }))
+		const nodeExtraSpace = computeNodeExtraSpace(graphNodeDeps, {
+			showAssets: $showAssets ?? true,
+			showNotes,
+			notes,
+			noteTextHeights,
+			groupDisplayState,
+			insertable,
+			flowModuleStates,
+			linkedAgentTools: resolvedLinkedTools
+		})
 
+		// Layout with extra space baked into sugiyama
+		let layoutedNodes = layoutNodes(graphNodeDeps, nodeExtraSpace)
+		let newNodes: (Node & NodeLayout)[] = layoutedNodes.map((n) => {
+			const merged = { ...n, ...graph.nodes[n.id] }
+			// Augment group head nodes with wrapper dimensions from compound layout
+			if (graph.nodes[n.id]?.type === 'groupHead' && lastGroupDimensions?.has(n.id)) {
+				const dims = lastGroupDimensions.get(n.id)!
+				merged.data = { ...merged.data, wrapperWidth: dims.width, wrapperHeight: dims.height }
+			}
+			return merged
+		})
+
+		// Compute asset visual nodes (no position remapping)
 		let assetNodesResult = $showAssets
 			? computeAssetNodes(
 					newNodes.map((n) => ({
@@ -591,32 +839,42 @@
 					}))
 				)
 			: undefined
-		if (assetNodesResult) {
-			newNodes = newNodes.map((n) => ({
-				...n,
-				position: assetNodesResult.newNodePositions[n.id]
-			}))
-		}
-		let aiToolNodesResult = computeAIToolNodes(newNodes, eventHandler, insertable, flowModuleStates)
-		let nodesAfterAITools = newNodes.map((n) => ({
-			...n,
-			position: aiToolNodesResult.newNodePositions[n.id]
-		}))
 
-		let finalNodes = [
-			...nodesAfterAITools,
+		// Compute AI tool visual nodes (no position remapping)
+		let aiToolNodesResult = computeAIToolNodes(
+			newNodes,
+			eventHandler,
+			insertable,
+			flowModuleStates,
+			resolvedLinkedTools
+		)
+
+		let finalNodes: (Node & NodeLayout)[] = [
+			...newNodes,
 			...(assetNodesResult?.newAssetNodes ?? []),
 			...aiToolNodesResult.toolNodes
 		]
 
-		// Compute note nodes and positions
+		// Collect module IDs hidden inside collapsed groups so note cleanup preserves them
+		const collapsedModuleIds = new Set<string>()
+		for (const n of finalNodes) {
+			if (n.type === 'collapsedGroup') {
+				const modules = (n.data as any)?.modules as FlowModule[] | undefined
+				if (modules) {
+					for (const m of modules) {
+						collapsedModuleIds.add(m.id)
+					}
+				}
+			}
+		}
+
+		// Compute note nodes (no position remapping)
 		let noteNodesResult = showNotes
 			? computeNoteNodes(
 					finalNodes.map((n) => ({
 						id: n.id,
 						position: n.position,
 						parentIds: n.parentIds,
-						offset: n.data?.offset ?? 0,
 						data: { assets: (n.data as any)?.assets },
 						type: n.type
 					})),
@@ -627,26 +885,19 @@
 						noteManager.render()
 					},
 					editMode,
-					noteEditorContext
+					noteEditorContext,
+					collapsedModuleIds.size > 0 ? collapsedModuleIds : undefined
 				)
 			: undefined
 
-		// Apply note positioning to nodes if notes are enabled
-		if (noteNodesResult) {
-			finalNodes = finalNodes.map((n) => ({
-				...n,
-				position: noteNodesResult.newNodePositions[n.id] || n.position
-			}))
-		}
-
 		// update nodes
-		nodes = [...finalNodes, ...(noteNodesResult?.noteNodes ?? [])]
+		nodes = reuseUnchanged(nodes, [...finalNodes, ...(noteNodesResult?.noteNodes ?? [])])
 
-		edges = [
+		edges = reuseUnchanged(edges, [
 			...(assetNodesResult?.newAssetEdges ?? []),
 			...aiToolNodesResult.toolEdges,
 			...graph.edges
-		]
+		])
 
 		await tick()
 		updateHeight()
@@ -658,18 +909,24 @@
 		} else {
 			const minY = Math.min(...nodes.map((n) => n.position.y))
 			const maxBottom = Math.max(...nodes.map((n) => n.position.y + NODE.height + 100))
-			height = Math.max(maxBottom - minY, minHeight)
+			const computed = maxBottom - minY
+			height = Math.max(Math.min(computed, maxHeight ?? computed), minHeight)
 		}
+		onHeight?.(height)
 	}
 
 	$effect(() => {
+		// Track both bounds — updateHeight() reads both, so missing one (as
+		// maxHeight was) leaves height stale when only that bound changes.
 		minHeight
+		maxHeight
 		untrack(() => updateHeight())
 	})
 
 	const nodeTypes = {
 		input2: InputNode,
 		module: ModuleNode,
+		failureModule: FailureModuleNode,
 		branchAllStart: BranchAllStart,
 		branchAllEnd: BranchAllEndNode,
 		forLoopEnd: ForLoopEndNode,
@@ -686,7 +943,10 @@
 		assetsOverflowed: AssetsOverflowedNode,
 		aiTool: AiToolNode,
 		newAiTool: NewAiToolNode,
-		note: NoteNode
+		note: NoteNode,
+		collapsedGroup: CollapsedGroupNode,
+		groupHead: GroupHeadNode,
+		groupEnd: GroupEndNode
 	} as any
 
 	const edgeTypes = {
@@ -722,7 +982,48 @@
 	let graph = $derived.by(() => {
 		moduleTracker.counter
 		effectiveModuleActions
-		return graphBuilder(
+		currentGroups
+		// The poll replaces `flowJob` on every tick and is what makes the untracked
+		// `flowModuleStates` above get re-read, so it stays a dependency. It is deliberately
+		// not handed to graphBuilder: anything put there lands in every node and edge's data,
+		// and a per-tick value there re-creates the whole graph. Renderers read it from
+		// FlowRunStatus instead.
+		flowJob
+		suspendStatus
+
+		const collapsedGroupIds = new Set(
+			allGroups
+				.filter((g) => groupDisplayState.isRuntimeCollapsed(groupKey(g)))
+				.map((g) => groupKey(g))
+		)
+
+		if (groupError) {
+			return { nodes: {}, edges: [], error: groupError }
+		}
+
+		// Use provided structure tree (from proxy) or build locally (diff mode / read-only)
+		let gm: FlowStructureNode[] | undefined = groupedModulesProp
+		if (!gm) {
+			const allGroups = groups ?? []
+			const graphGroups = allGroups.map((g) => ({
+				...g,
+				id: groupKey(g),
+				moduleIds: untrack(() =>
+					computeGroupModuleIds(g.start_id, g.end_id, getAllModules(effectiveModules ?? []))
+				)
+			}))
+			try {
+				gm = buildStructureTree(
+					stateSnapshot(untrack(() => effectiveModules) ?? []) as FlowModule[],
+					graphGroups
+				)
+			} catch (e) {
+				return { nodes: {}, edges: [], error: e }
+			}
+		}
+
+		const result = graphBuilder(
+			gm,
 			untrack(() => effectiveModules),
 			{
 				disableAi,
@@ -739,9 +1040,7 @@
 				isOwner,
 				isRunning,
 				individualStepTests,
-				flowJob,
 				showJobStatus,
-				suspendStatus,
 				flowHasChanged,
 				chatInputEnabled,
 				additionalAssetsMap: flowGraphAssetsCtx?.val.additionalAssetsMap
@@ -752,19 +1051,69 @@
 			success,
 			$useDataflow,
 			untrack(() => selectedId),
-			moving,
 			simplifiableFlow,
 			triggerNode ? path : undefined,
-			expandedSubflows
+			expandedSubflows,
+			showNotes,
+			collapsedGroupIds
 		)
+		return { ...result, structureTree: gm }
 	})
 	let hideAssetsToggle = $derived(
 		$showAssets && Object.values(nodes).every((n) => n.type !== 'asset')
 	)
-	let hideNotesToggle = $derived(!notes || notes.length === 0)
+	let hideNotesToggle = $derived(
+		(!notes || notes.length === 0) && !(groups ?? []).some((g) => g.note != null)
+	)
+
+	let currentGroupDepths = $derived(
+		'structureTree' in graph && graph.structureTree ? computeGroupDepths(graph.structureTree) : {}
+	)
+
+	// All groups including those from expanded subflows (for overlay rendering)
+	let allGroups = $derived.by(() => {
+		const base = groups ?? []
+		const subflowGroups = Object.values(expandedSubflows).flatMap((sf) => sf.groups ?? [])
+		return subflowGroups.length > 0 ? [...base, ...subflowGroups] : base
+	})
+
+	// Track groups for re-layout when groups change
+	let currentGroups = $derived(groups ?? [])
+
+	/**
+	 * An agent's tool calls become nodes, and they land one at a time while the step runs.
+	 * Nothing else the graph reads changes as they arrive — the run only appends to an
+	 * existing step's state — so without this the tools all appear at once when the step ends.
+	 */
+	let agentActionsVersion = $derived.by(() => {
+		// The editor draws the agent's declared tools and ignores the run's calls, so neither the
+		// layout nor the tool nodes can change as they land.
+		if (insertable) return ''
+		let version = ''
+		for (const [id, state] of Object.entries(flowModuleStates ?? {})) {
+			const actions = state?.agent_actions
+			if (!actions) continue
+			version += `${id}:${actions.length}:`
+			for (const action of actions) {
+				version += `${action.type}/${(action as { function_name?: string }).function_name ?? ''},`
+			}
+		}
+		return version
+	})
 
 	$effect(() => {
-		;[graph, allowSimplifiedPoll, $showAssets, showNotes, noteManager.renderCount]
+		;[
+			graph,
+			allowSimplifiedPoll,
+			$showAssets,
+			showNotes,
+			noteManager.renderCount,
+			currentGroups,
+			groupDisplayState.renderCount,
+			agentActionsVersion,
+			// A linked step's tools resolve asynchronously; recompute tool nodes when they land.
+			linkedAgentToolsVersion()
+		]
 		untrack(async () => {
 			await updateStores()
 		})
@@ -881,6 +1230,64 @@
 		}
 	}
 
+	let latestReload = 0
+
+	/** Flow an expanded subflow node stands for, read from the step it inlines: the edited
+	 * flow for a top-level expansion, the enclosing expansion's modules otherwise. */
+	function expandedSubflowPath(nodeId: string): string | undefined {
+		const parentId = expandedSubflowParentId(nodeId)
+		const parentModules = parentId == undefined ? modules : expandedSubflows[parentId]?.modules
+		const stepId = parseExpandedSubflowId(nodeId)?.leaf ?? nodeId
+		const value = parentModules && findStepPath(parentModules, stepId)?.target.value
+		return value && value.type === 'flow' ? value.path : undefined
+	}
+
+	/** Refetch the steps inlined by every expanded subflow, e.g. after one was deployed from
+	 * the flow editor drawer. Outermost first, so a nested expansion resolves its path from
+	 * its refreshed parent: a step now pointing at another flow must not keep rendering the
+	 * one it pointed at when it was expanded. */
+	export async function reloadExpandedSubflows() {
+		const reload = ++latestReload
+		const ids = Object.keys(expandedSubflows).sort(
+			(a, b) =>
+				(parseExpandedSubflowId(a)?.subflowSteps.length ?? 0) -
+				(parseExpandedSubflowId(b)?.subflowSteps.length ?? 0)
+		)
+		for (const id of ids) {
+			// A later reload owns the state from here on.
+			if (reload !== latestReload) return
+			const expansion = expandedSubflows[id]
+			if (expansion == undefined) continue
+			const path = expandedSubflowPath(id)
+			if (path == undefined) {
+				delete expandedSubflows[id]
+				continue
+			}
+			try {
+				const flow = await FlowService.getFlowByPath({ workspace: workspace, path })
+				if (reload !== latestReload) return
+				// While this request was in flight the user may have collapsed the expansion, or
+				// collapsed it and re-expanded onto another flow: only commit onto the very
+				// expansion this response was fetched for.
+				if (expandedSubflows[id] !== expansion) continue
+				expandedSubflows[id] = { modules: flow.value.modules, groups: flow.value.groups }
+			} catch (err) {
+				sendUserToast(`Could not reload expanded subflow ${path}: ${err.body ?? err}`, true)
+			}
+		}
+		expandedSubflows = expandedSubflows
+	}
+
+	export function createGroupFromSelection(ids: string[]) {
+		if (groupEditorCtx?.groupEditor) {
+			groupEditorCtx.groupEditor.createGroup(ids, currentGraphNodeDeps)
+			tick().then(() => {
+				clearFlowSelection()
+				selectionManager.clearSelection()
+			})
+		}
+	}
+
 	const modifierKey = isMac() ? 'Meta' : 'Control'
 </script>
 
@@ -892,12 +1299,12 @@
 {/if}
 <div
 	style={`height: ${height}px; max-height: ${maxHeight}px;`}
-	class="overflow-clip relative"
+	class="overflow-clip relative {outerDivClass}"
 	bind:clientWidth={debouncedWidth}
 	bind:this={flowContainer}
 >
 	{#if graph?.error}
-		<div class="center-center p-2">
+		<div class="center-center p-2 mt-20">
 			<Alert title="Error parsing the flow" type="error" class="max-w-1/2">
 				{graph.error}
 
@@ -912,6 +1319,14 @@
 	{:else}
 		<SvelteFlowProvider>
 			<ViewportResizer {height} {width} {nodes} bind:this={viewportResizer} />
+			{#if moveManager}
+				<DragCoordinator
+					{moveManager}
+					eventHandlers={eventHandler}
+					{edges}
+					nodes={nodesWithOffset}
+				/>
+			{/if}
 			{#if sharedViewport && onViewportChange}
 				<ViewportSynchronizer
 					{sharedViewport}
@@ -962,6 +1377,7 @@
 				elevateNodesOnSelect={false}
 				{proOptions}
 				multiSelectionKey={'Shift'}
+				deleteKey={null}
 				nodesDraggable={false}
 				--background-color={false}
 			>
@@ -973,10 +1389,25 @@
 
 				{#if multiSelectEnabled}
 					<SelectionBoundingBox
-						selectedNodes={selectionManager.selectedIds}
+						selectedNodes={selectionManager.selectedIds.filter((id) =>
+							nodesWithOffset.some((n) => n.id === id)
+						)}
 						allNodes={nodesWithOffset as (Node & { type: string })[]}
+						onDeleteSelected={() => onDeleteMultiple?.(resolvedModuleIds)}
+						onDuplicateSelected={() => onDuplicateMultiple?.(resolvedModuleIds)}
+						onMoveSelected={() => onMoveMultiple?.(resolvedModuleIds)}
+						onCancelMove={() => onMoveMultiple?.(movingIds ?? [])}
+						{canMoveSelected}
+						isMoving={movingIds != null && movingIds.length > 0}
+						{resolvedModuleIds}
 					/>
 				{/if}
+
+				<GroupOverlay
+					allNodes={nodesWithOffset as (Node & { type: string })[]}
+					groups={allGroups}
+					groupDepths={currentGroupDepths}
+				/>
 
 				<!-- SelectionTool for handling selection changes and filtering -->
 				<SelectionTool {selectionManager} clearGraphSelection={clearFlowSelection} />
@@ -986,7 +1417,17 @@
 						{@render leftHeader()}
 					</div>
 				{:else}
-					<Controls position="top-right" orientation="horizontal" showLock={false}>
+					<!-- Their built-in glyphs are fill-based and sized differently from every other
+					     icon in the editor, so the bar is built from lucide throughout. -->
+					<Controls
+						class="wm-flow-controls"
+						position={controlsPosition === 'bottom' ? 'bottom-right' : 'top-right'}
+						orientation="horizontal"
+						showZoom={false}
+						showFitView={false}
+						showLock={false}
+					>
+						<GraphZoomControls fitViewNodes={nodes.filter((n) => n.type !== 'note')} />
 						{#if multiSelectEnabled}
 							<div class="flex items-center gap-2">
 								<Tooltip>
@@ -1030,7 +1471,7 @@
 									try {
 										localStorage.setItem(
 											'svelvet',
-											encodeState({ modules, failureModule, preprocessorModule, notes })
+											encodeState({ modules, failureModule, preprocessorModule, notes, groups })
 										)
 									} catch (e) {
 										console.error('error interacting with local storage', e)
@@ -1042,6 +1483,7 @@
 								<Expand size="14" />
 							</ControlButton>
 						{/if}
+						<FlowPanelPlacementPicker variant="control" placement="top-end" />
 					</Controls>
 
 					<Controls
@@ -1074,11 +1516,39 @@
 		opacity: 0;
 	}
 
-	:global(.svelte-flow__controls-button) {
-		@apply bg-surface border-0;
+	/* xy-flow's own rules are nested, so `.svelte-flow__controls-button svg` and the like
+	   match ours exactly and load order decides. Scoping by the class we pass to <Controls>
+	   outranks them instead of racing them. */
+	:global(.svelte-flow__controls.wm-flow-controls) {
+		/* Name the colour rather than leaning on the base layer's bare `.border`: preflight
+		   sets a light `border-color` on every element, so whenever that base rule does not
+		   make it into the bundle alongside this one the bar draws a white outline. */
+		@apply overflow-hidden rounded-md border border-border-light;
+		box-shadow: none;
 	}
-	:global(.svelte-flow__controls-button:hover) {
+	:global(.wm-flow-controls .svelte-flow__controls-button) {
+		@apply bg-surface text-primary;
+		width: 32px;
+		height: 30px;
+		padding: 8px;
+	}
+	:global(.wm-flow-controls .svelte-flow__controls-button:hover) {
 		@apply bg-surface-hover;
+	}
+	:global(.wm-flow-controls.horizontal .svelte-flow__controls-button) {
+		@apply border-r border-gray-200 dark:border-gray-700;
+	}
+	:global(.wm-flow-controls.horizontal .svelte-flow__controls-button:last-child) {
+		@apply border-r-0;
+	}
+	/* Every glyph in this bar is lucide, so undo their base `fill: currentColor` — it beats
+	   lucide's inline fill="none" and would flood the stroke icons solid — and lift the
+	   12px cap that keeps them off the editor's icon scale. */
+	:global(.wm-flow-controls .svelte-flow__controls-button svg) {
+		max-width: 16px;
+		max-height: 16px;
+		fill: none;
+		stroke: currentColor;
 	}
 
 	:global(.svelte-flow__edgelabel-renderer) {
@@ -1088,5 +1558,9 @@
 	:global(.svelte-flow__selection) {
 		display: none;
 		pointer-events: none;
+	}
+
+	:global(.svelte-flow__selection-wrapper) {
+		pointer-events: none !important;
 	}
 </style>

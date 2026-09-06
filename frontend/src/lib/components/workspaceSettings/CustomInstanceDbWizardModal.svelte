@@ -8,24 +8,23 @@
 	import { slide } from 'svelte/transition'
 	import Modal2 from '../common/modal/Modal2.svelte'
 	import Alert from '../common/alert/Alert.svelte'
-	import LoggedWizardResult, { firstEmptyStepIsError } from '../wizards/LoggedWizardResult.svelte'
+	import SetupChecklist from '../wizards/SetupChecklist.svelte'
 	import Button from '../common/button/Button.svelte'
 	import { sendUserToast } from '$lib/toast'
 	import { isCustomInstanceDbEnabled } from './utils.svelte'
 	import type { ResourceReturn } from 'runed'
 	import type { ConfirmationModalHandle } from '../common/confirmationModal/asyncConfirmationModal.svelte'
 	import ExploreAssetButton from '../ExploreAssetButton.svelte'
-	import type DBManagerDrawer from '../DBManagerDrawer.svelte'
-	import { ArrowRight, InfoIcon } from 'lucide-svelte'
+	import { ArrowRight, InfoIcon, Trash2 } from 'lucide-svelte'
 	import type { Snippet } from 'svelte'
 	import { truncate } from '$lib/utils'
 	import Tooltip from '../meltComponents/Tooltip.svelte'
 	import { superadmin } from '$lib/stores'
+	import { instanceSetupSteps } from './instanceDbSteps'
 
 	type Props = {
 		customInstanceDbs: ResourceReturn<ListCustomInstanceDbsResponse>
 		confirmationModal: ConfirmationModalHandle
-		dbManagerDrawer: DBManagerDrawer | undefined
 		bottomHint?: Snippet | undefined
 		opened: { status: CustomInstanceDb | undefined; dbname: string } | undefined
 		tag?: CustomInstanceDbTag
@@ -34,19 +33,20 @@
 	let {
 		customInstanceDbs,
 		confirmationModal,
-		dbManagerDrawer,
 		bottomHint,
 		opened = $bindable(),
 		tag
 	}: Props = $props()
 
 	let customInstanceDbSetupIsRunning = $state(false)
+	let dropIsRunning = $state(false)
 	let preventClose = false
 </script>
 
 <Modal2
 	bind:isOpen={() => !!opened, (v) => !v && !preventClose && (opened = undefined)}
 	target="#content"
+	formStyling
 	title={'Custom Instance Database Setup'}
 	contentClasses="flex flex-col"
 	fixedWidth="md"
@@ -61,7 +61,7 @@
 			<div class="basis-2/5 grow-0 shrink-0 flex flex-col">
 				<div class="flex-1 flex flex-col">
 					<span class="text-sm font-bold mb-2 overflow break-all">{dbname}</span>
-					<span class="text-sm">
+					<span class="text-xs font-normal text-secondary">
 						Custom instance databases are databases created in the Windmill PostgreSQL instance.
 						Their credentials are automatically managed by Windmill and are never exposed to users.
 						Only super admins can create them.
@@ -73,14 +73,50 @@
 							{@render bottomHint()}
 						</div>
 					{/if}
-					<ExploreAssetButton
-						class="flex-1"
-						asset={{ kind: 'resource', path: 'CUSTOM_INSTANCE_DB/' + dbname }}
-						_resourceMetadata={{ resource_type: 'postgresql' }}
-						{dbManagerDrawer}
-						disabled={!$isCustomInstanceDbEnabled || !enableManageButton}
-						onClick={() => (opened = undefined)}
-					/>
+					<div class="flex gap-2">
+						<ExploreAssetButton
+							class="flex-1"
+							asset={{ kind: 'resource', path: 'CUSTOM_INSTANCE_DB/' + dbname }}
+							_resourceMetadata={{ resource_type: 'postgresql' }}
+							disabled={!$isCustomInstanceDbEnabled || !enableManageButton}
+							onClick={() => (opened = undefined)}
+						/>
+						{#if $superadmin}
+							<Button
+								size="sm"
+								destructive
+								iconOnly
+								variant="accent"
+								startIcon={{ icon: Trash2 }}
+								loading={dropIsRunning}
+								onClick={async () => {
+									preventClose = true
+									let confirm = await confirmationModal.ask({
+										title: 'Drop database',
+										children: `This will permanently drop the database "${dbname}". All data will be lost. This action is irreversible.`,
+										confirmationText: 'Drop database'
+									})
+									preventClose = false
+									if (!confirm) return
+
+									try {
+										dropIsRunning = true
+										await SettingService.dropCustomInstanceDb({ name: dbname })
+										await customInstanceDbs.refetch()
+										sendUserToast(`Database "${dbname}" dropped successfully`)
+										opened = undefined
+									} catch (e) {
+										sendUserToast(`Failed to drop database: ${e}`, true)
+										console.error('Error dropping custom instance database', e)
+									} finally {
+										dropIsRunning = false
+									}
+								}}
+							>
+								Drop database
+							</Button>
+						{/if}
+					</div>
 				</div>
 			</div>
 			<div class="flex-1 shrink-0 flex flex-col pl-4 gap-2">
@@ -93,56 +129,8 @@
 						</div>
 					{/if}
 
-					<LoggedWizardResult
-						steps={firstEmptyStepIsError(
-							[
-								{
-									title: 'Super admin required',
-									status: status?.logs.super_admin,
-									description:
-										'You need to be a super admin to create a new database in the Windmill PostgreSQL instance'
-								},
-								{
-									title: 'Retrieve and parse database credentials',
-									status: status?.logs.database_credentials,
-									description:
-										'Windmill uses the DATABASE_URL or DATABASE_URL_FILE environment variable to connect to the PostgreSQL instance. Make sure it is correctly set'
-								},
-								{
-									title: 'Database name is valid',
-									status: status?.logs.valid_dbname,
-									description:
-										'The database name must be alphanumeric (underscores allowed) and cannot be named the same as the Windmill database (usually "windmill")'
-								},
-								{
-									title:
-										'Create database' +
-										(status?.logs.created_database === 'SKIP' ? ' (already exists, skipped)' : ''),
-									status: status?.logs.created_database,
-									description: `In the Windmill PostgreSQL instance, run: CREATE DATABASE "${dbname}".`
-								},
-								{
-									title: `Connect to the ${dbname} database`,
-									status: status?.logs.db_connect,
-									description:
-										"Connect to the newly created database with the default admin user (the one in DATABASE_URL, usually 'postgres') to run the next commands"
-								},
-								{
-									title: 'Grant permissions to custom_instance_user',
-									status: status?.logs.grant_permissions,
-									description:
-										'Gives custom_instance_user the required permissions to use the database. custom_instance_user is already created during a migration and has an auto-generated password stored in global_settings.custom_instance_pg_databases.user_pwd. These are the commands : \n\n' +
-										`GRANT CONNECT ON DATABASE "${dbname}" TO custom_instance_user;\n` +
-										'GRANT USAGE ON SCHEMA public TO custom_instance_user;\n' +
-										'GRANT CREATE ON SCHEMA public TO custom_instance_user;\n' +
-										`GRANT CREATE ON DATABASE "${dbname}" TO custom_instance_user;\n` +
-										'ALTER DEFAULT PRIVILEGES IN SCHEMA public \n' +
-										'  	GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES\n    TO custom_instance_user;\n' +
-										'ALTER ROLE custom_instance_user CREATEROLE;'
-								}
-							],
-							status?.error ?? undefined
-						)}
+					<SetupChecklist
+						steps={instanceSetupSteps(dbname, status, customInstanceDbSetupIsRunning)}
 					/>
 				</div>
 				{#if $superadmin}
@@ -151,11 +139,13 @@
 							endIcon={{ icon: InfoIcon }}
 							onClick={async () => {
 								await SettingService.refreshCustomInstanceUserPwd()
-								sendUserToast('custom_instance_user password refreshed')
-							}}>Refresh custom_instance_user password</Button
+								sendUserToast('custom instance user passwords refreshed')
+							}}>Refresh custom instance passwords</Button
 						>
 						{#snippet text()}
-							Try this if there is an issue with your custom instance database password.
+							Try this if there is an issue with your custom instance database passwords. Rotates
+							both custom_instance_user and the custom_instance_replication_user used by postgres
+							triggers.
 						{/snippet}
 					</Tooltip>
 				{/if}

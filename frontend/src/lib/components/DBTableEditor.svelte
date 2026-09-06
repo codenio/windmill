@@ -1,4 +1,5 @@
 <script lang="ts" module>
+	import { untrack } from 'svelte'
 	function validate(values: TableEditorValues, dbSchema?: DBSchema) {
 		const columnNamesErrs = values.columns.flatMap((column) => {
 			const isUnique = values.columns.filter((c) => c.name === column.name).length === 1
@@ -41,16 +42,17 @@
 <script lang="ts">
 	import { ArrowRight, ClipboardCopy, Plus, Settings, X } from 'lucide-svelte'
 
+	import { copyToClipboard } from '$lib/utils'
 	import { Button } from './common'
 	import { Cell } from './table'
 	import DataTable from './table/DataTable.svelte'
 	import Head from './table/Head.svelte'
 	import { datatypeHasLength } from './apps/components/display/dbtable/utils'
-	import { DB_TYPES } from '$lib/consts'
+	import { DB_TYPES, NEW_COLUMN_ONLY_TYPES } from '$lib/consts'
 	import Popover from './meltComponents/Popover.svelte'
 	import ConfirmationModal from './common/confirmationModal/ConfirmationModal.svelte'
 	import { sendUserToast } from '$lib/toast'
-	import { copyToClipboard } from '$lib/utils'
+	import { MigrationRunCancelled } from './dbOps'
 	import { getFlatTableNamesFromSchema, type DBSchema } from '$lib/stores'
 	import { twMerge } from 'tailwind-merge'
 	import DarkModeObserver from './DarkModeObserver.svelte'
@@ -62,6 +64,7 @@
 	import { Debounced } from 'runed'
 	import {
 		type TableEditorValues,
+		type TableEditorValuesColumn,
 		datatypeDefaultLength
 	} from './apps/components/display/dbtable/tableEditor'
 	import Alert from './common/alert/Alert.svelte'
@@ -77,7 +80,7 @@
 		onConfirm: (params: { values: TableEditorValues }) => void | Promise<void>
 		computePreview: (params: {
 			values: TableEditorValues
-		}) => { sql: string; alert?: { title: string; body?: string } }
+		}) => Promise<{ sql: string; alert?: { title: string; body?: string } }>
 		computeBtnProps: (params: { values: TableEditorValues }) => { text: string; disabled?: boolean }
 	}
 
@@ -92,7 +95,13 @@
 		computePreview
 	}: Props = $props()
 
-	const columnTypes = DB_TYPES[dbType]
+	const columnTypes = DB_TYPES[untrack(() => dbType)]
+	function columnTypesFor(column: TableEditorValuesColumn): string[] {
+		if (column.initialName) {
+			return columnTypes.filter((t) => !NEW_COLUMN_ONLY_TYPES.includes(t))
+		}
+		return columnTypes
+	}
 	const defaultColumnType = (
 		{
 			postgresql: 'BIGSERIAL',
@@ -102,10 +111,10 @@
 			mysql: 'varchar',
 			duckdb: 'string'
 		} satisfies Record<DbType, string>
-	)[dbType]
+	)[untrack(() => dbType)]
 
 	const values: TableEditorValues = $state(
-		$state.snapshot(initialValues) ?? {
+		$state.snapshot(untrack(() => initialValues)) ?? {
 			name: '',
 			columns: [],
 			foreignKeys: []
@@ -122,8 +131,8 @@
 			...(primaryKey && { primaryKey })
 		})
 	}
-	if (!initialValues) {
-		addColumn({ name: 'id', primaryKey: features?.primaryKeys })
+	if (!untrack(() => initialValues)) {
+		addColumn({ name: 'id', primaryKey: untrack(() => features)?.primaryKeys })
 	}
 
 	const errors: ReturnType<typeof validate> = $derived(validate(values, dbSchema))
@@ -135,6 +144,8 @@
 				alert?: { title: string; body?: string }
 		  })
 		| undefined = $state()
+
+	let previewLoading = $state(false)
 
 	let darkMode = $state(false)
 
@@ -209,7 +220,7 @@
 											}
 										}
 									}
-									items={safeSelectItems(columnTypes)}
+									items={safeSelectItems(columnTypesFor(column))}
 									class="w-48"
 								/>
 								{#if column.initialName && column.name !== column.initialName}
@@ -439,25 +450,38 @@
 	</div>
 	<Button
 		disabled={!!errors || btnProps.current.disabled}
-		loading={btnProps.pending}
-		on:click={() => {
-			let preview = computePreview?.({ values })
-			askingForConfirmation = {
-				onConfirm: async () => {
-					try {
-						askingForConfirmation && (askingForConfirmation.loading = true)
-						await onConfirm({ values })
-					} catch (e) {
-						let msg: string | undefined = (e as Error)?.message
-						if (typeof msg !== 'string') msg = e ? JSON.stringify(e) : 'An error occurred'
-						sendUserToast(msg, true)
-					}
-					askingForConfirmation = undefined
-				},
-				title: 'Confirm running the following:',
-				confirmationText: btnProps.current.text,
-				open: true,
-				...(preview && { codeContent: preview.sql, alert: preview.alert })
+		loading={btnProps.pending || previewLoading}
+		on:click={async () => {
+			previewLoading = true
+			try {
+				let preview = await computePreview({ values })
+				askingForConfirmation = {
+					onConfirm: async () => {
+						try {
+							askingForConfirmation && (askingForConfirmation.loading = true)
+							await onConfirm({ values })
+						} catch (e) {
+							// User declined the out-of-order run warning: silent cancel,
+							// leave the editor open so they can adjust or run earlier first.
+							if (!(e instanceof MigrationRunCancelled)) {
+								let msg: string | undefined = (e as any)?.body ?? (e as Error)?.message
+								if (typeof msg !== 'string') msg = e ? JSON.stringify(e) : 'An error occurred'
+								sendUserToast(msg, true)
+							}
+						}
+						askingForConfirmation = undefined
+					},
+					title: 'Confirm running the following:',
+					confirmationText: btnProps.current.text,
+					open: true,
+					...(preview && { codeContent: preview.sql, alert: preview.alert })
+				}
+			} catch (e) {
+				let msg: string | undefined = (e as any)?.body ?? (e as Error)?.message
+				if (typeof msg !== 'string') msg = e ? JSON.stringify(e) : 'An error occurred'
+				sendUserToast(msg, true)
+			} finally {
+				previewLoading = false
 			}
 		}}
 	>
@@ -478,17 +502,19 @@
 			</Alert>
 		{/if}
 		{#if askingForConfirmation?.codeContent}
-			<div class="bg-surface-secondary border border-surface-selected rounded-md p-2 relative">
-				<code class="whitespace-pre-wrap">
-					{askingForConfirmation.codeContent}
-				</code>
-				<Button
-					on:click={() => copyToClipboard(askingForConfirmation?.codeContent)}
-					size="xs"
-					startIcon={{ icon: ClipboardCopy }}
-					color="none"
-					wrapperClasses="absolute z-10 top-0 right-0"
-				></Button>
+			<div
+				class="bg-surface-secondary border border-surface-selected rounded-md p-2 relative group"
+			>
+				<button
+					class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-surface-hover"
+					onclick={() => copyToClipboard(askingForConfirmation?.codeContent)}
+					title="Copy to clipboard"
+				>
+					<ClipboardCopy size={14} />
+				</button>
+				<pre class="whitespace-pre-wrap text-sm"
+					><code>{askingForConfirmation.codeContent}</code></pre
+				>
 			</div>
 		{/if}
 	</ConfirmationModal>

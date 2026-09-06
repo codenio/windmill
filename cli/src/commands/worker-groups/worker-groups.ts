@@ -1,6 +1,8 @@
-import { Command, Confirm, setClient, Table } from "../../../deps.ts";
-
-import { log } from "../../../deps.ts";
+import { Command } from "@cliffy/command";
+import { Table } from "@cliffy/table";
+import { Confirm } from "@cliffy/prompt/confirm";
+import * as log from "../../core/log.ts";
+import { setClient } from "../../core/client.ts";
 import { allInstances, getActiveInstance, InstanceSyncOptions, pickInstance } from "../instance/instance.ts";
 import * as wmill from "../../../gen/services.gen.ts";
 import { pullInstanceConfigs, pushInstanceConfigs } from "../../core/settings.ts";
@@ -120,7 +122,7 @@ const command = new Command()
   .action(pullWorkerGroups as any)
   .command("push")
   .description(
-    "Push instance settings, users, configs, group and overwrite remote"
+    "Push worker groups (similar to `wmill instance push --skip-users --skip-settings --skip-groups`)"
   )
   .option(
     "--instance [instance]",

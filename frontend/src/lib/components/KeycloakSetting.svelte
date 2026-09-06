@@ -1,18 +1,21 @@
 <script lang="ts">
+	import { untrack } from 'svelte'
 	import IconedResourceType from './IconedResourceType.svelte'
 	import TextInput from './text_input/TextInput.svelte'
+	import Password from './Password.svelte'
 	import Toggle from './Toggle.svelte'
+	import SettingCard from './instanceSettings/SettingCard.svelte'
 
-	export let value: any
+	interface Props {
+		value: any
+	}
 
-	$: enabled = value != undefined
+	let { value = $bindable() }: Props = $props()
 
-	let org = ''
+	let lastOrg: string | undefined = undefined
 
-	$: changeOrg(org)
-
-	function changeOrg(org) {
-		if (value) {
+	function changeOrg(org: string | undefined) {
+		if (value && org) {
 			value = {
 				...value,
 				connect_config: {
@@ -29,16 +32,25 @@
 			}
 		}
 	}
+
+	let enabled = $derived(value != undefined)
+
+	$effect.pre(() => {
+		if (value?.['org'] != lastOrg) {
+			lastOrg = value?.['org']
+			untrack(() => changeOrg(value?.['org']))
+		}
+	})
 </script>
 
 <div class="flex flex-col gap-1">
-	<!-- svelte-ignore a11y-label-has-associated-control -->
+	<!-- svelte-ignore a11y_label_has_associated_control -->
 	<label class="text-xs font-semibold text-emphasis flex gap-4 items-center"
 		><div class="w-[120px]"><IconedResourceType name={'keycloak'} after={true} /></div><Toggle
 			checked={enabled}
 			on:change={(e) => {
 				if (e.detail) {
-					value = { id: '', secret: '' }
+					value = { id: '', secret: '', org: '' }
 				} else {
 					value = undefined
 				}
@@ -46,13 +58,16 @@
 		/></label
 	>
 	{#if enabled}
-		<div class="border rounded p-4 flex flex-col gap-6">
+		<SettingCard class="flex flex-col gap-6">
 			<label class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs">Realm Url </span>
 				<span class="text-secondary font-normal text-xs"
 					>{'REALM_URL/protocol/openid-connect/auth'}</span
 				>
-				<TextInput inputProps={{ type: 'text', placeholder: 'yourorg' }} bind:value={org} />
+				<TextInput
+					inputProps={{ type: 'text', placeholder: 'yourorg' }}
+					bind:value={value['org']}
+				/>
 			</label>
 			<label class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs">Custom Name</span>
@@ -68,13 +83,14 @@
 					bind:value={value['id']}
 				/>
 			</label>
-			<label class="flex flex-col gap-1">
+			<label for="keycloak_client_secret" class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs">Client Secret </span>
-				<TextInput
-					inputProps={{ type: 'text', placeholder: 'Client Secret' }}
-					bind:value={value['secret']}
+				<Password
+					id="keycloak_client_secret"
+					placeholder="Client Secret"
+					bind:password={value['secret']}
 				/>
 			</label>
-		</div>
+		</SettingCard>
 	{/if}
 </div>

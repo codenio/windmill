@@ -1,6 +1,14 @@
 <script lang="ts">
-	import { type DBSchema } from '$lib/stores'
-	import { ChevronDownIcon, EditIcon, Loader2, Plus, Table2, Trash2Icon } from 'lucide-svelte'
+	import { superadmin, userStore, type DBSchema } from '$lib/stores'
+	import {
+		ChevronDownIcon,
+		EditIcon,
+		Loader2,
+		Plus,
+		Table2,
+		Trash2Icon,
+		UploadIcon
+	} from 'lucide-svelte'
 	import { Pane, Splitpanes } from 'svelte-splitpanes'
 	import { ClearableInput, Drawer, DrawerContent } from './common'
 	import { sendUserToast } from '$lib/toast'
@@ -36,6 +44,7 @@
 		dbType: DbType
 		dbSchema: DBSchema
 		dbSupportsSchemas: boolean
+		databaseIsEmpty?: boolean
 		colDefs: Record<string, ColumnDef[]> | undefined
 		dbTableOpsFactory: (params: { colDefs: ColumnDef[]; tableKey: string }) => IDbTableOps
 		dbSchemaOps: IDbSchemaOps
@@ -53,6 +62,7 @@
 		disabledTables?: SelectedTable[]
 		features?: DbFeatures
 		asset?: Asset
+		onImport?: (mode: 'schema_and_data' | 'schema_only') => void
 	}
 	let {
 		dbType,
@@ -60,6 +70,7 @@
 		dbTableOpsFactory,
 		dbSchemaOps,
 		dbSupportsSchemas,
+		databaseIsEmpty,
 		colDefs,
 		refresh,
 		initialSchemaKey,
@@ -71,7 +82,8 @@
 		selectedTables = $bindable([]),
 		disabledTables = [],
 		features,
-		asset
+		asset,
+		onImport
 	}: Props = $props()
 
 	// Helper to check if a table is selected in multi-select mode
@@ -150,7 +162,13 @@
 		if (!selected.schemaKey && schemaKeys.length) {
 			let schemaKey =
 				initialSchemaKey ??
-				('public' in dbSchema.schema ? 'public' : 'dbo' in dbSchema.schema ? 'dbo' : schemaKeys[0])
+				('public' in dbSchema.schema
+					? 'public'
+					: 'dbo' in dbSchema.schema
+						? 'dbo'
+						: 'main' in dbSchema.schema
+							? 'main'
+							: schemaKeys[0])
 			let tableKey =
 				initialTableKey && dbSchema.schema?.[schemaKey]?.[initialTableKey]
 					? initialTableKey
@@ -352,7 +370,7 @@
 											refresh?.()
 											sendUserToast(`Schema '${schemaKey}' deleted successfully`)
 										} catch (e) {
-											let msg: string | undefined = (e as Error).message
+											let msg: string | undefined = (e as any).body ?? (e as Error).message
 											if (typeof msg !== 'string') msg = e ? JSON.stringify(e) : undefined
 											sendUserToast(msg ?? 'Action failed!', true)
 										}
@@ -418,7 +436,7 @@
 												refresh?.()
 												sendUserToast(`Table '${tableKey}' deleted successfully`)
 											} catch (e) {
-												let msg: string | undefined = (e as Error).message
+												let msg: string | undefined = (e as any).body ?? (e as Error).message
 												if (typeof msg !== 'string') msg = e ? JSON.stringify(e) : undefined
 												sendUserToast(msg ?? 'Action failed!', true)
 											}
@@ -484,7 +502,7 @@
 													refresh?.()
 													sendUserToast(`Table '${tableKey}' deleted successfully`)
 												} catch (e) {
-													let msg: string | undefined = (e as Error).message
+													let msg: string | undefined = (e as any).body ?? (e as Error).message
 													if (typeof msg !== 'string') msg = e ? JSON.stringify(e) : undefined
 													sendUserToast(msg ?? 'Action failed!', true)
 												}
@@ -525,6 +543,34 @@
 		{#if tableKey && colDefs?.[tableKey]?.length}
 			{@const dbTableOps = dbTableOpsFactory({ colDefs: colDefs[tableKey], tableKey })}
 			<DBTable {dbTableOps} bind:this={_dbTable} />
+		{:else if databaseIsEmpty}
+			<div class="h-full w-full center-center flex-col gap-4">
+				<span class="text-hint">Database is empty</span>
+				{#if onImport}
+					<div class="flex gap-4">
+						<button
+							onclick={() => onImport('schema_only')}
+							class="hover:opacity-70 transition-opacity rounded-md border aspect-square w-52 gap-4 p-4 center-center flex-col"
+						>
+							<UploadIcon size={64} class="text-secondary" />
+							<span class="text-center font-normal text-sm text-secondary">
+								Import schema from database
+							</span>
+						</button>
+						{#if !!$userStore?.is_admin || !!$superadmin}
+							<button
+								onclick={() => onImport('schema_and_data')}
+								class="hover:opacity-70 transition-opacity rounded-md border aspect-square w-52 gap-4 p-4 center-center flex-col"
+							>
+								<UploadIcon size={64} class="text-secondary" />
+								<span class="text-center font-normal text-sm text-secondary">
+									Import schema and data from database
+								</span>
+							</button>
+						{/if}
+					</div>
+				{/if}
+			</div>
 		{/if}
 	</Pane>
 </Splitpanes>
@@ -559,7 +605,9 @@
 					onConfirm={async ({ values }) => {
 						if (dbTableEditorState.alterTableKey && dbTableEditorAlterTableData.current) {
 							let diff = diffTableEditorValues(dbTableEditorAlterTableData.current, values)
-							await dbSchemaOps.onAlter({ schema: selected.schemaKey, values: diff })
+							// Reverse diff (new → old) so the migration's down undoes the alter.
+							let reverse = diffTableEditorValues(values, dbTableEditorAlterTableData.current)
+							await dbSchemaOps.onAlter({ schema: selected.schemaKey, values: diff, reverse })
 						} else {
 							await dbSchemaOps.onCreate({ values, schema: selected.schemaKey })
 						}
@@ -572,10 +620,10 @@
 						dbTableEditorState = { open: false }
 					}}
 					{dbType}
-					computePreview={({ values }) => {
+					computePreview={async ({ values }) => {
 						if (dbTableEditorState.alterTableKey && dbTableEditorAlterTableData.current) {
 							let diff = diffTableEditorValues(dbTableEditorAlterTableData.current, values)
-							let queries = dbSchemaOps.previewAlterSql({
+							let sql = await dbSchemaOps.previewAlterSql({
 								values: diff,
 								schema: selected.schemaKey
 							})
@@ -585,23 +633,20 @@
 										body: 'Any of these statements failing may leave your database in an intermediate state.'
 									}
 								: undefined
-							return { sql: queries.join('\n'), ...(alert ? { alert } : {}) }
+							return { sql, ...(alert ? { alert } : {}) }
 						} else {
-							return { sql: dbSchemaOps.previewCreateSql({ values, schema: selected.schemaKey }) }
+							let sql = await dbSchemaOps.previewCreateSql({ values, schema: selected.schemaKey })
+							return { sql }
 						}
 					}}
 					computeBtnProps={({ values }) => {
 						if (dbTableEditorState.alterTableKey && dbTableEditorAlterTableData.current) {
 							let diff = diffTableEditorValues(dbTableEditorAlterTableData.current, values)
-							let queries = dbSchemaOps.previewAlterSql({
-								values: diff,
-								schema: selected.schemaKey
-							})
-							if (!queries.length) {
+							if (!diff.operations.length) {
 								return { text: 'No changes detected', disabled: true }
 							}
 							return {
-								text: `Alter table (${pluralize(queries.length, 'change')} detected)`
+								text: `Alter table (${pluralize(diff.operations.length, 'change')} detected)`
 							}
 						} else {
 							return { text: 'Create table' }

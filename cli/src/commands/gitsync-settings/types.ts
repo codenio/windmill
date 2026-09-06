@@ -37,6 +37,8 @@ export const GIT_SYNC_FIELDS = [
   "includeGroups",
   "includeSettings",
   "includeKey",
+  "skipWorkspaceDependencies",
+  "skipDatatableMigrations",
 ] as const;
 
 export type GitSyncField = typeof GIT_SYNC_FIELDS[number];
@@ -57,6 +59,8 @@ export const INCLUDE_TYPE_MAPPINGS = {
   group: "includeGroups",
   settings: "includeSettings",
   key: "includeKey",
+  workspacedependencies: "skipWorkspaceDependencies",
+  datatablemigration: "skipDatatableMigrations",
 } as const;
 
 // Write mode for branch-based configuration

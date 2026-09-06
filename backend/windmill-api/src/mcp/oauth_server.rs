@@ -10,12 +10,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 use windmill_common::{
+    auth::{hash_token, TOKEN_PREFIX_LEN},
     error::{Error, Result},
+    min_version::MIN_VERSION_SUPPORTS_TOKEN_HASH,
     utils::rd_string,
     BASE_URL, DB,
 };
 
 use crate::db::ApiAuthed;
+use windmill_api_auth::forbid_elevated_job_token;
+use windmill_mcp::parse_mcp_scopes;
 
 /// Token expiration for MCP OAuth tokens (1 week in seconds)
 const MCP_OAUTH_TOKEN_EXPIRATION_SECS: u64 = 7 * 24 * 60 * 60;
@@ -209,7 +213,7 @@ struct AuthorizationCode {
 struct RefreshTokenRow {
     id: i64,
     refresh_token: String,
-    access_token: String,
+    access_token_hash: String,
     client_id: String,
     user_email: String,
     workspace_id: String,
@@ -232,19 +236,11 @@ fn supported_scopes() -> Vec<String> {
 }
 
 /// GET /.well-known/oauth-authorization-server/api/w/:workspace_id/mcp/oauth/server
-pub async fn workspaced_oauth_metadata(
-    Path(workspace_id): Path<String>,
-) -> Json<AuthorizationMetadata> {
-    let base_url = BASE_URL.read().await;
-    let issuer = format!("{}/api/w/{}/mcp/oauth/server", base_url, workspace_id);
-
-    Json(AuthorizationMetadata {
-        issuer,
-        authorization_endpoint: format!(
-            "{}/api/w/{}/mcp/oauth/server/authorize",
-            base_url, workspace_id
-        ),
-        token_endpoint: format!("{}/api/w/{}/mcp/oauth/server/token", base_url, workspace_id),
+fn build_oauth_metadata(oauth_prefix: &str, base_url: &str) -> AuthorizationMetadata {
+    AuthorizationMetadata {
+        issuer: format!("{}{}", base_url, oauth_prefix),
+        authorization_endpoint: format!("{}{}/authorize", base_url, oauth_prefix),
+        token_endpoint: format!("{}{}/token", base_url, oauth_prefix),
         registration_endpoint: Some(format!("{}/api/mcp/oauth/server/register", base_url)),
         scopes_supported: Some(supported_scopes()),
         response_types_supported: Some(vec!["code".to_string()]),
@@ -253,22 +249,70 @@ pub async fn workspaced_oauth_metadata(
             "refresh_token".to_string(),
         ]),
         code_challenge_methods_supported: Some(vec!["S256".to_string()]),
-    })
+    }
+}
+
+fn build_protected_resource_metadata(
+    resource_path: &str,
+    oauth_prefix: &str,
+    base_url: &str,
+) -> ProtectedResourceMetadata {
+    ProtectedResourceMetadata {
+        resource: format!("{}{}", base_url, resource_path),
+        authorization_servers: vec![format!("{}{}", base_url, oauth_prefix)],
+        scopes_supported: Some(supported_scopes()),
+        bearer_methods_supported: Some(vec!["header".to_string()]),
+    }
+}
+
+pub async fn workspaced_oauth_metadata(
+    Path(workspace_id): Path<String>,
+) -> Json<AuthorizationMetadata> {
+    let base_url = BASE_URL.load();
+    let oauth_prefix = format!("/api/w/{}/mcp/oauth/server", workspace_id);
+    Json(build_oauth_metadata(&oauth_prefix, &base_url))
 }
 
 /// GET /.well-known/oauth-protected-resource/api/mcp/w/:workspace_id/mcp
 pub async fn protected_resource_metadata_by_path(
     Path(workspace_id): Path<String>,
 ) -> Json<ProtectedResourceMetadata> {
-    let base_url = BASE_URL.read().await;
-    let resource_url = format!("{}/api/mcp/w/{}/mcp", base_url, workspace_id);
-    let auth_server_url = format!("{}/api/w/{}/mcp/oauth/server", base_url, workspace_id);
-    Json(ProtectedResourceMetadata {
-        resource: resource_url,
-        authorization_servers: vec![auth_server_url],
-        scopes_supported: Some(supported_scopes()),
-        bearer_methods_supported: Some(vec!["header".to_string()]),
-    })
+    let base_url = BASE_URL.load();
+    let resource_path = format!("/api/mcp/w/{}/mcp", workspace_id);
+    let oauth_prefix = format!("/api/w/{}/mcp/oauth/server", workspace_id);
+    Json(build_protected_resource_metadata(
+        &resource_path,
+        &oauth_prefix,
+        &base_url,
+    ))
+}
+
+/// Schemes that a browser executes as script or uses to read local content. The
+/// consent page navigates the user's browser to the registered redirect_uri
+/// (`window.location` / anchor `href`), so accepting any of these turns dynamic
+/// client registration into a stored-XSS / token-exfiltration primitive.
+const DISALLOWED_REDIRECT_URI_SCHEMES: &[&str] =
+    &["javascript", "data", "vbscript", "blob", "file"];
+
+/// Validate a dynamically-registered redirect_uri.
+///
+/// RFC 7591 dynamic client registration is intentionally unauthenticated for MCP
+/// interoperability, so the redirect_uri is the security boundary: it must be an
+/// absolute URI (RFC 6749 §3.1.2) and must not use a browser-executable scheme.
+fn validate_redirect_uri(uri: &str) -> Result<()> {
+    let parsed = url::Url::parse(uri).map_err(|_| {
+        Error::BadRequest(format!(
+            "Invalid redirect_uri (must be an absolute URI): {uri}"
+        ))
+    })?;
+    // `url` normalizes the scheme to lowercase ASCII.
+    if DISALLOWED_REDIRECT_URI_SCHEMES.contains(&parsed.scheme()) {
+        return Err(Error::BadRequest(format!(
+            "redirect_uri scheme '{}' is not allowed",
+            parsed.scheme()
+        )));
+    }
+    Ok(())
 }
 
 /// POST /api/mcp/oauth/server/register - dynamic client registration
@@ -280,6 +324,10 @@ pub async fn oauth_register(
         return Err(Error::BadRequest(
             "At least one redirect_uri is required".to_string(),
         ));
+    }
+
+    for uri in &req.redirect_uris {
+        validate_redirect_uri(uri)?;
     }
 
     let client_id = format!("mcp-client-{}", rd_string(16));
@@ -383,15 +431,27 @@ async fn handle_authorization_code_grant(
     }
 
     let access_token = rd_string(32);
+    let access_token_hash = hash_token(&access_token);
+    let access_token_prefix = access_token
+        .get(..TOKEN_PREFIX_LEN)
+        .unwrap_or(&access_token);
+    let plaintext: Option<&str> = if MIN_VERSION_SUPPORTS_TOKEN_HASH.met().await {
+        None
+    } else {
+        Some(&access_token)
+    };
     let refresh_token = rd_string(32);
     let token_family = sqlx::types::Uuid::new_v4();
     let scopes = auth_code.scopes;
 
-    // Create access token
-    if let Err(e) = sqlx::query!(
-        "INSERT INTO token (token, email, label, expiration, scopes, workspace_id)
-         VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval, $5, $6)",
-        access_token,
+    // Create access token (rejects archived workspaces inline)
+    let rows = sqlx::query!(
+        "INSERT INTO token (token_hash, token_prefix, token, email, label, expiration, scopes, workspace_id)
+         SELECT $1::varchar, $2::varchar, $3::varchar, $4::varchar, $5::varchar, now() + ($6 || ' seconds')::interval, $7::text[], $8::varchar
+         WHERE NOT EXISTS(SELECT 1 FROM workspace WHERE id = $8 AND deleted = true)",
+        access_token_hash,
+        access_token_prefix,
+        plaintext as Option<&str>,
         auth_code.user_email,
         format!("mcp-oauth-{}", auth_code.client_id),
         MCP_OAUTH_TOKEN_EXPIRATION_SECS.to_string(),
@@ -400,20 +460,23 @@ async fn handle_authorization_code_grant(
     )
     .execute(db)
     .await
-    {
+    .map_err(|e| {
         tracing::error!("Failed to create access token: {}", e);
-        return Err(OAuthTokenError::server_error(
-            "Failed to create access token",
+        OAuthTokenError::server_error("Failed to create access token")
+    })?;
+    if rows.rows_affected() == 0 {
+        return Err(OAuthTokenError::invalid_grant(
+            "Cannot create a token for an archived workspace",
         ));
     }
 
-    // Create refresh token
+    // Create refresh token — store the hash of the access token so we can delete it later
     let refresh_token_result = sqlx::query!(
         "INSERT INTO mcp_oauth_refresh_token
-         (refresh_token, access_token, client_id, user_email, workspace_id, scopes, token_family, expires_at)
+         (refresh_token, access_token_hash, client_id, user_email, workspace_id, scopes, token_family, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, now() + ($8 || ' seconds')::interval)",
         refresh_token,
-        access_token,
+        access_token_hash,
         auth_code.client_id,
         auth_code.user_email,
         auth_code.workspace_id,
@@ -465,7 +528,7 @@ async fn handle_refresh_token_grant(
            AND used_at IS NULL
            AND NOT revoked
            AND expires_at > now()
-         RETURNING id, refresh_token, access_token, client_id, user_email, workspace_id,
+         RETURNING id, refresh_token, access_token_hash, client_id, user_email, workspace_id,
                    scopes, token_family, created_at, expires_at, used_at, revoked",
         refresh_token_value,
         req.client_id
@@ -500,10 +563,13 @@ async fn handle_refresh_token_grant(
         }
     };
 
-    // Delete old access token
-    if let Err(e) = sqlx::query!("DELETE FROM token WHERE token = $1", token_row.access_token)
-        .execute(db)
-        .await
+    // Delete old access token using the stored hash
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM token WHERE token_hash = $1",
+        token_row.access_token_hash
+    )
+    .execute(db)
+    .await
     {
         tracing::error!("Failed to delete old access token: {}", e);
         // Non-fatal, continue with token creation
@@ -511,14 +577,28 @@ async fn handle_refresh_token_grant(
 
     // Generate new tokens
     let new_access_token = rd_string(32);
+    let new_access_token_hash = hash_token(&new_access_token);
+    let new_access_token_prefix = new_access_token
+        .get(..TOKEN_PREFIX_LEN)
+        .unwrap_or(&new_access_token);
+    let new_plaintext: Option<&str> = if MIN_VERSION_SUPPORTS_TOKEN_HASH.met().await {
+        None
+    } else {
+        Some(&new_access_token)
+    };
     let new_refresh_token = rd_string(32);
+    // Re-issues the already-approved (hence already-contained) scopes verbatim;
+    // containment is enforced once at approval time, so no re-check here.
     let scopes = token_row.scopes;
 
-    // Create new access token
-    if let Err(e) = sqlx::query!(
-        "INSERT INTO token (token, email, label, expiration, scopes, workspace_id)
-         VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval, $5, $6)",
-        new_access_token,
+    // Create new access token (rejects archived workspaces inline)
+    let rows = sqlx::query!(
+        "INSERT INTO token (token_hash, token_prefix, token, email, label, expiration, scopes, workspace_id)
+         SELECT $1::varchar, $2::varchar, $3::varchar, $4::varchar, $5::varchar, now() + ($6 || ' seconds')::interval, $7::text[], $8::varchar
+         WHERE NOT EXISTS(SELECT 1 FROM workspace WHERE id = $8 AND deleted = true)",
+        new_access_token_hash,
+        new_access_token_prefix,
+        new_plaintext as Option<&str>,
         token_row.user_email,
         format!("mcp-oauth-{}", token_row.client_id),
         MCP_OAUTH_TOKEN_EXPIRATION_SECS.to_string(),
@@ -527,20 +607,23 @@ async fn handle_refresh_token_grant(
     )
     .execute(db)
     .await
-    {
+    .map_err(|e| {
         tracing::error!("Failed to create new access token: {}", e);
-        return Err(OAuthTokenError::server_error(
-            "Failed to create access token",
+        OAuthTokenError::server_error("Failed to create access token")
+    })?;
+    if rows.rows_affected() == 0 {
+        return Err(OAuthTokenError::invalid_grant(
+            "Cannot create a token for an archived workspace",
         ));
     }
 
-    // Create new refresh token (same token family for tracking)
+    // Create new refresh token (same token family for tracking) — store hash of access token
     if let Err(e) = sqlx::query!(
         "INSERT INTO mcp_oauth_refresh_token
-         (refresh_token, access_token, client_id, user_email, workspace_id, scopes, token_family, expires_at)
+         (refresh_token, access_token_hash, client_id, user_email, workspace_id, scopes, token_family, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, now() + ($8 || ' seconds')::interval)",
         new_refresh_token,
-        new_access_token,
+        new_access_token_hash,
         token_row.client_id,
         token_row.user_email,
         token_row.workspace_id,
@@ -564,18 +647,19 @@ async fn handle_refresh_token_grant(
     }))
 }
 
-/// GET /api/w/:workspace_id/mcp/oauth/server/authorize - redirects to consent page
-pub async fn workspaced_oauth_authorize(
-    Extension(db): Extension<DB>,
-    Path(workspace_id): Path<String>,
-    Query(params): Query<AuthorizeQuery>,
-) -> impl IntoResponse {
+/// Shared authorize logic — validates params, looks up client, redirects to consent page.
+/// When `workspace_id` is Some, passes it to frontend; when None, passes `gateway=true`.
+async fn oauth_authorize_inner(
+    db: &DB,
+    params: AuthorizeQuery,
+    workspace_id: Option<String>,
+) -> axum::response::Response {
     let client = match sqlx::query_as!(
         OAuthClient,
         "SELECT client_id, client_name, redirect_uris FROM mcp_oauth_server_client WHERE client_id = $1",
         params.client_id
     )
-    .fetch_optional(&db)
+    .fetch_optional(db)
     .await
     {
         Ok(Some(client)) => client,
@@ -646,12 +730,18 @@ pub async fn workspaced_oauth_authorize(
         }
     };
 
-    let base_url = BASE_URL.read().await;
+    // Build frontend redirect params — gateway mode vs workspace mode
+    let (mode_key, mode_value) = match &workspace_id {
+        Some(w_id) => ("workspace_id", w_id.as_str()),
+        None => ("gateway", "true"),
+    };
+
+    let base_url = BASE_URL.load();
     let frontend_url = format!(
         "{}/oauth/mcp_authorize?{}",
         base_url,
         serde_urlencoded::to_string(&[
-            ("workspace_id", workspace_id.as_str()),
+            (mode_key, mode_value),
             ("client_id", params.client_id.as_str()),
             ("client_name", client.client_name.as_str()),
             ("redirect_uri", params.redirect_uri.as_str()),
@@ -667,20 +757,27 @@ pub async fn workspaced_oauth_authorize(
     Redirect::temporary(&frontend_url).into_response()
 }
 
-/// POST /api/w/:workspace_id/mcp/oauth/server/approve - user approval (frontend)
-pub async fn workspaced_oauth_approve(
-    Extension(db): Extension<DB>,
-    Path(workspace_id): Path<String>,
-    authed: ApiAuthed,
-    Json(form): Json<ApprovalForm>,
+/// Shared approve logic — validates form, checks membership, stores auth code.
+async fn oauth_approve_inner(
+    db: &DB,
+    authed: &ApiAuthed,
+    workspace_id: &str,
+    form: ApprovalForm,
 ) -> Result<Json<ApprovalResponse>> {
+    // The code approved here is exchanged for a database token carrying only this
+    // email, so an elevated job token would launder its identity into a credential
+    // with no `job_id` — and the MCP gateway would then re-enter the API uncapped
+    // (GHSA-hfh4-cx4h-3fcr). Guarded at the shared inner fn: both the workspaced and
+    // the gateway approve route reach the exchange through here.
+    forbid_elevated_job_token(db, &authed.email, authed.job_id).await?;
+
     // Verify user is a member of the workspace
     let is_member = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM usr WHERE workspace_id = $1 AND email = $2 AND NOT disabled)",
         workspace_id,
         authed.email
     )
-    .fetch_one(&db)
+    .fetch_one(db)
     .await
     .map_err(|e| Error::InternalErr(format!("Database error: {}", e)))?
     .unwrap_or(false);
@@ -697,7 +794,7 @@ pub async fn workspaced_oauth_approve(
         "SELECT client_id, client_name, redirect_uris FROM mcp_oauth_server_client WHERE client_id = $1",
         form.client_id
     )
-    .fetch_optional(&db)
+    .fetch_optional(db)
     .await
     .map_err(|e| Error::InternalErr(format!("Database error: {}", e)))?
     .ok_or_else(|| Error::BadRequest("Unknown client_id".to_string()))?;
@@ -734,6 +831,40 @@ pub async fn workspaced_oauth_approve(
         .map(|s| s.to_string())
         .collect();
 
+    // The approver's own token bounds what it may grant: a scope-restricted MCP
+    // token must not approve a broader one (e.g. mcp:scripts:f/x -> mcp:all). An
+    // unrestricted approver (interactive session, scopes None) grants freely,
+    // which is the normal consent flow. This is the legitimate MCP-narrowing
+    // path, so it uses MCP-pattern containment rather than the byte-identical
+    // rule ensure_scopes_within_caller applies on the generic token endpoints.
+    let caller_restricted = authed
+        .scopes
+        .as_deref()
+        .is_some_and(|s| s.iter().any(|x| !x.starts_with("if_jobs:filter_tags:")));
+    if caller_restricted {
+        // An empty grant would mint a token the auth layer treats as unscoped
+        // (full privileges), so a restricted approver must not produce one.
+        if scopes.is_empty() {
+            return Err(Error::NotAuthorized(
+                "A scope-restricted token cannot approve an empty scope grant".to_string(),
+            ));
+        }
+        if scopes.iter().any(|s| !s.starts_with("mcp:")) {
+            return Err(Error::NotAuthorized(
+                "A scope-restricted token can only approve MCP (mcp:*) scopes".to_string(),
+            ));
+        }
+        let caller_config = parse_mcp_scopes(authed.scopes.as_deref().unwrap_or(&[]))
+            .map_err(|e| Error::InternalErr(format!("Failed to parse caller MCP scopes: {e}")))?;
+        let requested_config = parse_mcp_scopes(&scopes)
+            .map_err(|e| Error::BadRequest(format!("Failed to parse requested MCP scopes: {e}")))?;
+        if !caller_config.contains(&requested_config) {
+            return Err(Error::NotAuthorized(
+                "Requested scopes exceed the approving token's own MCP scopes".to_string(),
+            ));
+        }
+    }
+
     sqlx::query!(
         "INSERT INTO mcp_oauth_server_code
          (code, client_id, user_email, workspace_id, scopes, redirect_uri, code_challenge, code_challenge_method)
@@ -747,7 +878,7 @@ pub async fn workspaced_oauth_approve(
         &form.code_challenge,
         &form.code_challenge_method,
     )
-    .execute(&db)
+    .execute(db)
     .await
     .map_err(|e| Error::InternalErr(format!("Failed to store authorization code: {}", e)))?;
 
@@ -759,6 +890,25 @@ pub async fn workspaced_oauth_approve(
             Some(form.state)
         },
     }))
+}
+
+/// GET /api/w/:workspace_id/mcp/oauth/server/authorize
+pub async fn workspaced_oauth_authorize(
+    Extension(db): Extension<DB>,
+    Path(workspace_id): Path<String>,
+    Query(params): Query<AuthorizeQuery>,
+) -> impl IntoResponse {
+    oauth_authorize_inner(&db, params, Some(workspace_id)).await
+}
+
+/// POST /api/w/:workspace_id/mcp/oauth/server/approve
+pub async fn workspaced_oauth_approve(
+    Extension(db): Extension<DB>,
+    Path(workspace_id): Path<String>,
+    authed: ApiAuthed,
+    Json(form): Json<ApprovalForm>,
+) -> Result<Json<ApprovalResponse>> {
+    oauth_approve_inner(&db, &authed, &workspace_id, form).await
 }
 
 /// PKCE validation (S256 only)
@@ -820,6 +970,73 @@ impl IntoResponse for OAuthErrorRedirect {
     }
 }
 
+// ── Gateway (workspace-agnostic) OAuth handlers ──
+// Thin wrappers that delegate to the shared inner functions above.
+
+pub async fn gateway_oauth_metadata() -> Json<AuthorizationMetadata> {
+    let base_url = BASE_URL.load();
+    Json(build_oauth_metadata(
+        "/api/mcp/gateway/oauth/server",
+        &base_url,
+    ))
+}
+
+pub async fn gateway_protected_resource_metadata() -> Json<ProtectedResourceMetadata> {
+    let base_url = BASE_URL.load();
+    Json(build_protected_resource_metadata(
+        "/api/mcp/gateway",
+        "/api/mcp/gateway/oauth/server",
+        &base_url,
+    ))
+}
+
+/// GET /api/mcp/gateway/oauth/server/authorize — gateway mode (no workspace in path)
+pub async fn gateway_oauth_authorize(
+    Extension(db): Extension<DB>,
+    Query(params): Query<AuthorizeQuery>,
+) -> impl IntoResponse {
+    oauth_authorize_inner(&db, params, None).await
+}
+
+/// POST /api/mcp/gateway/oauth/server/approve — workspace_id comes from JSON body
+pub async fn gateway_oauth_approve(
+    Extension(db): Extension<DB>,
+    authed: ApiAuthed,
+    Json(form): Json<GatewayApprovalForm>,
+) -> Result<Json<ApprovalResponse>> {
+    if form.workspace_id.is_empty() {
+        return Err(Error::BadRequest("workspace_id is required".to_string()));
+    }
+    oauth_approve_inner(
+        &db,
+        &authed,
+        &form.workspace_id,
+        ApprovalForm {
+            client_id: form.client_id,
+            redirect_uri: form.redirect_uri,
+            scope: form.scope,
+            state: form.state,
+            code_challenge: form.code_challenge,
+            code_challenge_method: form.code_challenge_method,
+        },
+    )
+    .await
+}
+
+/// Gateway approval form — same as ApprovalForm but includes workspace_id
+#[derive(Debug, Deserialize)]
+pub struct GatewayApprovalForm {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+    pub state: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub workspace_id: String,
+}
+
+// ── Router constructors ──
+
 /// Mounted at /api/mcp/oauth/server
 pub fn global_service() -> Router {
     Router::new().route("/register", post(oauth_register))
@@ -837,4 +1054,61 @@ pub fn workspaced_unauthed_service() -> Router {
 /// Mounted at /api/w/:workspace_id/mcp/oauth/server (inside authenticated section)
 pub fn workspaced_authed_service() -> Router {
     Router::new().route("/approve", post(workspaced_oauth_approve))
+}
+
+/// Gateway OAuth endpoints that don't require authentication
+/// Mounted at /api/mcp/gateway/oauth/server (outside authenticated section)
+pub fn gateway_unauthed_service() -> Router {
+    Router::new()
+        .route("/authorize", get(gateway_oauth_authorize))
+        .route("/token", post(oauth_token))
+}
+
+/// Gateway OAuth endpoints that require authentication
+/// Mounted at /api/mcp/gateway/oauth/server (inside authenticated section)
+pub fn gateway_authed_service() -> Router {
+    Router::new().route("/approve", post(gateway_oauth_approve))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_redirect_uri;
+
+    #[test]
+    fn accepts_legitimate_redirect_uris() {
+        for uri in [
+            "https://app.example.com/oauth/callback",
+            "http://localhost:9876/callback",
+            "http://127.0.0.1:33418/oauth/callback",
+            // Native/editor MCP clients use private-use URI schemes (RFC 8252).
+            "vscode://anthropic.claude/oauth/callback",
+            "cursor://anysphere.cursor/callback",
+        ] {
+            assert!(
+                validate_redirect_uri(uri).is_ok(),
+                "expected {uri} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_browser_executable_and_relative_redirect_uris() {
+        for uri in [
+            // GHSA-q9xg-f2v2-695g: stored-XSS / token exfiltration via consent page.
+            "javascript:fetch('/api/w/admins/tokens/create',{method:'POST'})//",
+            "JavaScript:alert(document.domain)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "blob:https://example.com/uuid",
+            "file:///etc/passwd",
+            // Not an absolute URI (RFC 6749 §3.1.2).
+            "/relative/callback",
+            "not a uri",
+        ] {
+            assert!(
+                validate_redirect_uri(uri).is_err(),
+                "expected {uri} to be rejected"
+            );
+        }
+    }
 }

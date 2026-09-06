@@ -1,5 +1,3 @@
-pub use crate::ai::types::McpToolSource;
-use crate::ai::types::ToolDef;
 use anyhow::Context;
 use serde_json::value::RawValue;
 use sqlx::types::Json;
@@ -8,9 +6,11 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+use windmill_ai::types::*;
+#[cfg(feature = "mcp")]
+use windmill_common::client::AuthedClient;
 use windmill_common::flows::FlowModuleValue;
 use windmill_common::{
-    ai_providers::AIProvider,
     db::DB,
     error::Error,
     flow_conversations::{add_message_to_conversation_tx, MessageType},
@@ -24,7 +24,7 @@ use windmill_common::{
 use windmill_mcp::{McpClient, McpResource, McpTool};
 use windmill_queue::{flow_status::get_step_of_flow_status, MiniPulledJob};
 
-use crate::{ai::types::*, parse_sig_of_lang};
+use crate::parse_sig_of_lang;
 
 pub fn parse_raw_script_schema(
     content: &str,
@@ -62,6 +62,17 @@ pub fn parse_raw_script_schema(
     Ok(to_raw_value(&schema))
 }
 
+pub fn is_completed_input_transform(transform: &InputTransform) -> bool {
+    match transform {
+        InputTransform::Static { value } => {
+            let val = value.get().trim();
+            !val.is_empty() && val != "null"
+        }
+        InputTransform::Javascript { expr } => !expr.trim().is_empty(),
+        InputTransform::Ai => false,
+    }
+}
+
 /// Filters out properties from a JSON schema that have completed input transforms.
 /// This allows AI agents to only see and fill parameters that don't have user-configured values.
 pub fn filter_schema_by_input_transforms(
@@ -77,14 +88,7 @@ pub fn filter_schema_by_input_transforms(
     let keys_to_remove: HashSet<String> = input_transforms
         .iter()
         .filter_map(|(key, transform)| {
-            let is_completed = match transform {
-                InputTransform::Static { value } => {
-                    let val = value.get().trim();
-                    !val.is_empty() && val != "null"
-                }
-                InputTransform::Javascript { expr } => !expr.trim().is_empty(),
-                InputTransform::Ai => false,
-            };
+            let is_completed = is_completed_input_transform(transform);
             if is_completed {
                 Some(key.clone())
             } else {
@@ -123,10 +127,13 @@ pub fn filter_schema_by_input_transforms(
     Ok(to_raw_value(&schema_value))
 }
 
+#[derive(Clone)]
 pub struct FlowJobRunnableIdAndRawFlow {
     pub runnable_id: Option<ScriptHash>,
     pub raw_flow: Option<sqlx::types::Json<Box<RawValue>>>,
     pub kind: JobKind,
+    pub parent_job: Option<Uuid>,
+    pub flow_step_id: Option<String>,
 }
 
 pub async fn get_flow_job_runnable_and_raw_flow(
@@ -135,7 +142,7 @@ pub async fn get_flow_job_runnable_and_raw_flow(
 ) -> windmill_common::error::Result<FlowJobRunnableIdAndRawFlow> {
     let job = sqlx::query_as!(
         FlowJobRunnableIdAndRawFlow,
-        "SELECT runnable_id as \"runnable_id: ScriptHash\", raw_flow as \"raw_flow: _\", kind as \"kind: _\" FROM v2_job WHERE id = $1",
+        "SELECT runnable_id as \"runnable_id: ScriptHash\", raw_flow as \"raw_flow: _\", kind as \"kind: _\", parent_job, flow_step_id FROM v2_job WHERE id = $1",
         job_id
     )
     .fetch_one(db)
@@ -314,11 +321,6 @@ pub fn get_step_name_from_flow(
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("AI Agent Step {}", flow_step_id)),
     )
-}
-
-/// AWS Bedrock do not handle structured output query param, so we use a tool for structured output. Same for every Claude models.
-pub fn should_use_structured_output_tool(provider: &AIProvider, model: &str) -> bool {
-    model.contains("claude") || provider == &AIProvider::AWSBedrock
 }
 
 /// Cleanup MCP clients by gracefully shutting down connections
@@ -508,7 +510,7 @@ async fn refresh_token_if_expired(
     );
 
     // Call the API refresh endpoint
-    let base_url = windmill_common::BASE_URL.read().await.clone();
+    let base_url = (**windmill_common::BASE_URL.load()).clone();
     let refresh_url = format!(
         "{}/api/w/{}/oauth/refresh_token/{}",
         base_url, workspace_id, account_id
@@ -546,7 +548,7 @@ pub async fn load_mcp_tools(
     db: &DB,
     workspace_id: &str,
     mcp_configs: Vec<McpResourceConfig>,
-    auth_token: &str,
+    client: &AuthedClient,
 ) -> Result<(HashMap<String, Arc<McpClient>>, Vec<Tool>), Error> {
     let mut all_mcp_tools = Vec::new();
     let mut mcp_clients = HashMap::new();
@@ -555,45 +557,64 @@ pub async fn load_mcp_tools(
         tracing::debug!("Loading MCP tools from resource: {}", config.resource_path);
 
         let path = config.resource_path.trim_start_matches("$res:");
-        let mcp_resource = {
-            // Fetch the resource from database
-            let resource= sqlx::query_scalar!(
-                "SELECT value as \"value: sqlx::types::Json<Box<RawValue>>\" FROM resource WHERE path = $1 AND workspace_id = $2",
-                &path,
-                &workspace_id
-            )
-            .fetch_optional(db)
-            .await?
-            .ok_or_else(|| Error::NotFound(format!("Could not find the resource {}, update the resource path in the workspace settings", config.resource_path)))?
-            .ok_or_else(|| Error::BadRequest(format!("Empty resource value for {}", config.resource_path)))?;
-
-            serde_json::from_str::<McpResource>(resource.0.get())
-                .context("Failed to parse MCP resource")?
-        };
+        // Load the resource through the job's permissioned (RLS + scope) path so
+        // a flow author cannot make the agent use an MCP resource their identity
+        // is not allowed to read (resources:read:{path}). Reading through the raw
+        // db pool here would bypass the authorization enforced by the regular MCP
+        // tools API (get_mcp_tools) and act as a confused deputy.
+        let mcp_resource = client
+            .get_resource_value::<McpResource>(path)
+            .await
+            .map_err(|e| {
+                Error::internal_err(format!(
+                    "Failed to load MCP resource {}: {}",
+                    config.resource_path, e
+                ))
+            })?;
 
         let resource_name = mcp_resource.name.clone();
 
-        // Check if token needs refresh before creating MCP client
-        if let Some(ref token_path) = mcp_resource.token {
+        // Resolve the token through the job's permissioned (RLS + audit) path so
+        // the AI agent cannot exfiltrate a secret its identity is not allowed to
+        // read by pointing an MCP resource's token at it.
+        let token = if let Some(ref token_path) = mcp_resource.token {
             let token_var_path = token_path.trim_start_matches("$var:");
-            if let Err(e) =
-                refresh_token_if_expired(db, workspace_id, token_var_path, auth_token).await
-            {
-                tracing::warn!(
-                    "Failed to refresh token for MCP resource {}: {}. Proceeding with possibly expired token.",
-                    resource_name, e
-                );
+            if token_var_path.trim().is_empty() {
+                None
+            } else {
+                // Refresh first (best-effort) so the value we read is current.
+                if let Err(e) =
+                    refresh_token_if_expired(db, workspace_id, token_var_path, &client.token).await
+                {
+                    tracing::warn!(
+                        "Failed to refresh token for MCP resource {}: {}. Proceeding with possibly expired token.",
+                        resource_name, e
+                    );
+                }
+                Some(
+                    client
+                        .get_variable_value(token_var_path)
+                        .await
+                        .map_err(|e| {
+                            Error::internal_err(format!(
+                                "Failed to resolve token variable {} for MCP resource {}: {}",
+                                token_var_path, resource_name, e
+                            ))
+                        })?,
+                )
             }
-        }
+        } else {
+            None
+        };
 
         // Create new MCP client for this execution
         tracing::debug!("Creating fresh MCP client for {}", resource_name);
-        let client = McpClient::from_resource(mcp_resource, db, workspace_id)
+        let mcp_conn = McpClient::from_resource(mcp_resource, token)
             .await
             .context("Failed to create MCP client")?;
 
         // Get raw MCP tools from client
-        let raw_mcp_tools = client.available_tools();
+        let raw_mcp_tools = mcp_conn.available_tools();
 
         // Convert to Windmill Tool format
         let converted_tools =
@@ -616,7 +637,7 @@ pub async fn load_mcp_tools(
         all_mcp_tools.extend(filtered_tools);
 
         // Store client for later use and cleanup
-        let mcp_client = Arc::new(client);
+        let mcp_client = Arc::new(mcp_conn);
         mcp_clients.insert(resource_name, mcp_client);
     }
 
@@ -663,7 +684,7 @@ pub async fn load_mcp_tools<T>(
     _db: &DB,
     _workspace_id: &str,
     _mcp_configs: Vec<McpResourceConfig>,
-    _auth_token: &str,
+    _client: &windmill_common::client::AuthedClient,
 ) -> Result<(HashMap<String, Arc<T>>, Vec<Tool>), Error> {
     Ok((HashMap::new(), Vec::new()))
 }
@@ -690,6 +711,7 @@ pub fn any_tool_needs_previous_result(tools: &[Tool]) -> bool {
                     FlowModuleValue::Script { input_transforms, .. } => input_transforms,
                     FlowModuleValue::RawScript { input_transforms, .. } => input_transforms,
                     FlowModuleValue::FlowScript { input_transforms, .. } => input_transforms,
+                    FlowModuleValue::AIAgent { input_transforms, .. } => input_transforms,
                     _ => return false,
                 };
 
@@ -704,35 +726,4 @@ pub fn any_tool_needs_previous_result(tools: &[Tool]) -> bool {
         }
         false
     })
-}
-
-/// Extract text content from OpenAIContent, joining parts with space if multiple
-pub fn extract_text_content(content: &OpenAIContent) -> String {
-    match content {
-        OpenAIContent::Text(text) => text.clone(),
-        OpenAIContent::Parts(parts) => parts
-            .iter()
-            .filter_map(|p| {
-                if let ContentPart::Text { text } = p {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-/// Parse a data URL to extract media type and base64 data
-/// Format: data:mime_type;base64,data
-/// Returns (media_type, data) tuple if successful
-pub fn parse_data_url(url: &str) -> Option<(String, String)> {
-    if !url.starts_with("data:") {
-        return None;
-    }
-    let rest = url.strip_prefix("data:")?;
-    let (header, data) = rest.split_once(",")?;
-    let media_type = header.strip_suffix(";base64")?;
-    Some((media_type.to_string(), data.to_string()))
 }

@@ -87,7 +87,7 @@
 		comfortable: 50
 	}
 
-	let css = $state(initCss($app.css?.aggridcomponent, customCss))
+	let css = $state(initCss($app.css?.aggridcomponent, untrack(() => customCss)))
 
 	let result: any[] | undefined = $state(undefined)
 
@@ -129,13 +129,14 @@
 	}
 
 	let resolvedConfig = $state(
-		initConfig(components['aggridcomponent'].initialData.configuration, configuration)
+		initConfig(components['aggridcomponent'].initialData.configuration, untrack(() => configuration))
 	)
 
-	let outputs = initOutput($worldStore, id, {
+	let outputs = initOutput($worldStore, untrack(() => id), {
 		selectedRowIndex: 0,
 		selectedRow: {},
 		selectedRows: [] as any[],
+		openedModalRow: {},
 		result: [] as any[],
 		loading: false,
 		page: 0,
@@ -280,6 +281,11 @@
 			selectRow: (p) => {
 				toggleRow(p)
 				p.node.setSelected(true)
+			},
+			setModalRow: (row) => {
+				const data = { ...(row?.data ?? {}) }
+				delete data['__index']
+				if (!deepEqual(outputs?.openedModalRow?.peak(), data)) outputs?.openedModalRow.set(data)
 			},
 			onSet: (id, value, rowIndex) => {
 				if (!inputs[id]) {
@@ -639,6 +645,7 @@
 				</div>
 			{/if}
 
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
 				onpointerdown={stopPropagation(() => {
 					$selectedComponent = [id]

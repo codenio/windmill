@@ -1,4 +1,3 @@
-import { Sha256 } from '@aws-crypto/sha256-js'
 import { getCountInput } from '../components/display/dbtable/queries/count'
 import { getDeleteInput } from '../components/display/dbtable/queries/delete'
 import { getInsertInput } from '../components/display/dbtable/queries/insert'
@@ -47,15 +46,18 @@ export async function updatePolicy(app: App, currentPolicy: Policy | undefined):
 					let nr: { id: string; input: AppInput }[] = []
 					let config = c.configuration as any
 
-					const dbType = config?.type?.selected as DbType
-					let pg = config?.type?.configuration?.[dbType]
+					const dbType = (
+						config?.type?.selected === 'datatable' ? 'postgresql' : config?.type?.selected
+					) as DbType
+					let pg = config?.type?.configuration?.[config?.type?.selected]
 
 					if (pg && dbType) {
-						const { table, resource, ducklake } = pg
+						const { table, resource, ducklake, datatable } = pg
 						const tableValue = table.value
 						const dbPath =
 							resource?.value.split('$res:')[1] ??
-							(ducklake?.value as string | undefined)?.split('ducklake://')[1]
+							(ducklake?.value as string | undefined)?.split('ducklake://')[1] ??
+							datatable?.value
 						const columnDefs = (c.configuration.columnDefs as any).value as ColumnDef[]
 						const whereClause = (c.configuration.whereClause as any).value as unknown as
 							| string
@@ -178,12 +180,13 @@ export async function updatePolicy(app: App, currentPolicy: Policy | undefined):
 		})
 		.filter(Boolean) as { s3_path: string; storage?: string | undefined }[]
 
-	return {
+	const next = {
 		...(currentPolicy ?? {}),
 		allowed_s3_keys: s3FileKeys,
 		s3_inputs,
 		triggerables_v2: ntriggerables
 	}
+	return next
 }
 
 export async function processRunnable(
@@ -208,7 +211,8 @@ export async function processRunnable(
 			{
 				static_inputs: staticInputs,
 				one_of_inputs: oneOfInputs,
-				allow_user_resources: allowUserResources
+				allow_user_resources: allowUserResources,
+				...(runnable.inlineScript?.tag ? { tag: runnable.inlineScript.tag } : {})
 			}
 		]
 	} else if (isRunnableByPath(runnable)) {
@@ -233,6 +237,7 @@ async function hash(message) {
 		return hashHex
 	} catch {
 		//subtle not available, trying pure js
+		const { Sha256 } = await import('@aws-crypto/sha256-js')
 		const hash = new Sha256()
 		hash.update(message ?? '')
 		const result = Array.from(await hash.digest())

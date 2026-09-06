@@ -22,13 +22,13 @@ pub fn workspaced_service() -> Router {
         .allow_origin(Any);
 
     Router::new()
-        .route("/get/:id", post(get_job_metrics).layer(cors.clone()))
+        .route("/get/{id}", post(get_job_metrics).layer(cors.clone()))
         .route(
-            "/set_progress/:id",
+            "/set_progress/{id}",
             post(set_job_progress).layer(cors.clone()),
         )
         .route(
-            "/get_progress/:id",
+            "/get_progress/{id}",
             get(get_job_progress).layer(cors.clone()),
         )
 }
@@ -79,7 +79,7 @@ async fn get_job_metrics(
     >,
 ) -> error::JsonResult<JobStatsResponse> {
     let records = sqlx::query_as::<_, JobStatsRecord>(
-        "SELECT * FROM job_stats where workspace_id = $1 and job_id = $2",
+        "SELECT workspace_id, job_id, metric_id, metric_name, metric_kind, scalar_int, scalar_float, timestamps, timeseries_int, timeseries_float, timeseries_start, offsets_cs FROM job_stats WHERE workspace_id = $1 AND job_id = $2",
     )
     .bind(w_id)
     .bind(job_id)
@@ -91,7 +91,7 @@ async fn get_job_metrics(
     let mut timeseries_metrics: Vec<TimeseriesMetric> = vec![];
 
     for record in records {
-        let metric_id = record.metric_id;
+        let metric_id = record.metric_id.clone();
         match record.metric_kind {
             MetricKind::ScalarInt => {
                 let value = record.scalar_int.unwrap_or_default() as f64;
@@ -102,47 +102,43 @@ async fn get_job_metrics(
                 scalar_metrics.push(ScalarMetric { metric_id: metric_id.clone(), value });
             }
             MetricKind::TimeseriesInt => {
-                if record.timestamps.clone().unwrap_or_default().len()
-                    != record.timeseries_int.clone().unwrap_or_default().len()
-                {
-                    tracing::warn!("Timeseries metric {} has an invalid shape. It doesn't have one timestamp per measurement. (timestamps: {:?}, measurements: {:?})", metric_id, record.timestamps, record.timeseries_int)
+                let timestamps = resolve_timestamps(&record);
+                let timeseries_int = record.timeseries_int.unwrap_or_default();
+                if timestamps.len() != timeseries_int.len() {
+                    tracing::warn!("Timeseries metric {} has an invalid shape. timestamps: {}, measurements: {}", metric_id, timestamps.len(), timeseries_int.len());
                 }
                 let (timestamps, timeseries_int) = timeseries_sample(
                     from_timestamp,
                     to_timestamp,
                     timeseries_max_datapoints,
-                    record.timestamps.unwrap_or_default(),
-                    record.timeseries_int.unwrap_or_default(),
+                    timestamps,
+                    timeseries_int,
                 );
-                let mut values: Vec<DataPoint> = vec![];
-                for (idx, value) in timeseries_int.iter().enumerate() {
-                    values.push(DataPoint {
-                        timestamp: timestamps[idx],
-                        value: value.to_owned() as f64,
-                    });
-                }
+                let values: Vec<DataPoint> = timestamps
+                    .iter()
+                    .zip(timeseries_int.iter())
+                    .map(|(ts, v)| DataPoint { timestamp: *ts, value: *v as f64 })
+                    .collect();
                 timeseries_metrics.push(TimeseriesMetric { metric_id: metric_id.clone(), values });
             }
             MetricKind::TimeseriesFloat => {
-                if record.timestamps.clone().unwrap_or_default().len()
-                    != record.timeseries_int.clone().unwrap_or_default().len()
-                {
-                    tracing::warn!("Timeseries metric {} has an invalid shape. It doesn't have one timestamp per measurement. (timestamps: {:?}, measurements: {:?})", metric_id, record.timestamps, record.timeseries_float)
+                let timestamps = resolve_timestamps(&record);
+                let timeseries_float = record.timeseries_float.unwrap_or_default();
+                if timestamps.len() != timeseries_float.len() {
+                    tracing::warn!("Timeseries metric {} has an invalid shape. timestamps: {}, measurements: {}", metric_id, timestamps.len(), timeseries_float.len());
                 }
                 let (timestamps, timeseries_float) = timeseries_sample(
                     from_timestamp,
                     to_timestamp,
                     timeseries_max_datapoints,
-                    record.timestamps.unwrap_or_default(),
-                    record.timeseries_float.unwrap_or_default(),
+                    timestamps,
+                    timeseries_float,
                 );
-                let mut values: Vec<DataPoint> = vec![];
-                for (idx, value) in timeseries_float.iter().enumerate() {
-                    values.push(DataPoint {
-                        timestamp: timestamps[idx],
-                        value: value.to_owned() as f64,
-                    });
-                }
+                let values: Vec<DataPoint> = timestamps
+                    .iter()
+                    .zip(timeseries_float.iter())
+                    .map(|(ts, v)| DataPoint { timestamp: *ts, value: *v as f64 })
+                    .collect();
                 timeseries_metrics.push(TimeseriesMetric { metric_id: metric_id.clone(), values });
             }
         };
@@ -151,6 +147,21 @@ async fn get_job_metrics(
 
     let response = JobStatsResponse { metrics_metadata, scalar_metrics, timeseries_metrics };
     Ok(Json(response))
+}
+
+/// Reconstruct full timestamps from `timeseries_start` + `offsets_cs` if available,
+/// otherwise fall back to legacy `timestamps` column.
+fn resolve_timestamps(record: &JobStatsRecord) -> Vec<chrono::DateTime<chrono::Utc>> {
+    if let (Some(start), Some(offsets)) = (record.timeseries_start, &record.offsets_cs) {
+        if !offsets.is_empty() {
+            return offsets
+                .iter()
+                .map(|&cs| start + chrono::Duration::milliseconds(cs as i64 * 10))
+                .collect();
+        }
+    }
+    // Legacy fallback: use the full timestamps column
+    record.timestamps.clone().unwrap_or_default()
 }
 #[derive(Deserialize)]
 struct JobProgressSetRequest {
@@ -169,13 +180,22 @@ async fn set_job_progress(
     // If flow_job_id exists, than we should modify flow_status of corresponding module
     // Individual jobs and flows are handled differently
     if let Some(flow_job_id) = flow_job_id {
+        // `v2_job_status` has no workspace_id column and the root db handle
+        // bypasses RLS (the per-row policy on the table is also inert today —
+        // `ENABLE ROW LEVEL SECURITY` was never set). Scope the update by
+        // joining `v2_job` so the URL's workspace_id confines tampering to the
+        // caller's workspace; without this, an authed member of any workspace
+        // could overwrite the flow `progress` UI field of a flow in another
+        // workspace given just the flow UUID.
         // TODO: Return error if trying to set completed job?
         sqlx::query!(
-            "UPDATE v2_job_status
-                SET flow_status = JSONB_SET(flow_status, ARRAY['modules', flow_status->>'step', 'progress'], $1)
-                WHERE id = $2",
+            "UPDATE v2_job_status s
+                SET flow_status = JSONB_SET(s.flow_status, ARRAY['modules', s.flow_status->>'step', 'progress'], $1)
+                FROM v2_job j
+                WHERE s.id = $2 AND j.id = s.id AND j.workspace_id = $3",
             serde_json::json!(percent.clamp(0, 99)),
-            flow_job_id
+            flow_job_id,
+            w_id,
         )
         .execute(&db)
         .await?;

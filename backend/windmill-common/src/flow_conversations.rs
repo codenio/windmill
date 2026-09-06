@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{self, FromRow};
 use uuid::Uuid;
 
+use crate::db::DB;
 use crate::error::Result;
+use crate::utils::truncate_with_ellipsis;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "MESSAGE_TYPE", rename_all = "lowercase")]
@@ -50,12 +52,8 @@ pub async fn get_or_create_conversation_with_id(
         return Ok(existing);
     }
 
-    // Truncate title to 25 char characters max
-    let title = if title.len() > 25 {
-        format!("{}...", &title[..25])
-    } else {
-        title.to_string()
-    };
+    // Truncate title to 25 characters max
+    let title = truncate_with_ellipsis(title, 25);
 
     // Create new conversation with provided ID
     let conversation = sqlx::query_as!(
@@ -124,6 +122,23 @@ pub async fn add_message_to_conversation_tx(
         conversation_id
     )
     .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Delete all memory for a conversation from the database
+pub async fn delete_conversation_memory(
+    db: &DB,
+    workspace_id: &str,
+    conversation_id: Uuid,
+) -> Result<()> {
+    sqlx::query!(
+        "DELETE FROM ai_agent_memory WHERE workspace_id = $1 AND conversation_id = $2",
+        workspace_id,
+        conversation_id
+    )
+    .execute(db)
     .await?;
 
     Ok(())

@@ -39,7 +39,10 @@ export const scriptBootstrapCode = {
 }
 `,
 
-  bun: `export async function main() {
+  bun: `// there are multiple modes to add as header: //nobundling //native //npm //nodejs
+// https://www.windmill.dev/docs/getting_started/scripts_quickstart/typescript#modes
+
+export async function main() {
   return "Hello world";
 }
 `,
@@ -131,6 +134,11 @@ public class Main {
 def main a, b, c
   puts a, b, c
 end
+`,
+  rlang: `
+main <- function(x, name = "default") {
+    return(list(result = x, name = name))
+}
 `,
   // for related places search: ADD_NEW_LANG
 };

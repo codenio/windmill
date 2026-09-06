@@ -355,7 +355,7 @@
 		</div>
 	{/if}
 {/if}
-{#if ($generatedCode.length === 0 || genLoading) && SUPPORTED_LANGUAGES.has(lang ?? '')}
+{#if ($generatedCode.length === 0 || genLoading) && SUPPORTED_LANGUAGES.has(lang ?? '') && !$copilotInfo.workspaceDisabled}
 	<Popover
 		floatingConfig={{
 			middleware: [
@@ -490,7 +490,7 @@
 										We pass the selected schema to GPT-4 Turbo for better script generation.
 									</Tooltip>
 									{#if dbSchema && dbSchema.stringified.length > MAX_SCHEMA_LENGTH}
-										<TooltipV2 notClickable placement="top">
+										<TooltipV2 placement="top">
 											<AlertTriangle size={16} class="text-yellow-500" />
 											{#snippet text()}
 												The schema is about {addThousandsSeparator(

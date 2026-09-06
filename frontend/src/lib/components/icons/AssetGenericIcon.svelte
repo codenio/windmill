@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { BoxesIcon, DatabaseIcon, FileIcon, Pyramid } from 'lucide-svelte'
+	import { BoxesIcon, DatabaseIcon, FileIcon, HardDriveIcon, Pyramid, Table2 } from 'lucide-svelte'
 	import type { AssetKind } from '../assets/lib'
 	import DucklakeIcon from './DucklakeIcon.svelte'
 
@@ -20,6 +20,10 @@
 	<DucklakeIcon {size} class={className} />
 {:else if assetKind == 'resource'}
 	<BoxesIcon {size} class={className} />
+{:else if assetKind == 'volume'}
+	<HardDriveIcon {size} class={className} />
+{:else if assetKind == 'dbt'}
+	<Table2 {size} class={className} />
 {:else}
 	<Pyramid {size} class={className} />
 {/if}

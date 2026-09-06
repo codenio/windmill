@@ -1,4 +1,6 @@
-import { log } from "../../deps.ts";
+import * as log from "./log.ts";
+import { writeFile } from "node:fs/promises";
+import { readTextFile } from "../utils/utils.ts";
 import { getStore } from "./store.ts";
 
 export interface BranchProfileMapping {
@@ -16,7 +18,7 @@ export async function getBranchProfilesPath(configDirOverride?: string): Promise
 export async function loadBranchProfiles(configDirOverride?: string): Promise<BranchProfileMapping> {
   try {
     const path = await getBranchProfilesPath(configDirOverride);
-    const content = await Deno.readTextFile(path);
+    const content = await readTextFile(path);
     return JSON.parse(content);
   } catch {
     // File doesn't exist or invalid JSON - return empty mapping
@@ -29,7 +31,7 @@ export async function saveBranchProfiles(
   configDirOverride?: string
 ): Promise<void> {
   const path = await getBranchProfilesPath(configDirOverride);
-  await Deno.writeTextFile(path, JSON.stringify(mapping, null, 2));
+  await writeFile(path, JSON.stringify(mapping, null, 2), "utf-8");
 }
 
 export function getBranchProfileKey(

@@ -1,21 +1,34 @@
 <script lang="ts">
+	import { stopPropagation, createBubbler } from 'svelte/legacy'
+
+	const bubble = createBubbler()
 	import { Pencil } from 'lucide-svelte'
 	import { createEventDispatcher } from 'svelte'
 	import Button from './common/button/Button.svelte'
 	import Popover from './meltComponents/Popover.svelte'
-	import { offset, flip, shift } from 'svelte-floating-ui/dom'
 	import ChangeInstanceUsernameInner from './ChangeInstanceUsernameInner.svelte'
+	import ChangeInstanceEmailInner from './ChangeInstanceEmailInner.svelte'
 	import { UserService } from '$lib/gen'
 	import { sendUserToast } from '$lib/toast'
 	import TextInput from './text_input/TextInput.svelte'
 
-	export let value: string | undefined
-	export let email: string
-	export let username: string | undefined = undefined
-	export let automateUsernameCreation: boolean = false
-	export let login_type: string
+	interface Props {
+		value: string | undefined
+		email: string
+		username?: string | undefined
+		automateUsernameCreation?: boolean
+		login_type: string
+	}
 
-	let password: string = ''
+	let {
+		value = $bindable(),
+		email,
+		username = undefined,
+		automateUsernameCreation = false,
+		login_type = $bindable()
+	}: Props = $props()
+
+	let password: string = $state('')
 
 	const dispatch = createEventDispatcher()
 
@@ -39,18 +52,26 @@
 </script>
 
 <Popover
-	floatingConfig={{
-		strategy: 'fixed',
-		placement: 'left-end',
-		middleware: [offset(8), flip(), shift()]
-	}}
+	floatingConfig={{ strategy: 'fixed', placement: 'left-end' }}
+	contentClasses="pt-9"
 	closeButton
 >
-	<svelte:fragment slot="trigger">
-		<Button nonCaptureEvent={true} size="xs" color="light" endIcon={{ icon: Pencil }}>Edit</Button>
-	</svelte:fragment>
-	<svelte:fragment slot="content">
-		<div class="flex flex-col gap-8 max-w-sm p-4">
+	{#snippet trigger()}
+		<Button unifiedSize="sm" nonCaptureEvent={true} variant="subtle" startIcon={{ icon: Pencil }}
+			>Edit</Button
+		>
+	{/snippet}
+	{#snippet content()}
+		<!-- The scroll sits here rather than on the popover box, which is what the close button
+		     is positioned against — box-level overflow scrolls that button out of reach. The
+		     box's `pt-9` clears the button's 34px, so the scrollbar starts below it. -->
+		<div class="flex flex-col gap-8 max-w-sm p-4 pt-0 max-h-[70vh] overflow-y-auto">
+			<ChangeInstanceEmailInner
+				{email}
+				{username}
+				noPadding
+				on:changed={() => dispatch('refresh')}
+			/>
 			{#if automateUsernameCreation && username}
 				<ChangeInstanceUsernameInner {email} {username} on:renamed noPadding />
 			{/if}
@@ -94,10 +115,11 @@
 						type="password"
 						bind:value={password}
 						class="!w-auto grow"
-						on:click|stopPropagation={() => {}}
-						on:keydown|stopPropagation
-						on:keypress|stopPropagation={({ key }) => {
-							if (key === 'Enter') {
+						onclick={stopPropagation(() => {})}
+						onkeydown={stopPropagation(bubble('keydown'))}
+						onkeypress={(e) => {
+							e.stopPropagation()
+							if (e.key === 'Enter') {
 								savePassword()
 							}
 						}}
@@ -124,10 +146,11 @@
 						type="text"
 						bind:value={login_type}
 						class="!w-auto grow"
-						on:click|stopPropagation={() => {}}
-						on:keydown|stopPropagation
-						on:keypress|stopPropagation={({ key }) => {
-							if (key === 'Enter') {
+						onclick={stopPropagation(() => {})}
+						onkeydown={stopPropagation(bubble('keydown'))}
+						onkeypress={(e) => {
+							e.stopPropagation()
+							if (e.key === 'Enter') {
 								saveLoginType()
 							}
 						}}
@@ -151,5 +174,5 @@
 				</Button>
 			</label>
 		</div>
-	</svelte:fragment>
+	{/snippet}
 </Popover>

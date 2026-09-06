@@ -1,9 +1,14 @@
-// deno-lint-ignore-file no-explicit-any
-import { colors, log, Select, Confirm, Input } from "../../deps.ts";
+import { colors } from "@cliffy/ansi/colors";
+import * as log from "./log.ts";
+import { Select } from "@cliffy/prompt/select";
+import { Confirm } from "@cliffy/prompt/confirm";
+import { Input } from "@cliffy/prompt/input";
+import { Table } from "@cliffy/table";
 
 import { loginInteractive } from "./login.ts";
 import { GlobalOptions } from "../types.ts";
 import { getHeaders } from "../utils/utils.ts";
+import { detectAuthGatewayChallenge } from "../utils/http_guards.ts";
 
 import {
   getActiveWorkspace,
@@ -13,7 +18,15 @@ import {
   addWorkspace,
 } from "../commands/workspace/workspace.ts";
 import { getLastUsedProfile, setLastUsedProfile } from "./branch-profiles.ts";
-import { readConfigFile } from "./conf.ts";
+import {
+  readConfigFile,
+  findWorkspaceByGitBranch,
+  getEffectiveWorkspaceId,
+  getWmillYamlPath,
+  WorkspaceEntryConfig,
+} from "./conf.ts";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   getCurrentGitBranch,
   getOriginalBranchForWorkspaceForks,
@@ -21,6 +34,7 @@ import {
   isGitRepository,
 } from "../utils/git.ts";
 import { WM_FORK_PREFIX } from "./constants.ts";
+import { levenshteinDistance } from "@jsr/std__text/levenshtein-distance";
 
 // Helper function to select from multiple matching profiles
 async function selectFromMultipleProfiles(
@@ -46,7 +60,7 @@ async function selectFromMultipleProfiles(
       (p) => p.name === lastUsedProfileName
     );
     if (lastUsedProfile) {
-      log.info(
+      log.infoStderr(
         colors.green(
           `Using last used profile '${lastUsedProfile.name}' for ${context}`
         )
@@ -56,9 +70,9 @@ async function selectFromMultipleProfiles(
   }
 
   // No last used or it no longer exists - prompt for selection
-  if (!Deno.stdin.isTerminal() || !Deno.stdout.isTerminal()) {
+  if (!!!process.stdin.isTTY || !!!process.stdout.isTTY) {
     const selectedProfile = profiles[0];
-    log.info(
+    log.infoStderr(
       colors.yellow(
         `Multiple profiles found for ${context}. Using first available profile: '${selectedProfile.name}'`
       )
@@ -76,7 +90,7 @@ async function selectFromMultipleProfiles(
     return selectedProfile;
   }
 
-  log.info(
+  log.infoStderr(
     colors.yellow(`\nMultiple workspace profiles found for ${context}:`)
   );
 
@@ -114,14 +128,14 @@ async function createWorkspaceProfileInteractively(
 ): Promise<Workspace | undefined> {
   // Log appropriate message based on context
   if (!context.isForked) {
-    log.info(
+    log.infoStderr(
       colors.yellow(
         `\nNo workspace profile found for branch '${context.rawBranch}'\n` +
           `(${normalizedBaseUrl}, ${workspaceId})`
       )
     );
   } else {
-    log.info(
+    log.infoStderr(
       colors.yellow(
         `\nNo workspace profile was found for this forked workspace\n` +
           `(${normalizedBaseUrl}, ${workspaceId})`
@@ -129,8 +143,8 @@ async function createWorkspaceProfileInteractively(
     );
   }
 
-  if (!Deno.stdin.isTerminal() || !Deno.stdout.isTerminal()) {
-    log.info(
+  if (!!!process.stdin.isTTY || !!!process.stdout.isTTY) {
+    log.infoStderr(
       "Not a TTY, cannot create profile interactively. Use 'wmill workspace add' first."
     );
     return undefined;
@@ -176,12 +190,12 @@ async function createWorkspaceProfileInteractively(
     opts.configDir
   );
 
-  log.info(
+  log.infoStderr(
     colors.green(
       `✓ Created profile '${profileName}' for ${workspaceId} on ${normalizedBaseUrl}`
     )
   );
-  log.info(colors.green(`✓ Profile '${profileName}' is now active`));
+  log.infoStderr(colors.green(`✓ Profile '${profileName}' is now active`));
 
   return newWorkspace;
 }
@@ -202,11 +216,71 @@ async function tryResolveWorkspace(
   if (cache) return { isError: false, value: cache };
 
   if (opts.workspace) {
+    // First try: look up workspace by name in wmill.yaml workspaces config
+    const config = await readConfigFile({ warnIfMissing: false });
+    const wsEntry = config.workspaces?.[opts.workspace] as WorkspaceEntryConfig | undefined;
+    if (wsEntry?.baseUrl) {
+      const workspaceId = getEffectiveWorkspaceId(opts.workspace, wsEntry);
+      let normalizedBaseUrl: string;
+      try {
+        normalizedBaseUrl = new URL(wsEntry.baseUrl).toString();
+      } catch {
+        return {
+          isError: true,
+          error: colors.red.underline(`Invalid baseUrl in workspace '${opts.workspace}' configuration: ${wsEntry.baseUrl}`),
+        };
+      }
+
+      // Find matching profile by baseUrl + workspaceId
+      const allProfs = await allWorkspaces(opts.configDir);
+      const matching = allProfs.filter(
+        (w) => w.remote === normalizedBaseUrl && w.workspaceId === workspaceId
+      );
+
+      if (matching.length >= 1) {
+        const selected = matching.length === 1
+          ? matching[0]
+          : await selectFromMultipleProfiles(
+              matching,
+              normalizedBaseUrl,
+              workspaceId,
+              `workspace '${opts.workspace}'`,
+              opts.configDir
+            );
+        log.infoStderr(
+          colors.green(
+            `Using workspace profile '${selected.name}' for workspace '${opts.workspace}' (${workspaceId} on ${normalizedBaseUrl})`
+          )
+        );
+        (opts as any).__secret_workspace = selected;
+        return { isError: false, value: selected };
+      }
+
+      // No matching profile — offer to create one
+      log.infoStderr(
+        `No profile found for workspace '${opts.workspace}' (${workspaceId} on ${normalizedBaseUrl})`
+      );
+      const ws = await createWorkspaceProfileInteractively(
+        normalizedBaseUrl,
+        workspaceId,
+        opts.workspace,
+        opts,
+        { rawBranch: opts.workspace, isForked: false }
+      );
+      if (ws) {
+        (opts as any).__secret_workspace = ws;
+        return { isError: false, value: ws };
+      }
+    }
+
+    // Fall back: look up profile by name directly (old behavior)
     const e = await getWorkspaceByName(opts.workspace, opts.configDir);
     if (!e) {
       return {
         isError: true,
-        error: colors.red.underline("Given workspace does not exist."),
+        error: colors.red.underline(
+          `Workspace '${opts.workspace}' not found in wmill.yaml config or local profiles.`
+        ),
       };
     }
     (opts as any).__secret_workspace = e;
@@ -222,17 +296,24 @@ async function tryResolveWorkspace(
 
 export async function tryResolveBranchWorkspace(
   opts: GlobalOptions,
-  branchOverride?: string
+  workspaceNameOverride?: string
 ): Promise<Workspace | undefined> {
   let rawBranch: string | null = null;
-  let currentBranch: string;
+  let wsName: string | undefined;
+  let wsEntry: WorkspaceEntryConfig | undefined;
   let originalBranchIfForked: string | null = null;
   let workspaceIdIfForked: string | null = null;
 
-  if (branchOverride) {
-    // Use branch override directly
-    currentBranch = branchOverride;
-    log.info(`Using branch override: ${branchOverride}`);
+  // Read wmill.yaml (silent — just probing)
+  const config = await readConfigFile({ warnIfMissing: false });
+
+  if (workspaceNameOverride) {
+    // Direct lookup by workspace name
+    wsEntry = config.workspaces?.[workspaceNameOverride] as WorkspaceEntryConfig | undefined;
+    if (wsEntry) {
+      wsName = workspaceNameOverride;
+      log.infoStderr(`Using workspace override: ${workspaceNameOverride}`);
+    }
   } else {
     // Only try branch-based resolution if in a Git repository
     if (!isGitRepository()) {
@@ -247,37 +328,58 @@ export async function tryResolveBranchWorkspace(
     originalBranchIfForked = getOriginalBranchForWorkspaceForks(rawBranch);
     workspaceIdIfForked =
       getWorkspaceIdForWorkspaceForkFromBranchName(rawBranch);
-    if (originalBranchIfForked) {
-      log.info(
-        `Using original branch \`${originalBranchIfForked}\` for finding workspace profile from gitBranches section in wmill.yaml`
-      );
-      currentBranch = originalBranchIfForked;
-    } else {
-      currentBranch = rawBranch;
+
+    // The "matched via fork branch" reason logged below already explains the
+    // base-branch lookup, so no extra message here.
+    const branchToLookup = originalBranchIfForked ?? rawBranch;
+
+    const match = findWorkspaceByGitBranch(config.workspaces, branchToLookup);
+    if (match) {
+      [wsName, wsEntry] = match;
     }
   }
 
-  // Read wmill.yaml to check for branch workspace configuration
-  const config = await readConfigFile();
-  const branchConfig = config.gitBranches?.[currentBranch];
-
-  // Check if branch has workspace configuration
-  if (!branchConfig?.baseUrl || !branchConfig?.workspaceId) {
+  if (!wsName || !wsEntry) {
     return undefined;
   }
 
-  log.info(
-    `Using branch configuration for branch \`${currentBranch}\` set in gitBranches`
-  );
+  if (!wsEntry.baseUrl) {
+    if (workspaceNameOverride) {
+      // User explicitly asked for this workspace but it has no baseUrl
+      log.warnStderr(
+        `⚠️  Workspace '${wsName}' has no baseUrl configured. Cannot resolve a profile.\n` +
+        `   Add baseUrl to workspace '${wsName}' in wmill.yaml, or use --base-url flag.`
+      );
+    }
+    return undefined;
+  }
 
-  const { baseUrl, workspaceId } = branchConfig;
+  const workspaceId = getEffectiveWorkspaceId(wsName, wsEntry);
+  const effectiveGitBranch = (wsEntry as any).gitBranch ?? wsName;
+  const { baseUrl } = wsEntry;
+
+  // Explain why this workspace was selected
+  let reason: string;
+  if (workspaceNameOverride) {
+    reason = `selected via --workspace`;
+  } else if (originalBranchIfForked) {
+    reason = `matched via fork branch '${rawBranch}' → original branch '${originalBranchIfForked}'`;
+  } else if (effectiveGitBranch !== wsName) {
+    reason = `matched git branch '${effectiveGitBranch}' on current branch '${rawBranch}'`;
+  } else {
+    reason = `matched current git branch '${rawBranch}'`;
+  }
+
+  // Printed as part of the single final targeting line on the happy paths;
+  // logged up front only when an interactive flow needs the context first.
+  const workspaceLine = `Using workspace '${wsName}' (${reason}) → ${workspaceId} on ${baseUrl}`;
 
   let normalizedBaseUrl: string;
   try {
     normalizedBaseUrl = new URL(baseUrl).toString();
   } catch (error) {
     log.error(
-      colors.red(`Invalid baseUrl in branch configuration: ${baseUrl}`)
+      colors.red(`Invalid baseUrl in workspace '${wsName}' configuration: ${baseUrl}`)
     );
     return undefined;
   }
@@ -288,81 +390,80 @@ export async function tryResolveBranchWorkspace(
     (w) => w.remote === normalizedBaseUrl && w.workspaceId === workspaceId
   );
 
+  // Every branch below must flow into the shared fork handling at the end —
+  // returning a profile directly would hand back the parent workspace profile
+  // on a fork branch.
+  let selectedProfile: Workspace;
+  let profileNote: string;
+  // Set when workspaceLine was already printed as context for the interactive
+  // profile-creation flow, so it isn't printed a second time at the end.
+  let workspaceLinePrinted = false;
+
   if (matchingProfiles.length === 0) {
     // No matching profile exists - prompt to create one
-    return await createWorkspaceProfileInteractively(
+    log.infoStderr(workspaceLine);
+    workspaceLinePrinted = true;
+    const created = await createWorkspaceProfileInteractively(
       normalizedBaseUrl,
       workspaceId,
-      currentBranch,
+      wsName,
       opts,
-      { rawBranch: rawBranch ?? currentBranch, isForked: !!originalBranchIfForked }
+      { rawBranch: rawBranch ?? wsName, isForked: !!originalBranchIfForked }
     );
-  }
-
-  // Handle multiple profiles - use special branch-aware logic
-  let selectedProfile: Workspace;
-
-  if (matchingProfiles.length === 1) {
-    selectedProfile = matchingProfiles[0];
-    log.info(
-      colors.green(
-        `Using workspace profile '${selectedProfile.name}' for branch '${currentBranch}' with workspace id \`${workspaceId}\``
-      )
-    );
-  } else {
-    // For multiple profiles, check branch-specific last used first
-    const lastUsedName = await getLastUsedProfile(
-      currentBranch,
-      normalizedBaseUrl,
-      workspaceId,
-      opts.configDir
-    );
-
-    if (lastUsedName) {
-      const lastUsedProfile = matchingProfiles.find(
-        (p) => p.name === lastUsedName
-      );
-      if (lastUsedProfile) {
-        log.info(
-          colors.green(
-            `Using workspace profile '${lastUsedProfile.name}' for branch '${currentBranch}' (last used)`
-          )
-        );
-        return lastUsedProfile;
-      }
+    if (!created) {
+      return undefined;
     }
-
-    // Fall back to general selection logic
-    selectedProfile = await selectFromMultipleProfiles(
-      matchingProfiles,
+    selectedProfile = created;
+    profileNote = `profile '${selectedProfile.name}'`;
+  } else if (matchingProfiles.length === 1) {
+    selectedProfile = matchingProfiles[0];
+    profileNote = `profile '${selectedProfile.name}'`;
+  } else {
+    const lastUsedName = await getLastUsedProfile(
+      wsName,
       normalizedBaseUrl,
       workspaceId,
-      `branch '${currentBranch}'`,
       opts.configDir
     );
+    const lastUsedProfile = lastUsedName
+      ? matchingProfiles.find((p) => p.name === lastUsedName)
+      : undefined;
 
-    // Save branch-specific selection
-    await setLastUsedProfile(
-      currentBranch,
-      normalizedBaseUrl,
-      workspaceId,
-      selectedProfile.name,
-      opts.configDir
-    );
+    if (lastUsedProfile) {
+      selectedProfile = lastUsedProfile;
+      profileNote = `last used profile '${selectedProfile.name}'`;
+    } else {
+      // selectFromMultipleProfiles prints its own context header, and the
+      // final summary line below names the chosen profile.
+      selectedProfile = await selectFromMultipleProfiles(
+        matchingProfiles,
+        normalizedBaseUrl,
+        workspaceId,
+        `workspace '${wsName}'`,
+        opts.configDir
+      );
 
-    log.info(
-      colors.green(
-        `Using workspace profile '${selectedProfile.name}' for branch '${currentBranch}'`
-      )
-    );
+      await setLastUsedProfile(
+        wsName,
+        normalizedBaseUrl,
+        workspaceId,
+        selectedProfile.name,
+        opts.configDir
+      );
+      profileNote = `profile '${selectedProfile.name}'`;
+    }
   }
 
   if (workspaceIdIfForked) {
     selectedProfile.name = `${selectedProfile.name}/${workspaceIdIfForked}`;
     selectedProfile.workspaceId = workspaceIdIfForked;
-    log.info(
-      `Inferred workspace id \`${workspaceId}\` from branch name because this is a workspace fork branch (\`${rawBranch}\`). `
+    log.infoStderr(
+      colors.green(
+        `Automatically targeting fork workspace \`${workspaceIdIfForked}\` (fork of \`${workspaceId}\` on ${baseUrl}, ${profileNote}), resolved from git branch \`${rawBranch}\`. Use --workspace to override.`
+      )
     );
+  } else if (!workspaceLinePrinted) {
+    log.infoStderr(`${workspaceLine} (${profileNote})`);
   }
 
   return selectedProfile;
@@ -370,7 +471,7 @@ export async function tryResolveBranchWorkspace(
 
 export async function resolveWorkspace(
   opts: GlobalOptions,
-  branchOverride?: string
+  workspaceNameOverride?: string
 ): Promise<Workspace> {
   const cache = (opts as any).__secret_workspace;
   if (cache) return cache;
@@ -379,27 +480,25 @@ export async function resolveWorkspace(
     if (opts.workspace && opts.token) {
       let normalizedBaseUrl: string;
       try {
-        normalizedBaseUrl = new URL(opts.baseUrl).toString(); // add trailing slash if not present
+        normalizedBaseUrl = new URL(opts.baseUrl).toString();
       } catch (error) {
-        log.info(colors.red(`Invalid base URL: ${opts.baseUrl}`));
-        return Deno.exit(-1);
+        log.infoStderr(colors.red(`Invalid base URL: ${opts.baseUrl}`));
+        return process.exit(-1);
       }
 
       // Try to find existing workspace profile by name, then by workspaceId + remote
       if (opts.workspace) {
-        // Try by workspace name first
         let existingWorkspace = await getWorkspaceByName(
           opts.workspace,
           opts.configDir
         );
 
-        // If not found by name, try to find by workspaceId + remote match
         if (!existingWorkspace) {
           const { allWorkspaces } = await import(
             "../commands/workspace/workspace.ts"
           );
-          const workspaces = await allWorkspaces(opts.configDir);
-          const matchingWorkspaces = workspaces.filter(
+          const profiles = await allWorkspaces(opts.configDir);
+          const matchingWorkspaces = profiles.filter(
             (w) =>
               w.workspaceId === opts.workspace && w.remote === normalizedBaseUrl
           );
@@ -416,24 +515,21 @@ export async function resolveWorkspace(
         }
 
         if (existingWorkspace) {
-          // Validate that the base URL matches the profile's remote
           if (existingWorkspace.remote !== normalizedBaseUrl) {
-            log.info(
+            log.infoStderr(
               colors.red(
                 `Base URL mismatch: --base-url is ${normalizedBaseUrl} but workspace profile "${opts.workspace}" uses ${existingWorkspace.remote}`
               )
             );
-            return Deno.exit(-1);
+            return process.exit(-1);
           }
-          // Use the existing workspace profile (preserves workspace name)
           return {
             ...existingWorkspace,
-            token: opts.token, // Use the provided token
+            token: opts.token,
           };
         }
       }
 
-      // No existing profile found, create temporary workspace
       return {
         remote: normalizedBaseUrl,
         workspaceId: opts.workspace,
@@ -441,58 +537,164 @@ export async function resolveWorkspace(
         token: opts.token,
       };
     } else {
-      log.info(
+      log.infoStderr(
         colors.red(
           "If you specify a base URL with --base-url, you must also specify a workspace (--workspace) and token (--token)."
         )
       );
-      return Deno.exit(-1);
+      return process.exit(-1);
     }
   }
 
-  const branch = branchOverride ?? getCurrentGitBranch();
+  const branch = workspaceNameOverride ? null : getCurrentGitBranch();
 
   // Try explicit workspace flag first (should override branch-based resolution). Unless it's a
-  // forked workspace, that we detect through the branch name (only when not using branchOverride)
+  // forked workspace, that we detect through the branch name (only when not using workspaceNameOverride
+  // and --workspace was not explicitly provided)
   const res = await tryResolveWorkspace(opts);
   if (!res.isError) {
-    if (branchOverride || !branch || !branch.startsWith(WM_FORK_PREFIX)) {
-      return res.value;
+    const workspace = (res as { isError: false; value: Workspace }).value;
+    if (workspaceNameOverride || opts.workspace || !branch || !branch.startsWith(WM_FORK_PREFIX)) {
+      return workspace;
     } else {
-      log.info(
-        `Found an active workspace \`${res.value.name}\` but the branch name indicates this is a forked workspace. Ignoring active workspace and trying to resolve the correct workspace from the branch name \`${branch}\``
+      log.infoStderr(
+        `You are on fork branch \`${branch}\`, which takes precedence over the active workspace profile \`${workspace.name}\`: resolving the fork workspace from the branch name instead. Use --workspace to override.`
       );
     }
+  } else if (opts.workspace) {
+    // --workspace was explicitly provided but not found — fail immediately
+    const profiles = await allWorkspaces(opts.configDir);
+    const names = profiles.map((w) => w.name);
+    let msg = `Workspace "${opts.workspace}" not found.`;
+    const suggestions = names
+      .map((n) => ({ name: n, dist: levenshteinDistance(opts.workspace!, n) }))
+      .filter((s) => s.dist <= 3)
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 3);
+    if (suggestions.length > 0) {
+      msg += ` Did you mean: ${suggestions.map((s) => `"${s.name}"`).join(", ")}?`;
+    }
+    log.infoStderr(colors.red.bold(msg));
+    if (profiles.length > 0) {
+      log.infoStderr("\nAvailable workspaces:");
+      new Table()
+        .header(["name", "remote", "workspace id"])
+        .padding(2)
+        .border(true)
+        .body(profiles.map((w) => [w.name, w.remote, w.workspaceId]))
+        .render();
+    }
+    return process.exit(-1);
   }
 
   // Try branch-based resolution (medium priority)
-  const branchWorkspace = await tryResolveBranchWorkspace(opts, branchOverride);
+  const branchWorkspace = await tryResolveBranchWorkspace(opts, workspaceNameOverride);
   if (branchWorkspace) {
     (opts as any).__secret_workspace = branchWorkspace;
     return branchWorkspace;
-  } else if (!branchOverride) {
-    // Only check for fork errors when not using branchOverride
+  } else if (!workspaceNameOverride) {
+    // Only check for fork errors when not using workspaceNameOverride
     const originalBranch = getOriginalBranchForWorkspaceForks(branch);
     if (originalBranch) {
       log.error(
         colors.red.bold(
-          `Failed to resolve workspace profile for workspace fork. This most likely means that the original branch \`${originalBranch}\` where \`${branch}\` is originally forked from, is not setup in the wmill.yaml. You need to update the \`gitBranches\` section for \`${originalBranch}\` to include workspaceId and baseUrl.`
+          `Failed to resolve workspace profile for workspace fork. The original branch \`${originalBranch}\` (forked from \`${branch}\`) is not configured in wmill.yaml.\n` +
+            `   Add to the 'workspaces' section: \`${originalBranch}: { baseUrl: "https://...", workspaceId: "..." }\``
         )
       );
-      return Deno.exit(-1);
+      return process.exit(-1);
     }
   }
 
-  // Fall back to active workspace (lowest priority)
+  // If workspaces config exists, use it rather than falling back to active profile
+  const config = await readConfigFile({ warnIfMissing: false });
+  const { getWorkspaceNames } = await import("./conf.ts");
+  const wsNames = getWorkspaceNames(config.workspaces);
+
+  if (wsNames.length > 0) {
+    let pickedWsName: string;
+
+    const wsListStr = wsNames.map((n) => {
+      const entry = (config.workspaces as any)[n];
+      const info = entry.baseUrl ? ` (${entry.workspaceId ?? n} on ${entry.baseUrl})` : "";
+      return `  - ${n}${info}`;
+    }).join("\n");
+
+    if (wsNames.length === 1) {
+      pickedWsName = wsNames[0];
+      log.infoStderr(
+        `Auto-selected workspace '${pickedWsName}' (only workspace in config).\n` +
+        `Use --workspace to override or 'wmill workspace bind' to add more workspaces.`
+      );
+    } else if (process.stdin.isTTY) {
+      log.infoStderr(
+        `Multiple workspaces configured but none matched the current context.\n` +
+        `Configured workspaces:\n${wsListStr}\n` +
+        `Use --workspace to skip this prompt.`
+      );
+      pickedWsName = await Select.prompt({
+        message: "Select workspace",
+        options: wsNames.map((n) => {
+          const entry = (config.workspaces as any)[n];
+          const info = entry.baseUrl ? ` (${entry.workspaceId ?? n} on ${entry.baseUrl})` : "";
+          return { name: `${n}${info}`, value: n };
+        }),
+      });
+    } else {
+      log.error(
+        colors.red.bold(
+          `Multiple workspaces configured but none matched the current context.\n` +
+          `Configured workspaces:\n${wsListStr}\n` +
+          `Use --workspace to select one.`
+        )
+      );
+      return process.exit(-1);
+    }
+
+    // Resolve the picked workspace via config
+    const pickedResult = await tryResolveBranchWorkspace(opts, pickedWsName);
+    if (pickedResult) {
+      (opts as any).__secret_workspace = pickedResult;
+      return pickedResult;
+    }
+  }
+
+  // Fall back to active workspace (only when no workspaces config)
   const activeWorkspace = await getActiveWorkspace(opts);
   if (activeWorkspace) {
     (opts as any).__secret_workspace = activeWorkspace;
     return activeWorkspace;
   }
 
-  // If everything failed, show error
-  log.info(colors.red.bold("No workspace given and no default set."));
-  return Deno.exit(-1);
+  // Last resort: auto-configure from Windmill environment variables
+  const envWorkspace = process.env["WM_WORKSPACE"];
+  const envToken = process.env["WM_TOKEN"];
+  const envBaseUrl =
+    process.env["BASE_INTERNAL_URL"] ?? process.env["BASE_URL"];
+
+  if (envWorkspace && envToken && envBaseUrl) {
+    let normalizedBaseUrl: string;
+    try {
+      normalizedBaseUrl = new URL(envBaseUrl).toString();
+    } catch {
+      log.infoStderr(colors.red(`Invalid BASE_INTERNAL_URL: ${envBaseUrl}`));
+      return process.exit(-1);
+    }
+    log.debug(
+      `Using workspace from environment variables: ${envWorkspace} on ${normalizedBaseUrl}`
+    );
+    const ws: Workspace = {
+      name: envWorkspace,
+      workspaceId: envWorkspace,
+      remote: normalizedBaseUrl,
+      token: envToken,
+    };
+    (opts as any).__secret_workspace = ws;
+    return ws;
+  }
+
+  log.infoStderr(colors.red.bold("No workspace given and no default set. Run 'wmill workspace add' to configure one."));
+  return process.exit(-1);
 }
 
 export async function fetchVersion(baseUrl: string): Promise<string> {
@@ -505,10 +707,13 @@ export async function fetchVersion(baseUrl: string): Promise<string> {
     }
   }
 
-  const response = await fetch(
-    new URL(new URL(baseUrl).origin + "/api/version"),
-    { headers: requestHeaders, method: "GET" }
-  );
+  const versionUrl = new URL(new URL(baseUrl).origin + "/api/version");
+  const response = await fetch(versionUrl, {
+    headers: requestHeaders,
+    method: "GET",
+  });
+
+  await detectAuthGatewayChallenge(response, versionUrl.toString());
 
   if (!response.ok) {
     // Consume response body even on error to avoid resource leak
@@ -529,7 +734,8 @@ export async function tryResolveVersion(
 
   const workspaceRes = await tryResolveWorkspace(opts);
   if (workspaceRes.isError) return undefined;
-  const version = await fetchVersion(workspaceRes.value.remote);
+  const workspace = (workspaceRes as { isError: false; value: Workspace }).value;
+  const version = await fetchVersion(workspace.remote);
 
   try {
     return Number.parseInt(
@@ -540,9 +746,95 @@ export async function tryResolveVersion(
   }
 }
 
+/**
+ * Directory the local tree mirrors the workspace from: the one holding
+ * wmill.yaml. Not `process.cwd()` — that only lands there once a config read
+ * has chdir'd into it, which `--remote` and fully-flagged invocations skip.
+ */
+function syncRoot(): string {
+  const wmillYaml = getWmillYamlPath();
+  return wmillYaml ? dirname(wmillYaml) : process.cwd();
+}
+
+/**
+ * Re-express a user-supplied file or folder argument as a path relative to the
+ * sync root, so the Windmill path derived from it is the same whatever shape
+ * the argument had (`./f/a/b.ts`, `/abs/repo/f/a/b.ts`, `b.ts` from inside
+ * `f/a`).
+ *
+ * `cwdBeforeConfig` must be the working directory as it was *before* the
+ * command read wmill.yaml: reading it chdirs into the directory holding it, and
+ * a relative argument was written against the directory the user was in.
+ * Arguments are resolved against that directory first and the sync root second,
+ * so both readings work.
+ *
+ * Resolving the sync root leaves the process in it, which is what makes the
+ * returned path readable by the caller — keep that in step if this ever stops
+ * going through `getWmillYamlPath`.
+ */
+export function toSyncRootRelativePath(
+  arg: string,
+  cwdBeforeConfig: string
+): string {
+  const root = syncRoot();
+  const candidates = isAbsolute(arg)
+    ? [arg]
+    : [resolve(cwdBeforeConfig, arg), resolve(root, arg)];
+  // A descriptor-less dbt project is named by a file that is deliberately not
+  // there, so an argument existing under neither reading is still a real one if
+  // the directory holding it is; only a path whose directory is missing too
+  // falls through to the sync-root reading for the caller to reject.
+  const abs =
+    candidates.find((c) => existsSync(c)) ??
+    candidates.find((c) => existsSync(dirname(c))) ??
+    candidates.at(-1)!;
+  const rel = relative(root, abs);
+  if (rel === "") return ".";
+  if (!rel.startsWith("..")) return rel;
+  // `relative` is purely lexical, so a root reached through a symlink (macOS'
+  // /var -> /private/var, a symlinked checkout) makes an absolute argument look
+  // like it escapes the tree. Resolve links only then, so a symlinked file
+  // *inside* the tree keeps the path it is filed under.
+  try {
+    const resolved = relative(realpathSync(root), realpathOfNamed(abs));
+    return resolved === "" ? "." : resolved;
+  } catch {
+    return rel;
+  }
+}
+
+/**
+ * `realpathSync` needs its target to exist, and a dbt descriptor deliberately
+ * does not. The directory naming it does, so resolve that and reattach.
+ */
+function realpathOfNamed(p: string): string {
+  return existsSync(p)
+    ? realpathSync(p)
+    : join(realpathSync(dirname(p)), basename(p));
+}
+
+/** Windmill workspace path: `u|f|g` followed by at least a folder and a name. */
+const REMOTE_PATH_RE = /^[ufg](\/[^/]+){2,}$/;
+
+/**
+ * Guard the Windmill path a preview run is pushed under. A preview job carries
+ * no runnable of its own, so this path is the only identity it has: it is what
+ * `WM_JOB_PATH` reports, what the runs page links to, and what relative imports
+ * inside the previewed code resolve against.
+ */
+export function assertRemotePath(remotePath: string, arg: string): void {
+  if (REMOTE_PATH_RE.test(remotePath)) return;
+  throw new Error(
+    `Cannot derive a Windmill path from '${arg}'` +
+      (remotePath ? ` (it maps to '${remotePath}')` : "") +
+      `: a preview runs under the path of the file it previews, which must sit inside the ` +
+      `wmill.yaml root and be of the form <u|g|f>/<username|group|folder>/<name>.`
+  );
+}
+
 export function validatePath(path: string): boolean {
   if (!(path.startsWith("g") || path.startsWith("u") || path.startsWith("f"))) {
-    log.info(
+    log.infoStderr(
       colors.red(
         "Given remote path looks invalid. Remote paths are typically of the form <u|g|f>/<username|group|folder>/..."
       )

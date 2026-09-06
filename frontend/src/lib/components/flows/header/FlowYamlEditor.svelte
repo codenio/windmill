@@ -21,16 +21,50 @@
 	let { drawer = $bindable() }: Props = $props()
 
 	let code = $state('')
+	let initialCode = $state('')
 	let editor = $state(undefined) as SimpleEditor | undefined
+	let hasChanges = $derived(code !== initialCode)
 
 	function reload() {
 		code = YAML.stringify(filteredContentForExport(flowStore.val))
+		initialCode = code
 		editor?.setCode(code)
+	}
+
+	/** `value` is assigned unconditionally below and `FlowEditor` dereferences
+	 * `flowStore.val.value.modules`, so an OpenFlow document missing it takes the
+	 * whole editor down mid-render — after the toast has already claimed success.
+	 * Reject it up front instead. */
+	function validateShape(parsed: unknown) {
+		if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+			throw new Error('the document must be a mapping (key: value)')
+		}
+		const value = (parsed as Record<string, unknown>).value
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+			throw new Error("missing 'value' - paste a whole OpenFlow document, not just its value")
+		}
+		if (!Array.isArray((value as Record<string, unknown>).modules)) {
+			throw new Error("'value.modules' must be a list")
+		}
+	}
+
+	function validateGroups(groups: { start_id: string; end_id: string }[] | undefined) {
+		if (!groups) return
+		const seen = new Set<string>()
+		for (const g of groups) {
+			const key = `${g.start_id}:${g.end_id}`
+			if (seen.has(key)) {
+				throw new Error(`Duplicate group: '${g.start_id}' → '${g.end_id}'`)
+			}
+			seen.add(key)
+		}
 	}
 
 	function apply() {
 		try {
 			const parsed = YAML.parse(code)
+			validateShape(parsed)
+			validateGroups(parsed.value?.groups)
 			if (parsed.summary && typeof parsed.summary === 'string') {
 				flowStore.val.summary = parsed.summary
 			}
@@ -49,13 +83,17 @@
 			if (parsed['on_behalf_of_email'] !== undefined) {
 				flowStore.val.on_behalf_of_email = parsed['on_behalf_of_email']
 			}
+			if (parsed['on_behalf_of'] !== undefined) {
+				flowStore.val.on_behalf_of = parsed['on_behalf_of']
+			}
 			flowStore.val.value = parsed.value
 			flowStore.val.schema = parsed.schema
 			flowStore.val.tag = parsed.tag
 			refreshStateStore(flowStore)
+			initialCode = code
 			sendUserToast('Changes applied')
 		} catch (e) {
-			;(sendUserToast('Error parsing yaml: ' + e), true)
+			sendUserToast('Error parsing yaml: ' + e, true)
 		}
 	}
 
@@ -65,8 +103,12 @@
 <Drawer on:open={reload} bind:this={drawer} size="800px">
 	<DrawerContent title="OpenFlow" on:close={() => drawer?.toggleDrawer()}>
 		{#snippet actions()}
-			<Button variant="default" unifiedSize="md" on:click={reload}>Reset code</Button>
-			<Button variant="accent" unifiedSize="md" on:click={apply}>Apply changes</Button>
+			<Button variant="default" unifiedSize="md" disabled={!hasChanges} on:click={reload}
+				>Reset code</Button
+			>
+			<Button variant="accent" unifiedSize="md" disabled={!hasChanges} on:click={apply}
+				>Apply changes</Button
+			>
 		{/snippet}
 
 		{#if flowStore.val}
@@ -80,6 +122,7 @@
 						minHeight={editorHeight}
 						bind:code
 						lang="yaml"
+						leadingChangeSync
 					/>
 				</div>
 			{/await}

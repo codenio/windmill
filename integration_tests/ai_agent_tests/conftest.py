@@ -18,6 +18,80 @@ load_dotenv(Path(__file__).parent / ".env")
 TEST_IMAGE_PATH = Path(__file__).parent / "test_image.webp"
 TEST_IMAGE_S3_KEY = "test_images/test_image.webp"
 
+# Env vars each provider needs before its cases can run. Cases for a provider
+# whose keys are absent are skipped instead of failed, so a CI run (or a local
+# dev) can exercise only the providers it has credentials for.
+PROVIDER_ENV_REQUIREMENTS: dict[str, list[str]] = {
+    "openai": ["OPENAI_API_KEY"],
+    "azure_openai": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL"],
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "google_ai": ["GOOGLE_AI_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+    "bedrock": ["BEDROCK_API_KEY"],
+    "bedrock_api_key": ["BEDROCK_API_KEY"],
+    "bedrock_iam": ["BEDROCK_IAM_ACCESS_KEY_ID", "BEDROCK_IAM_SECRET_ACCESS_KEY"],
+    "bedrock_iam_session": [
+        "BEDROCK_SESSION_ACCESS_KEY_ID",
+        "BEDROCK_SESSION_SECRET_ACCESS_KEY",
+        "BEDROCK_SESSION_TOKEN",
+    ],
+    "bedrock_env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+}
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "requires_provider(provider): skip test when the provider's credentials are absent",
+    )
+
+
+def _provider_name_from_item(item) -> str | None:
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        marker = item.get_closest_marker("requires_provider")
+        if marker is None:
+            return None
+        provider = marker.args[0] if marker.args else marker.kwargs.get("provider")
+    else:
+        provider = callspec.params.get("provider_config")
+
+    if isinstance(provider, str):
+        return provider
+    if isinstance(provider, dict) and isinstance(provider.get("name"), str):
+        return provider["name"]
+    return None
+
+
+def _provider_skip_reason(provider_name: str) -> str | None:
+    required = PROVIDER_ENV_REQUIREMENTS.get(provider_name, [])
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        return f"{provider_name}: missing {', '.join(missing)}"
+    return None
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        provider_name = _provider_name_from_item(item)
+        if provider_name is None:
+            continue
+
+        reason = _provider_skip_reason(provider_name)
+        if reason is not None:
+            item.add_marker(pytest.mark.skip(reason=reason))
+
+
+@pytest.fixture(autouse=True)
+def skip_provider_without_credentials(request):
+    """Skip dynamic provider cases when that provider's keys are not set."""
+    provider_name = _provider_name_from_item(request.node)
+    if provider_name is None:
+        return
+    reason = _provider_skip_reason(provider_name)
+    if reason is not None:
+        pytest.skip(reason)
+
 
 class AIAgentTestClient:
     """HTTP client for testing AI agents via the preview_flow endpoint."""
@@ -438,6 +512,12 @@ def setup_providers(client):
     - GOOGLE_AI_API_KEY
     - OPENROUTER_API_KEY
     - BEDROCK_API_KEY (optional)
+    - BEDROCK_IAM_ACCESS_KEY_ID and BEDROCK_IAM_SECRET_ACCESS_KEY (optional, for IAM Bedrock tests)
+    - BEDROCK_SESSION_ACCESS_KEY_ID, BEDROCK_SESSION_SECRET_ACCESS_KEY, BEDROCK_SESSION_TOKEN
+      (optional, for IAM session Bedrock tests)
+    - AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (optional, for environment fallback tests)
+    - AWS_SESSION_TOKEN (optional, if environment fallback uses temporary credentials)
+    - BEDROCK_REGION (optional, defaults to us-east-1)
     """
     # OpenAI
     if os.environ.get("OPENAI_API_KEY"):
@@ -475,13 +555,62 @@ def setup_providers(client):
             "api_key": "$var:u/admin/openrouter_api_key"
         })
 
+    bedrock_region = os.environ.get("BEDROCK_REGION", "us-east-1")
+
     # Bedrock (using apiKey approach)
     if os.environ.get("BEDROCK_API_KEY"):
         client.create_variable("u/admin/bedrock_api_key", os.environ["BEDROCK_API_KEY"])
         client.create_resource("u/admin/bedrock", "aws_bedrock", {
             "apiKey": "$var:u/admin/bedrock_api_key",
-            "region": "us-east-1"
+            "region": bedrock_region
         })
+
+    # Bedrock IAM credentials without session token
+    if os.environ.get("BEDROCK_IAM_ACCESS_KEY_ID") and os.environ.get("BEDROCK_IAM_SECRET_ACCESS_KEY"):
+        client.create_variable(
+            "u/admin/bedrock_iam_access_key_id",
+            os.environ["BEDROCK_IAM_ACCESS_KEY_ID"],
+        )
+        client.create_variable(
+            "u/admin/bedrock_iam_secret_access_key",
+            os.environ["BEDROCK_IAM_SECRET_ACCESS_KEY"],
+        )
+        client.create_resource("u/admin/bedrock_iam", "aws_bedrock", {
+            "awsAccessKeyId": "$var:u/admin/bedrock_iam_access_key_id",
+            "awsSecretAccessKey": "$var:u/admin/bedrock_iam_secret_access_key",
+            "region": bedrock_region
+        })
+
+    # Bedrock IAM credentials with session token
+    if (
+        os.environ.get("BEDROCK_SESSION_ACCESS_KEY_ID")
+        and os.environ.get("BEDROCK_SESSION_SECRET_ACCESS_KEY")
+        and os.environ.get("BEDROCK_SESSION_TOKEN")
+    ):
+        client.create_variable(
+            "u/admin/bedrock_session_access_key_id",
+            os.environ["BEDROCK_SESSION_ACCESS_KEY_ID"],
+        )
+        client.create_variable(
+            "u/admin/bedrock_session_secret_access_key",
+            os.environ["BEDROCK_SESSION_SECRET_ACCESS_KEY"],
+        )
+        client.create_variable(
+            "u/admin/bedrock_session_token",
+            os.environ["BEDROCK_SESSION_TOKEN"],
+        )
+        client.create_resource("u/admin/bedrock_iam_session", "aws_bedrock", {
+            "awsAccessKeyId": "$var:u/admin/bedrock_session_access_key_id",
+            "awsSecretAccessKey": "$var:u/admin/bedrock_session_secret_access_key",
+            "awsSessionToken": "$var:u/admin/bedrock_session_token",
+            "region": bedrock_region
+        })
+
+    # Bedrock using environment credentials fallback
+    # This resource intentionally omits explicit credentials.
+    client.create_resource("u/admin/bedrock_env", "aws_bedrock", {
+        "region": bedrock_region
+    })
 
     # DeepWiki MCP resource (always created for MCP tool tests)
     client.create_resource("u/admin/deepwiki", "mcp", {

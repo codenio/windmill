@@ -1,18 +1,18 @@
 <script lang="ts">
 	interface Props {
-		size?: number;
-		style?: string;
-		class?: string;
+		size?: number
+		style?: string
+		class?: string
 	}
 
-	let { size = 16, style = 'fill: white;', class: clazz = '' }: Props = $props();
-	
+	let { size = 16, style = 'fill: white;', class: clazz = '' }: Props = $props()
 </script>
 
 <svg
 	xmlns="http://www.w3.org/2000/svg"
 	height={`${size}px`}
-	viewBox="0 0 512 512"
+	width={`${size}px`}
+	viewBox="-23.545 -23.545 559.091 559.091"
 	class={clazz}
 	{style}
 >

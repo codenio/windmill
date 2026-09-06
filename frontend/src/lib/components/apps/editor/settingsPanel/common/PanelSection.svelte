@@ -1,5 +1,12 @@
+<script module lang="ts">
+	// Subtle uppercase variant for sidebar section titles (raw-app etc.).
+	export const SUBTLE_PANEL_TITLE = 'font-normal text-secondary text-2xs uppercase tracking-wider'
+</script>
+
 <script lang="ts">
+	import { untrack } from 'svelte'
 	import { classNames } from '$lib/utils'
+	import { twMerge } from 'tailwind-merge'
 	import { ChevronDown, ChevronRight } from 'lucide-svelte'
 	import Tooltip from '../../../../Tooltip.svelte'
 
@@ -8,6 +15,7 @@
 		noPadding?: boolean
 		fullHeight?: boolean
 		titlePadding?: string
+		titleClass?: string
 		tooltip?: string
 		documentationLink?: string | undefined
 		id?: string | undefined
@@ -24,6 +32,7 @@
 		noPadding = false,
 		fullHeight = true,
 		titlePadding = '',
+		titleClass = 'font-semibold',
 		tooltip = '',
 		documentationLink = undefined,
 		id = undefined,
@@ -49,7 +58,7 @@
 		}
 	}
 
-	let collapsed = $state(initiallyCollapsed)
+	let collapsed = $state(untrack(() => initiallyCollapsed))
 </script>
 
 <div
@@ -63,7 +72,12 @@
 >
 	<div class="flex justify-between flex-wrap items-center w-full gap-1">
 		<div
-			class="{textSize()} inline-flex items-center font-semibold text-primary {titlePadding} gap-1"
+			class={twMerge(
+				textSize(),
+				'inline-flex items-center text-primary gap-1',
+				titleClass,
+				titlePadding
+			)}
 		>
 			<span class="truncate">
 				{title}

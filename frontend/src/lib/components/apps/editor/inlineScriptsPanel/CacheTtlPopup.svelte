@@ -30,7 +30,7 @@
 			nonCaptureEvent={true}
 			btnClasses={Boolean(cache_ttl)
 				? 'bg-blue-100 text-blue-800 border border-blue-300 hover:bg-blue-200 dark:bg-frost-700 dark:text-frost-100 dark:border-frost-600'
-				: 'bg-surface text-primay hover:bg-hover'}
+				: 'bg-surface text-primary hover:bg-hover'}
 			color="light"
 			variant="contained"
 			size="xs2"
@@ -54,7 +54,7 @@
 				right: 'Cache the results for each possible inputs'
 			}}
 		/>
-		<div class="mb-4">
+		<div class="mt-6">
 			<span class="text-xs font-bold">How long to keep cache valid</span>
 
 			{#if cache_ttl}

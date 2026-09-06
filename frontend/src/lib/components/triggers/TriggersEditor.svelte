@@ -26,10 +26,14 @@
 		KafkaTriggerService,
 		NatsTriggerService,
 		MqttTriggerService,
+		AmqpTriggerService,
 		HttpTriggerService,
 		GcpTriggerService,
+		AzureTriggerService,
 		SqsTriggerService,
-		EmailTriggerService
+		EmailTriggerService,
+		NativeTriggerService,
+		type NativeServiceName
 	} from '$lib/gen'
 	import { sendUserToast } from '$lib/toast'
 	import Alert from '../common/alert/Alert.svelte'
@@ -110,26 +114,46 @@
 			kafka: () => KafkaTriggerService.deleteKafkaTrigger,
 			nats: () => NatsTriggerService.deleteNatsTrigger,
 			gcp: () => GcpTriggerService.deleteGcpTrigger,
+			azure: () => AzureTriggerService.deleteAzureTrigger,
 			sqs: () => SqsTriggerService.deleteSqsTrigger,
 			mqtt: () => MqttTriggerService.deleteMqttTrigger,
+			amqp: () => AmqpTriggerService.deleteAmqpTrigger,
 			http: () => HttpTriggerService.deleteHttpTrigger,
 			email: () => EmailTriggerService.deleteEmailTrigger
 		}
 
+		const nativeTriggerServices: Record<string, NativeServiceName> = {
+			nextcloud: 'nextcloud',
+			google: 'google',
+			github: 'github'
+		}
+
 		const deleteHandler = deleteHandlers[triggerType as keyof typeof deleteHandlers]
-		if (deleteHandler && deletingTrigger !== triggerIndex) {
-			deletingTrigger = triggerIndex
-			try {
+		const nativeServiceName = nativeTriggerServices[triggerType]
+
+		if (deletingTrigger === triggerIndex) return
+
+		deletingTrigger = triggerIndex
+		try {
+			if (nativeServiceName) {
+				await NativeTriggerService.deleteNativeTrigger({
+					workspace: $workspaceStore ?? '',
+					serviceName: nativeServiceName,
+					externalId: triggerPath ?? ''
+				})
+			} else if (deleteHandler) {
 				await deleteHandler()({
 					workspace: $workspaceStore ?? '',
 					path: triggerPath ?? ''
 				})
-				sendUserToast(`Successfully deleted ${triggerType} trigger: ${triggerPath}`)
-			} catch (error) {
-				sendUserToast(error.body || error.message, true)
-			} finally {
-				deletingTrigger = undefined
+			} else {
+				return
 			}
+			sendUserToast(`Successfully deleted ${triggerType} trigger: ${triggerPath}`)
+		} catch (error) {
+			sendUserToast(error.body || error.message, true)
+		} finally {
+			deletingTrigger = undefined
 		}
 	}
 
@@ -209,6 +233,14 @@
 				isFlow,
 				$userStore
 			)
+		} else if (triggerType === 'azure') {
+			await triggersState.fetchAzureTriggers(
+				triggersCount,
+				$workspaceStore,
+				currentPath,
+				isFlow,
+				$userStore
+			)
 		} else if (triggerType === 'sqs') {
 			await triggersState.fetchSqsTriggers(
 				triggersCount,
@@ -219,6 +251,14 @@
 			)
 		} else if (triggerType === 'mqtt') {
 			await triggersState.fetchMqttTriggers(
+				triggersCount,
+				$workspaceStore,
+				currentPath,
+				isFlow,
+				$userStore
+			)
+		} else if (triggerType === 'amqp') {
+			await triggersState.fetchAmqpTriggers(
 				triggersCount,
 				$workspaceStore,
 				currentPath,
@@ -243,7 +283,26 @@
 			)
 		} else if (triggerType === 'nextcloud') {
 			await triggersState.fetchNativeTriggers(
+				triggersCount,
 				'nextcloud',
+				$workspaceStore,
+				currentPath,
+				isFlow,
+				$userStore
+			)
+		} else if (triggerType === 'google') {
+			await triggersState.fetchNativeTriggers(
+				triggersCount,
+				'google',
+				$workspaceStore,
+				currentPath,
+				isFlow,
+				$userStore
+			)
+		} else if (triggerType === 'github') {
+			await triggersState.fetchNativeTriggers(
+				triggersCount,
+				'github',
 				$workspaceStore,
 				currentPath,
 				isFlow,
@@ -305,7 +364,7 @@
 			</Alert>
 		</div>
 	{/if}
-	<FlowCard {noEditor} noHeader>
+	<FlowCard {noEditor} title="Triggers">
 		<Splitpanes horizontal>
 			<Pane>
 				<div class="flex flex-row h-full" bind:clientWidth={leftPaneWidth}>

@@ -5,8 +5,18 @@
 	import { getContext } from 'svelte'
 	import { type TriggerContext } from '$lib/components/triggers'
 	import { enterpriseLicense } from '$lib/stores'
-	import { MqttIcon, NatsIcon, KafkaIcon, AwsIcon, GoogleCloudIcon } from '$lib/components/icons'
-	import { type Trigger, type TriggerType } from '$lib/components/triggers/utils'
+	import MqttIcon from '$lib/components/icons/MqttIcon.svelte'
+	import AmqpIcon from '$lib/components/icons/AmqpIcon.svelte'
+	import NatsIcon from '$lib/components/icons/NatsIcon.svelte'
+	import KafkaIcon from '$lib/components/icons/KafkaIcon.svelte'
+	import AwsIcon from '$lib/components/icons/AwsIcon.svelte'
+	import GoogleCloudIcon from '$lib/components/icons/GoogleCloudIcon.svelte'
+	import AzureIcon from '$lib/components/icons/AzureIcon.svelte'
+	import {
+		triggerIconMapMono,
+		type Trigger,
+		type TriggerType
+	} from '$lib/components/triggers/utils'
 	import { Menu, Menubar, MeltButton, MenuItem, Tooltip } from '$lib/components/meltComponents'
 	import { twMerge } from 'tailwind-merge'
 	import SchedulePollIcon from '$lib/components/icons/SchedulePollIcon.svelte'
@@ -14,6 +24,8 @@
 	import TriggerLabel from '$lib/components/triggers/TriggerLabel.svelte'
 	import CountBadge from '$lib/components/common/badge/CountBadge.svelte'
 	import NextcloudIcon from '$lib/components/icons/NextcloudIcon.svelte'
+	import GoogleIcon from '$lib/components/icons/GoogleIcon.svelte'
+	import GithubIcon from '$lib/components/icons/GithubIcon.svelte'
 
 	const { triggersState, triggersCount } = getContext<TriggerContext>('TriggerContext')
 
@@ -66,11 +78,15 @@
 			email: { icon: Mail, countKey: 'email_count' },
 			nats: { icon: NatsIcon, countKey: 'nats_count', disabled: !$enterpriseLicense },
 			mqtt: { icon: MqttIcon, countKey: 'mqtt_count', disabled: !$enterpriseLicense },
+			amqp: { icon: AmqpIcon, countKey: 'amqp_count' },
 			sqs: { icon: AwsIcon, countKey: 'sqs_count', disabled: !$enterpriseLicense },
 			gcp: { icon: GoogleCloudIcon, countKey: 'gcp_count', disabled: !$enterpriseLicense },
+			azure: { icon: AzureIcon, countKey: 'azure_count', disabled: !$enterpriseLicense },
 			poll: { icon: SchedulePollIcon },
 			cli: { icon: Terminal },
-			nextcloud: { icon: NextcloudIcon, countKey: 'nextcloud_count' }
+			nextcloud: { icon: NextcloudIcon, countKey: 'nextcloud_count' },
+			google: { icon: GoogleIcon, countKey: 'google_count' },
+			github: { icon: GithubIcon, countKey: 'github_count' }
 		}
 
 		// Add native trigger services that are available
@@ -97,12 +113,16 @@
 		'default_email',
 		'nats',
 		'mqtt',
+		'amqp',
 		'sqs',
 		'gcp',
+		'azure',
 		'email',
 		'poll',
 		'cli',
-		'nextcloud'
+		'nextcloud',
+		'google',
+		'github'
 	])
 
 	function camelCaseToWords(s: string) {
@@ -186,11 +206,7 @@
 				type === 'email' ||
 				type === 'cli' ||
 				(triggersGrouped[type] && triggersGrouped[type].length === 1)}
-			<Tooltip
-				disablePopup={menuOpen}
-				placement={vertical ? 'right' : 'bottom'}
-				on:click={(e) => e.stopPropagation()}
-			>
+			<Tooltip disablePopup={menuOpen} placement={vertical ? 'right' : 'bottom'}>
 				{#snippet text()}
 					{camelCaseToWords(type)}
 				{/snippet}
@@ -276,7 +292,7 @@
 			isSelected ? 'bg-surface-accent-selected text-accent border-border-selected' : '',
 			small ? 'w-[23px] h-[23px]' : 'p-2'
 		)}
-		on:click={(e) => {
+		onClick={(e) => {
 			e.stopPropagation()
 			e.preventDefault()
 			if (singleItem) {
@@ -306,10 +322,13 @@
 {/snippet}
 
 {#snippet simpleTriggerItem({ item, type })}
-	{@const { icon: SvelteComponent, countKey } = triggerTypeConfig()[type] || {
+	{@const { icon: ColourIcon, countKey } = triggerTypeConfig()[type] || {
 		icon: Database,
 		countKey: undefined
 	}}
+	<!-- The badge shows the full-colour mark; the menu it opens is a dense list beside lucide
+		glyphs, so its rows use the desaturated variants. See icons/index.ts. -->
+	{@const SvelteComponent = triggerIconMapMono[type] ?? ColourIcon}
 	<MenuItem {item} class={itemClass}>
 		<div class="flex flex-row items-center gap-2">
 			<SvelteComponent size={14} />

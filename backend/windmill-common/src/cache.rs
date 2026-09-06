@@ -12,10 +12,9 @@ use crate::{
     error,
     flows::{FlowNodeId, FlowValue},
     schema::SchemaValidator,
-    scripts::{ScriptHash, ScriptLang},
+    scripts::{ScriptHash, ScriptLang, ScriptModule},
 };
 use anyhow::anyhow;
-use serde_json::value::to_raw_value;
 
 #[cfg(feature = "scoped_cache")]
 use std::thread::ThreadId;
@@ -42,15 +41,14 @@ pub use quick_cache::sync::Cache;
 #[cfg(not(feature = "scoped_cache"))]
 lazy_static! {
     /// Cache directory for windmill server/worker(s).
-    /// 1. If `XDG_CACHE_HOME` is set, use `"${XDG_CACHE_HOME}/windmill"`.
-    /// 2. If `HOME` is set, use `"${HOME}/.cache/windmill"`.
-    /// 3. Otherwise, use `"{std::env::temp_dir()}/windmill/cache"`.
+    /// Lives under `WINDMILL_DIR` (default `/tmp/windmill`) as `cache_db/`.
+    /// If `WINDMILL_CACHE_PREFIX` (or `WEBMUX_BRANCH`) is set, uses `cache_db/{prefix}/`.
     pub static ref CACHE_PATH: PathBuf = {
-        std::env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".cache")))
-            .map(|cache| cache.join("windmill"))
-            .unwrap_or_else(|_| std::env::temp_dir().join("windmill/cache"))
+        let base = PathBuf::from(&*crate::worker::WINDMILL_DIR).join("cache_db");
+        let prefix = std::env::var("WINDMILL_CACHE_PREFIX")
+            .or_else(|_| std::env::var("WEBMUX_BRANCH"))
+            .unwrap_or_default();
+        if prefix.is_empty() { base } else { base.join(prefix) }
     };
 }
 
@@ -103,7 +101,7 @@ pub trait Import: Sized {
 }
 
 /// A type that can be exported to [`Storage`].
-pub trait Export: Clone {
+pub trait Export: Sized {
     /// The untrusted type that can be imported from [`Storage`].
     type Untrusted: Import;
 
@@ -122,7 +120,9 @@ pub struct FsBackedCache<Key, Val, Root> {
     root: Root,
 }
 
-impl<Key: Eq + Hash + Item + Clone, Val: Export, Root: AsRef<Path>> FsBackedCache<Key, Val, Root> {
+impl<Key: Eq + Hash + Item + Clone, Val: Export + Clone, Root: AsRef<Path>>
+    FsBackedCache<Key, Val, Root>
+{
     /// Create a new file-system backed cache with `items_capacity` capacity.
     /// The cache will be stored in the `root` directory.
     pub fn new(root: Root, items_capacity: usize) -> Self {
@@ -265,7 +265,11 @@ pub mod future {
         ///     assert_eq!(result.unwrap(), 42u64);
         /// };
         /// ```
-        fn cached<Key: Eq + Hash + Item + Clone, Val: Export<Untrusted = T>, Root: AsRef<Path>>(
+        fn cached<
+            Key: Eq + Hash + Item + Clone,
+            Val: Export<Untrusted = T> + Clone,
+            Root: AsRef<Path>,
+        >(
             self,
             cache: &FsBackedCache<Key, Val, Root>,
             key: Key,
@@ -278,63 +282,95 @@ pub mod future {
 }
 
 /// Flow data: i.e. a cached `raw_flow`.
-/// Contains the original json raw value and a pre-parsed [`FlowValue`].
-#[derive(Debug, Clone)]
+/// Contains the original json raw value; [`FlowValue`] is parsed lazily on first access.
 pub struct FlowData {
     pub raw_flow: Box<RawValue>,
-    pub flow: FlowValue,
+    flow: std::sync::OnceLock<FlowValue>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FlowNotes {
+impl std::fmt::Debug for FlowData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowData")
+            .field("raw_flow", &"<raw>")
+            .field("flow", &self.flow.get().map(|_| "<parsed>"))
+            .finish()
+    }
+}
+
+/// Top-level fields of a stored flow value that [`FlowValue`] does not model, so parsing a
+/// flow into a `FlowValue` drops them. Every write-back that round-trips a stored flow
+/// through `FlowValue` must capture them first and re-attach them with
+/// [`FlowExtras::reattach`], or they are destroyed on save. Adding a display-only flow
+/// field means adding it here — this is the only list, and `FlowValue` must never model a
+/// field named here: `reattach` flattens the two together, so a name in both would be
+/// emitted twice and the value would no longer deserialize.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct FlowExtras {
     pub notes: Option<Box<RawValue>>,
+    pub groups: Option<Box<RawValue>>,
+}
+
+impl FlowExtras {
+    /// Serialize `flow` with these extras folded back in. Fallible on purpose: the result is
+    /// written straight over a deployed flow value, so a serialization failure must abort the
+    /// write rather than persist a truncated value.
+    pub fn reattach(&self, flow: &FlowValue) -> error::Result<Box<RawValue>> {
+        // `flatten` + `RawValue` is fine for serialization; only deserialization breaks.
+        #[derive(Serialize)]
+        struct FlowValueWithExtras<'a> {
+            #[serde(flatten)]
+            flow: &'a FlowValue,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            notes: Option<&'a Box<RawValue>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            groups: Option<&'a Box<RawValue>>,
+        }
+
+        serde_json::value::to_raw_value(&FlowValueWithExtras {
+            flow,
+            notes: self.notes.as_ref(),
+            groups: self.groups.as_ref(),
+        })
+        .map_err(|e| error::Error::internal_err(format!("Failed to serialize flow value: {e}")))
+    }
+
+    /// Capture the extras carried by a raw stored flow value.
+    pub fn capture(raw_flow: &RawValue) -> Self {
+        serde_json::from_str::<FlowExtras>(raw_flow.get())
+            .map_err(|e| tracing::warn!("Failed to parse flow extras: {e}"))
+            .unwrap_or_default()
+    }
 }
 
 impl FlowData {
-    pub fn notes(&self) -> Option<FlowNotes> {
-        serde_json::from_str::<FlowNotes>(self.raw_flow.get())
-            .map_err(|e| {
-                tracing::error!("Failed to parse notes into FlowNotes: {}", e);
-                error::Error::internal_err(format!("Failed to parse notes into FlowNotes: {}", e))
-            })
-            .ok()
+    pub fn extras(&self) -> FlowExtras {
+        FlowExtras::capture(&self.raw_flow)
     }
 }
-/// !!!Shouldn't be used. Reverted optimization for ai agent steps.!!!
-#[derive(Deserialize)]
-struct RevertedFlowNodeFlow {
-    value: FlowValue,
-}
-
 impl FlowData {
     pub fn from_raw(raw_flow: Box<RawValue>) -> error::Result<Self> {
-        match serde_json::from_str::<FlowValue>(raw_flow.get()) {
-            Ok(flow) => Ok(FlowData { raw_flow, flow }),
-            _ => {
-                // fallback for compatibility with bad version 1.560.0
-                // TODO: remove this in a future version. Reverted optimization for ai agent steps.
-                let flow_node_flow = serde_json::from_str::<RevertedFlowNodeFlow>(raw_flow.get())
-                    .map_err(|e| {
-                    error::Error::internal_err(format!(
-                        "Failed to parse as RevertedFlowNodeFlow: {}",
-                        e
-                    ))
-                })?;
-                let raw_flow = to_raw_value(&flow_node_flow.value)?;
-                Ok(FlowData { raw_flow, flow: flow_node_flow.value })
-            }
-        }
+        let val = serde_json::from_str::<FlowValue>(raw_flow.get()).map_err(|e| {
+            error::Error::internal_err(format!("Failed to parse flow value: {}", e))
+        })?;
+        let flow = std::sync::OnceLock::new();
+        let _ = flow.set(val);
+        Ok(FlowData { raw_flow, flow })
     }
 
+    /// Return the parsed [`FlowValue`]. Already parsed from `from_raw`.
     pub fn value(&self) -> &FlowValue {
-        &self.flow
+        self.flow.get_or_init(|| {
+            serde_json::from_str::<FlowValue>(self.raw_flow.get())
+                .expect("FlowData raw_flow was validated at construction")
+        })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ScriptData {
     pub lock: Option<String>,
     pub code: String,
+    pub modules: Option<std::collections::HashMap<String, ScriptModule>>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +393,7 @@ pub struct RawScript {
     pub content: String,
     pub lock: Option<String>,
     pub meta: Option<ScriptMetadata>,
+    pub modules: Option<std::collections::HashMap<String, ScriptModule>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -364,17 +401,28 @@ pub struct RawScriptApi {
     pub content: String,
     pub lock: Option<String>,
     pub meta: Option<ScriptMetadata>,
+    pub modules: Option<std::collections::HashMap<String, ScriptModule>>,
 }
 
 impl From<RawScript> for RawScriptApi {
     fn from(value: RawScript) -> Self {
-        RawScriptApi { content: value.content, lock: value.lock, meta: value.meta }
+        RawScriptApi {
+            content: value.content,
+            lock: value.lock,
+            meta: value.meta,
+            modules: value.modules,
+        }
     }
 }
 
 impl From<RawScriptApi> for RawScript {
     fn from(value: RawScriptApi) -> Self {
-        RawScript { content: value.content, lock: value.lock, meta: value.meta }
+        RawScript {
+            content: value.content,
+            lock: value.lock,
+            meta: value.meta,
+            modules: value.modules,
+        }
     }
 }
 
@@ -409,8 +457,14 @@ impl From<RawNodeApi> for RawNode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Entry<T>(Arc<T>);
+
+impl<T> Clone for Entry<T> {
+    fn clone(&self) -> Self {
+        Entry(Arc::clone(&self.0))
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ScriptFull {
@@ -632,7 +686,8 @@ pub mod script {
                 schema AS \"schema: String\", \
                 schema_validation AS \"schema_validation: bool\", \
                 codebase LIKE '%.tar' as use_tar, \
-                codebase LIKE '%.esm%' as is_esm \
+                codebase LIKE '%.esm%' as is_esm, \
+                modules AS \"modules: serde_json::Value\" \
             FROM script WHERE hash = $1 LIMIT 1",
             hash.0
         )
@@ -644,6 +699,23 @@ pub mod script {
             Ok(RawScript {
                 content: r.content,
                 lock: r.lock,
+                modules: r.modules.and_then(|v| match serde_json::from_value(v) {
+                    Ok(modules) => Some(modules),
+                    // Not fatal: a script whose `modules` column cannot be read
+                    // still runs, just without its own files. But the result is
+                    // then cached under the script's hash, which never changes,
+                    // so the degraded run is what every later one gets too --
+                    // and for dbt "no modules" means no project at all. Say so
+                    // loudly, or the only symptom is a script that behaves as
+                    // if its files were never there.
+                    Err(err) => {
+                        tracing::error!(
+                            "Script {hash} has modules that cannot be deserialized, \
+                             running it without them: {err:#}"
+                        );
+                        None
+                    }
+                }),
                 meta: Some(ScriptMetadata {
                     language: r.language,
                     envs: r.envs,
@@ -822,6 +894,7 @@ pub mod job {
                 _ => Ok(RawData::Script(Arc::new(ScriptData {
                     code: code.unwrap_or_default(),
                     lock,
+                    modules: None,
                 }))),
             })
         };
@@ -909,9 +982,15 @@ pub mod workspace_dependencies {
         /// Cache key: (workspace_id, language)
         /// Cache value: (exists: bool, cached_at timestamp)
         static ref DEFAULT_WD_EXISTS_CACHE: quick_cache::sync::Cache<(String, String), (bool, Instant)> = quick_cache::sync::Cache::new(500);
+
+        /// Cache timeout for existence checks (default 10 seconds, configurable via EXISTS_CACHE_TIMEOUT_MS env var)
+        pub static ref EXISTS_CACHE_TIMEOUT: Duration = Duration::from_millis(
+            std::env::var("EXISTS_CACHE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000)
+        );
     }
-    /// Cache timeout for existence checks (10 seconds)
-    pub const EXISTS_CACHE_TIMEOUT: Duration = Duration::from_secs(10);
 
     pub fn fetch_workspace_dependencies<'c>(
         id: i64,
@@ -932,7 +1011,7 @@ pub mod workspace_dependencies {
         let exists_key = (workspace_id.to_string(), dependencies_filename);
 
         if let Some((exists, cached_at)) = DEFAULT_WD_EXISTS_CACHE.get(&exists_key) {
-            if cached_at.elapsed() < EXISTS_CACHE_TIMEOUT {
+            if cached_at.elapsed() < *EXISTS_CACHE_TIMEOUT {
                 tracing::debug!(
                     workspace_id = %workspace_id,
                     exists,
@@ -969,6 +1048,35 @@ pub mod workspace_dependencies {
     }
 }
 
+/// Temporary raw script content cache for CLI lock generation.
+pub mod raw_script_temp {
+    use super::*;
+    use crate::DB;
+
+    make_static! {
+        static ref CACHE: { String => String } in "raw_script_temp" <= 10000;
+    }
+
+    /// Compute hash for raw script content (includes workspace_id for isolation).
+    pub fn compute_hash(workspace_id: &str, content: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(workspace_id.as_bytes());
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Load content from cache, falling back to DB.
+    pub fn load(hash: String, db: &DB) -> impl Future<Output = error::Result<String>> + '_ {
+        CACHE.get_or_insert_async(hash.clone(), async move {
+            sqlx::query_scalar!("SELECT content FROM raw_script_temp WHERE hash = $1", &hash)
+                .fetch_optional(db)
+                .await?
+                .ok_or_else(|| error::Error::NotFound(format!("raw_script_temp hash: {}", hash)))
+        })
+    }
+}
+
 const _: () = {
     impl Import for RawFlow {
         fn import(src: &impl Storage) -> error::Result<Self> {
@@ -993,7 +1101,12 @@ const _: () = {
             let content = src.get_utf8("code.txt")?;
             let lock = src.get_utf8("lock.txt").ok();
             let meta = src.get_json("info.json").ok();
-            Ok(Self { content, lock, meta })
+            // Required, even when empty: a script's modules are part of what it
+            // IS, so an entry without them must fail to import and be refetched
+            // rather than serve the script stripped of its own files.
+            let modules: Option<std::collections::HashMap<String, ScriptModule>> =
+                src.get_json("modules.json")?;
+            Ok(Self { content, lock, meta, modules })
         }
     }
 
@@ -1001,7 +1114,7 @@ const _: () = {
         type Untrusted = RawScript;
 
         fn resolve(src: Self::Untrusted) -> error::Result<Self> {
-            Ok(ScriptData { code: src.content, lock: src.lock })
+            Ok(ScriptData { code: src.content, lock: src.lock, modules: src.modules })
         }
 
         fn export(&self, dst: &impl Storage) -> error::Result<()> {
@@ -1009,6 +1122,7 @@ const _: () = {
             if let Some(lock) = self.lock.as_ref() {
                 dst.put("lock.txt", lock.as_bytes())?;
             }
+            dst.put("modules.json", serde_json::to_vec(&self.modules)?)?;
             Ok(())
         }
     }
@@ -1027,7 +1141,11 @@ const _: () = {
                 return Err(error::Error::internal_err("Invalid script src".to_string()));
             };
             Ok(ScriptFull {
-                data: Arc::new(ScriptData { code: src.content, lock: src.lock }),
+                data: Arc::new(ScriptData {
+                    code: src.content,
+                    lock: src.lock,
+                    modules: src.modules,
+                }),
                 meta: Arc::new(meta),
             })
         }
@@ -1057,7 +1175,11 @@ const _: () = {
                     FlowData::from_raw(flow).map(Arc::new).map(Self::Flow)
                 }
                 RawNode { raw_code: Some(code), raw_lock: lock, .. } => {
-                    Ok(Self::Script(Arc::new(ScriptData { code, lock })))
+                    Ok(Self::Script(Arc::new(ScriptData {
+                        code,
+                        lock,
+                        modules: None,
+                    })))
                 }
                 _ => Err(error::Error::internal_err(
                     "Invalid raw data src".to_string(),
@@ -1123,11 +1245,25 @@ const _: () = {
             use std::fs::OpenOptions;
             use std::io::Write;
 
+            // Atomic write: truncate+write a uniquely-named temp file (UUID, not pid — pids
+            // collide across container PID namespaces on a shared cache volume), fsync, then
+            // rename(2) over the target. Without this a shorter overwrite leaves a stale tail
+            // and concurrent writers tear the file — a corrupt entry a reader would import.
+            let final_path = item.path(self);
+            let tmp_path = final_path.with_extension(format!("tmp.{}", Uuid::new_v4()));
             OpenOptions::new()
                 .write(true)
                 .create(true)
-                .open(item.path(self))
-                .and_then(|mut file| file.write_all(data.as_ref()))
+                .truncate(true)
+                .open(&tmp_path)
+                .and_then(|mut file| {
+                    file.write_all(data.as_ref())?;
+                    file.sync_all()
+                })
+                .and_then(|()| std::fs::rename(&tmp_path, &final_path))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp_path);
+                })
         }
     }
 
@@ -1153,7 +1289,8 @@ const _: () = {
         ((u8, ScriptHash), |x| format!("{:02x}-{:016x}", x.0, x.1.0)),
         (FlowNodeId, |x| format!("{:016x}", x.0)),
         (AppScriptId, |x| format!("{:016x}", x.0)),
-        ((i64, String), |x| format!("{}-{}", x.1, x.0))
+        ((i64, String), |x| format!("{}-{}", x.1, x.0)),
+        (String, |x| x.as_str())
     }
 
     #[cfg(feature = "scoped_cache")]
@@ -1164,3 +1301,173 @@ const _: () = {
         }
     }
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn fs_cache_put_overwrites_without_stale_tail() {
+        // Regression for the non-truncating, non-atomic `put`: overwriting a value with a
+        // shorter one must not leave stale trailing bytes (which imported as corrupt/wrong
+        // content — the #9751 worker-cache hazard).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        root.put("k", b"a-long-cached-value-0123456789").unwrap();
+        assert_eq!(root.get("k").unwrap(), b"a-long-cached-value-0123456789");
+
+        root.put("k", b"short").unwrap();
+        assert_eq!(
+            root.get("k").unwrap(),
+            b"short",
+            "shorter overwrite must fully replace, no stale tail"
+        );
+
+        // No temp files left behind after a successful write.
+        let leftover: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "temp files must be renamed/cleaned up");
+    }
+
+    // The first fetch of a script goes to the database, every later one to this
+    // directory. A module lost in between makes a worker restart silently start
+    // running the script without its own files — for dbt, without its project.
+    #[test]
+    fn a_scripts_modules_survive_the_file_system_cache() {
+        use crate::scripts::ScriptModule;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let data = ScriptData {
+            code: "profile: {}".to_string(),
+            lock: None,
+            modules: Some(std::collections::HashMap::from([(
+                "dbt_project.yml".to_string(),
+                ScriptModule {
+                    content: "name: p".to_string(),
+                    language: ScriptLang::Dbt,
+                    lock: None,
+                },
+            )])),
+        };
+        data.export(&root).unwrap();
+        let back = ScriptData::resolve(RawScript::import(&root).unwrap()).unwrap();
+        assert_eq!(back.modules.unwrap()["dbt_project.yml"].content, "name: p");
+
+        // An entry written before modules were cached has no `modules.json`.
+        // It must fail to import so the caller refetches, rather than serving a
+        // script stripped of its files for as long as the directory lives.
+        std::fs::remove_file(root.join("modules.json")).unwrap();
+        assert!(RawScript::import(&root).is_err());
+    }
+
+    #[test]
+    fn flow_data_extras_preserves_notes_and_groups() {
+        let raw = serde_json::value::to_raw_value(&json!({
+            "modules": [],
+            "notes": [{"id": "n1", "text": "hello", "color": "blue", "type": "group",
+                        "contained_node_ids": ["a", "b"], "locked": false}],
+            "groups": [{"start_id": "a", "end_id": "b", "summary": "grp", "color": "green"}]
+        }))
+        .unwrap();
+
+        let data = FlowData::from_raw(raw).unwrap();
+
+        // FlowValue ignores notes/groups
+        assert!(data.value().modules.is_empty());
+
+        // But extras() recovers them from the raw JSON
+        let extras = data.extras();
+        let notes: serde_json::Value =
+            serde_json::from_str(extras.notes.expect("notes present").get()).unwrap();
+        assert_eq!(notes.as_array().unwrap().len(), 1);
+        assert_eq!(notes[0]["id"], "n1");
+        assert_eq!(notes[0]["color"], "blue");
+
+        let groups: serde_json::Value =
+            serde_json::from_str(extras.groups.expect("groups present").get()).unwrap();
+        assert_eq!(groups.as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["start_id"], "a");
+    }
+
+    #[test]
+    fn flow_data_extras_returns_none_when_missing() {
+        let raw = serde_json::value::to_raw_value(&json!({"modules": []})).unwrap();
+        let data = FlowData::from_raw(raw).unwrap();
+
+        let extras = data.extras();
+        assert!(extras.notes.is_none());
+        assert!(extras.groups.is_none());
+    }
+
+    #[test]
+    fn flow_data_extras_lost_after_flow_value_roundtrip() {
+        // Demonstrates the bug: serializing through FlowValue drops notes/groups.
+        // This is the root cause of #8641.
+        let raw = serde_json::value::to_raw_value(&json!({
+            "modules": [],
+            "notes": [{"id": "n1", "text": "t", "color": "blue", "type": "free"}]
+        }))
+        .unwrap();
+
+        let data = FlowData::from_raw(raw).unwrap();
+
+        // Re-serialize through FlowValue (what RunFlowDependenciesRequest does)
+        let stripped = serde_json::to_string(data.value()).unwrap();
+        let stripped_raw = RawValue::from_string(stripped).unwrap();
+        let data2 = FlowData::from_raw(stripped_raw).unwrap();
+
+        // Notes are gone after the FlowValue round-trip
+        assert!(
+            data2.extras().notes.is_none(),
+            "notes lost after FlowValue round-trip"
+        );
+    }
+
+    #[test]
+    fn flow_extras_reattach_restores_what_the_roundtrip_drops() {
+        // Every write-back that re-serializes a stored flow through FlowValue must go
+        // through reattach, or notes/groups are destroyed.
+        let raw = serde_json::value::to_raw_value(&json!({
+            "modules": [{
+                "id": "a",
+                "value": {"type": "rawscript", "content": "x", "language": "bun",
+                          "input_transforms": {}}
+            }],
+            "same_worker": true,
+            "notes": [{"id": "n1", "text": "t", "color": "blue", "type": "free"}],
+            "groups": [{"start_id": "a", "end_id": "b", "summary": "grp"}]
+        }))
+        .unwrap();
+
+        let data = FlowData::from_raw(raw.clone()).unwrap();
+        let reattached: serde_json::Value =
+            serde_json::from_str(data.extras().reattach(data.value()).unwrap().get()).unwrap();
+        let original: serde_json::Value = serde_json::from_str(raw.get()).unwrap();
+
+        for key in original.as_object().unwrap().keys() {
+            assert_eq!(
+                reattached.get(key),
+                original.get(key),
+                "{key} did not survive the FlowValue round-trip"
+            );
+        }
+
+        // Absent extras must stay absent rather than serialize as null, which would show
+        // up as a spurious change in flow diffs.
+        let without =
+            FlowData::from_raw(serde_json::value::to_raw_value(&json!({ "modules": [] })).unwrap())
+                .unwrap();
+        let output = without
+            .extras()
+            .reattach(without.value())
+            .unwrap()
+            .to_string();
+        assert!(!output.contains("notes") && !output.contains("groups"));
+    }
+}

@@ -2,7 +2,7 @@
 	import { createBubbler } from 'svelte/legacy'
 
 	const bubble = createBubbler()
-	import { createEventDispatcher } from 'svelte'
+	import { createEventDispatcher, untrack } from 'svelte'
 	import { ButtonType } from './model'
 	import { twMerge } from 'tailwind-merge'
 	import Dropdown from '$lib/components/DropdownV2.svelte'
@@ -304,14 +304,14 @@
 		elements: { trigger, content },
 		states: { open },
 		options: { openDelay }
-	} = tooltipPopover
+	} = untrack(() => tooltipPopover)
 		? createTooltip({
 				positioning: {
-					placement: tooltipPopover?.placement
+					placement: untrack(() => tooltipPopover)?.placement
 				},
-				closeDelay: tooltipPopover?.closeDelay,
+				closeDelay: untrack(() => tooltipPopover)?.closeDelay,
 				group: true,
-				portal: tooltipPopover?.portal
+				portal: untrack(() => tooltipPopover)?.portal
 			})
 		: {
 				elements: { trigger: undefined, content: undefined },
@@ -355,8 +355,12 @@
 			onblur={bubble('blur')}
 			onmouseenter={bubble('mouseenter')}
 			onmouseleave={bubble('mouseleave')}
-			onclick={() => {
+			onclick={(event) => {
 				loading = true
+				// A link button can still want to intercept its own click (e.g. to resolve
+				// the real destination first and preventDefault), so `onClick` must run here
+				// too — the button branch below is not the only one that takes a handler.
+				onClick?.(event)
 				dispatch('click', event)
 				if (!loadUntilNav) {
 					loading = false
@@ -385,7 +389,11 @@
 				{@render children?.()}
 			{/if}
 			{#if endIcon?.icon}
-				<endIcon.icon class={twMerge('shrink-0', endIcon?.classes)} size={lucideIconSize} />
+				<endIcon.icon
+					class={twMerge('shrink-0', endIcon?.classes)}
+					size={lucideIconSize}
+					{...endIcon.props}
+				/>
 			{/if}
 			{#if shortCut && !shortCut.hide}
 				<div
@@ -434,7 +442,11 @@
 				{@render children?.()}
 			{/if}
 			{#if endIcon?.icon}
-				<endIcon.icon class={twMerge('shrink-0', endIcon?.classes)} size={lucideIconSize} />
+				<endIcon.icon
+					class={twMerge('shrink-0', endIcon?.classes)}
+					size={lucideIconSize}
+					{...endIcon.props}
+				/>
 			{/if}
 			{#if shortCut && !shortCut.hide}
 				{@const Icon = shortCut.Icon}

@@ -1,83 +1,211 @@
 <script lang="ts">
 	interface Props {
+		height?: string
+		width?: string
 		size?: number
 	}
 
-	let { size = 24 }: Props = $props()
+	let { height, width, size = 24 }: Props = $props()
+	let effectiveWidth = $derived(width ?? `${size}px`)
+	let effectiveHeight = $derived(height ?? `${size}px`)
 </script>
 
+<!-- #6459FE per Microsoft's Teams-Icon-FY26 asset (cdn-dynmedia-1.microsoft.com, served on microsoft.com/microsoft-teams); every gradient stop here is verbatim from it.
+	 Microsoft's trademark guidelines forbid altering their brand assets, so the full-colour mark ships unchanged in both themes. -->
 <svg
-	width="{size}px"
-	height="{size}px"
-	viewBox="0 0 16 16"
+	width={effectiveWidth}
+	height={effectiveHeight}
+	viewBox="1.223 2.207 41.523 41.523"
 	xmlns="http://www.w3.org/2000/svg"
 	fill="none"
 >
 	<path
-		fill="#5059C9"
-		d="M10.765 6.875h3.616c.342 0 .619.276.619.617v3.288a2.272 2.272 0 01-2.274 2.27h-.01a2.272 2.272 0 01-2.274-2.27V7.199c0-.179.145-.323.323-.323zM13.21 6.225c.808 0 1.464-.655 1.464-1.462 0-.808-.656-1.463-1.465-1.463s-1.465.655-1.465 1.463c0 .807.656 1.462 1.465 1.462z"
+		d="M21.9999 20H33.9999C37.3136 20 39.9999 22.6863 39.9999 26V36C39.9999 39.3137 37.3136 42 33.9999 42C30.6862 42 27.9999 39.3137 27.9999 36V26C27.9999 22.6863 25.3136 20 21.9999 20Z"
+		fill="url(#ms-teams-0)"
 	/>
 	<path
-		fill="#7B83EB"
-		d="M8.651 6.225a2.114 2.114 0 002.117-2.112A2.114 2.114 0 008.65 2a2.114 2.114 0 00-2.116 2.112c0 1.167.947 2.113 2.116 2.113zM11.473 6.875h-5.97a.611.611 0 00-.596.625v3.75A3.669 3.669 0 008.488 15a3.669 3.669 0 003.582-3.75V7.5a.611.611 0 00-.597-.625z"
+		d="M7.99988 24C7.99988 20.6863 10.6862 18 13.9999 18H21.9999C25.3136 18 27.9999 20.6863 27.9999 24V36C27.9999 39.3137 30.6862 42 33.9999 42L17.9998 41.9999C12.477 41.9999 7.99988 37.5228 7.99988 31.9999V24Z"
+		fill="url(#ms-teams-1)"
 	/>
 	<path
-		fill="#000000"
-		d="M8.814 6.875v5.255a.598.598 0 01-.596.595H5.193a3.951 3.951 0 01-.287-1.476V7.5a.61.61 0 01.597-.624h3.31z"
-		opacity=".1"
+		d="M7.99988 24C7.99988 20.6863 10.6862 18 13.9999 18H21.9999C25.3136 18 27.9999 20.6863 27.9999 24V36C27.9999 39.3137 30.6862 42 33.9999 42L17.9998 41.9999C12.477 41.9999 7.99988 37.5228 7.99988 31.9999V24Z"
+		fill="url(#ms-teams-2)"
+		fill-opacity="0.7"
 	/>
 	<path
-		fill="#000000"
-		d="M8.488 6.875v5.58a.6.6 0 01-.596.595H5.347a3.22 3.22 0 01-.267-.65 3.951 3.951 0 01-.172-1.15V7.498a.61.61 0 01.596-.624h2.985z"
-		opacity=".2"
+		d="M7.99988 24C7.99988 20.6863 10.6862 18 13.9999 18H21.9999C25.3136 18 27.9999 20.6863 27.9999 24V36C27.9999 39.3137 30.6862 42 33.9999 42L17.9998 41.9999C12.477 41.9999 7.99988 37.5228 7.99988 31.9999V24Z"
+		fill="url(#ms-teams-3)"
+		fill-opacity="0.7"
 	/>
 	<path
-		fill="#000000"
-		d="M8.488 6.875v4.93a.6.6 0 01-.596.595H5.08a3.951 3.951 0 01-.172-1.15V7.498a.61.61 0 01.596-.624h2.985z"
-		opacity=".2"
+		d="M32.9999 18C35.7613 18 37.9999 15.7614 37.9999 13C37.9999 10.2386 35.7613 8 32.9999 8C30.2385 8 27.9999 10.2386 27.9999 13C27.9999 15.7614 30.2385 18 32.9999 18Z"
+		fill="url(#ms-teams-4)"
 	/>
 	<path
-		fill="#000000"
-		d="M8.163 6.875v4.93a.6.6 0 01-.596.595H5.079a3.951 3.951 0 01-.172-1.15V7.498a.61.61 0 01.596-.624h2.66z"
-		opacity=".2"
+		d="M32.9999 18C35.7613 18 37.9999 15.7614 37.9999 13C37.9999 10.2386 35.7613 8 32.9999 8C30.2385 8 27.9999 10.2386 27.9999 13C27.9999 15.7614 30.2385 18 32.9999 18Z"
+		fill="url(#ms-teams-5)"
+		fill-opacity="0.46"
 	/>
 	<path
-		fill="#000000"
-		d="M8.814 5.195v1.024c-.055.003-.107.006-.163.006-.055 0-.107-.003-.163-.006A2.115 2.115 0 016.593 4.6h1.625a.598.598 0 01.596.594z"
-		opacity=".1"
+		d="M32.9999 18C35.7613 18 37.9999 15.7614 37.9999 13C37.9999 10.2386 35.7613 8 32.9999 8C30.2385 8 27.9999 10.2386 27.9999 13C27.9999 15.7614 30.2385 18 32.9999 18Z"
+		fill="url(#ms-teams-6)"
+		fill-opacity="0.4"
 	/>
 	<path
-		fill="#000000"
-		d="M8.488 5.52v.699a2.115 2.115 0 01-1.79-1.293h1.195a.598.598 0 01.595.594z"
-		opacity=".2"
+		d="M17.9999 16C21.3136 16 23.9999 13.3137 23.9999 10C23.9999 6.68629 21.3136 4 17.9999 4C14.6862 4 11.9999 6.68629 11.9999 10C11.9999 13.3137 14.6862 16 17.9999 16Z"
+		fill="url(#ms-teams-7)"
 	/>
 	<path
-		fill="#000000"
-		d="M8.488 5.52v.699a2.115 2.115 0 01-1.79-1.293h1.195a.598.598 0 01.595.594z"
-		opacity=".2"
+		d="M17.9999 16C21.3136 16 23.9999 13.3137 23.9999 10C23.9999 6.68629 21.3136 4 17.9999 4C14.6862 4 11.9999 6.68629 11.9999 10C11.9999 13.3137 14.6862 16 17.9999 16Z"
+		fill="url(#ms-teams-8)"
+		fill-opacity="0.6"
 	/>
 	<path
-		fill="#000000"
-		d="M8.163 5.52v.647a2.115 2.115 0 01-1.465-1.242h.87a.598.598 0 01.595.595z"
-		opacity=".2"
+		d="M17.9999 16C21.3136 16 23.9999 13.3137 23.9999 10C23.9999 6.68629 21.3136 4 17.9999 4C14.6862 4 11.9999 6.68629 11.9999 10C11.9999 13.3137 14.6862 16 17.9999 16Z"
+		fill="url(#ms-teams-9)"
+		fill-opacity="0.5"
 	/>
+	<rect x="4" y="23" width="16" height="16" rx="3.25" fill="url(#ms-teams-10)" />
+	<rect x="4" y="23" width="16" height="16" rx="3.25" fill="url(#ms-teams-11)" fill-opacity="0.7" />
 	<path
-		fill="url(#microsoft-teams-color-16__paint0_linear_2372_494)"
-		d="M1.597 4.925h5.969c.33 0 .597.267.597.596v5.958a.596.596 0 01-.597.596h-5.97A.596.596 0 011 11.479V5.521c0-.33.267-.596.597-.596z"
+		d="M15.4792 28.1054H13.0321V35.5714H10.9673V28.1054H8.52014V26.4286H15.4792V28.1054Z"
+		fill="white"
 	/>
-	<path fill="#ffffff" d="M6.152 7.193H4.959v3.243h-.76V7.193H3.01v-.63h3.141v.63z" />
 	<defs>
+		<radialGradient
+			id="ms-teams-0"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(39.7967 22.1739) scale(13.4784 33.2694)"
+		>
+			<stop stop-color="#A98AFF" />
+			<stop offset="0.14" stop-color="#8C75FF" />
+			<stop offset="0.565" stop-color="#5F50E2" />
+			<stop offset="0.9" stop-color="#3C2CB8" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-1"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(8.81238 16.4) rotate(68.1539) scale(32.752 33.1231)"
+		>
+			<stop stop-color="#85C2FF" />
+			<stop offset="0.69" stop-color="#7588FF" />
+			<stop offset="1" stop-color="#6459FE" />
+		</radialGradient>
 		<linearGradient
-			id="microsoft-teams-color-16__paint0_linear_2372_494"
-			x1="2.244"
-			x2="6.906"
-			y1="4.46"
-			y2="12.548"
+			id="ms-teams-2"
+			x1="20.5936"
+			y1="18"
+			x2="20.5936"
+			y2="42"
 			gradientUnits="userSpaceOnUse"
 		>
-			<stop stop-color="#5A62C3" />
-			<stop offset=".5" stop-color="#4D55BD" />
-			<stop offset="1" stop-color="#3940AB" />
+			<stop offset="0.801159" stop-color="#6864F6" stop-opacity="0" />
+			<stop offset="1" stop-color="#5149DE" />
 		</linearGradient>
+		<radialGradient
+			id="ms-teams-3"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(27.4999 17.2) rotate(113.326) scale(19.2186 15.4273)"
+		>
+			<stop stop-color="#BD96FF" />
+			<stop offset="0.686685" stop-color="#BD96FF" stop-opacity="0" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-4"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(32.9999 11.5714) rotate(-90) scale(10 12.6216)"
+		>
+			<stop offset="0.268201" stop-color="#6868F7" />
+			<stop offset="1" stop-color="#3923B1" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-5"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(28.8675 10.544) rotate(40.0516) scale(7.14629 10.3363)"
+		>
+			<stop offset="0.270711" stop-color="#A1D3FF" />
+			<stop offset="0.813393" stop-color="#A1D3FF" stop-opacity="0" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-6"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(36.9821 10.3686) rotate(-41.6581) scale(8.51275 20.8824)"
+		>
+			<stop stop-color="#E3ACFD" />
+			<stop offset="0.816041" stop-color="#9FA2FF" stop-opacity="0" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-7"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(17.9999 8.28571) rotate(-90) scale(12 15.146)"
+		>
+			<stop offset="0.268201" stop-color="#8282FF" />
+			<stop offset="1" stop-color="#3923B1" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-8"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(13.0411 7.05284) rotate(40.0516) scale(8.57554 12.4035)"
+		>
+			<stop offset="0.270711" stop-color="#A1D3FF" />
+			<stop offset="0.813393" stop-color="#A1D3FF" stop-opacity="0" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-9"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(22.7786 6.8423) rotate(-41.6581) scale(10.2153 25.0589)"
+		>
+			<stop stop-color="#E3ACFD" />
+			<stop offset="0.816041" stop-color="#9FA2FF" stop-opacity="0" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-10"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(4 23) rotate(45) scale(22.6274)"
+		>
+			<stop offset="0.046875" stop-color="#688EFF" />
+			<stop offset="0.946875" stop-color="#230F94" />
+		</radialGradient>
+		<radialGradient
+			id="ms-teams-11"
+			cx="0"
+			cy="0"
+			r="1"
+			gradientUnits="userSpaceOnUse"
+			gradientTransform="translate(12 32.6) rotate(90) scale(11.2 13.0702)"
+		>
+			<stop offset="0.570647" stop-color="#6965F6" stop-opacity="0" />
+			<stop offset="1" stop-color="#8F8FFF" />
+		</radialGradient>
 	</defs>
 </svg>

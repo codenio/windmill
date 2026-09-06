@@ -1,7 +1,6 @@
 use sqlx::{Pool, Postgres};
 
-mod common;
-use common::*;
+use windmill_test_utils::*;
 
 /// Test that the workspace success handler cache works correctly with 60s TTL
 #[cfg(feature = "deno_core")]
@@ -181,6 +180,7 @@ export async function main(path: string, email: string, job_id: string, is_flow:
         apply_preprocessor: false,
         concurrency_settings: ConcurrencySettings::default(),
         debouncing_settings: DebouncingSettings::default(),
+        labels: None,
     })
     .run_until_complete(&db, false, server.addr.port())
     .await;

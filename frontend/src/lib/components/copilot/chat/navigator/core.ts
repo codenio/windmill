@@ -3,7 +3,8 @@ import type {
 	ChatCompletionTool,
 	ChatCompletionUserMessageParam
 } from 'openai/resources/index.mjs'
-import type { Tool } from '../shared'
+import { createSearchWorkspaceTool, createGetRunnableDetailsTool, type Tool } from '../shared'
+import { readDocsPageTool, searchDocsTool } from '../docs/core'
 import { ResourceService } from '$lib/gen'
 import { workspaceStore } from '$lib/stores'
 import { get } from 'svelte/store'
@@ -15,12 +16,15 @@ Windmill is an open-source developer platform for building internal tools, API i
 
 You have access to these tools:
 1. View current buttons and inputs on the page (get_triggerable_components)
-2. Execute buttons and inputs (trigger_component) 
-3. Get documentation for user requests (get_documentation)
-4. Change the AI mode to the one specified (change_mode)
+2. Execute buttons and inputs (trigger_component)
+3. Search the documentation (search_docs)
+4. Read a documentation page (read_docs_page)
+5. Change the AI mode to the one specified (change_mode)
+6. Search for scripts and flows in the workspace (search_workspace)
+7. Get detailed information about a specific script or flow (get_runnable_details)
 
 INSTRUCTIONS:
-- When users ask about application features or concepts, first use get_documentation internally to retrieve accurate information about how to fulfill the user's request.
+- When users ask about application features or concepts, first use search_docs (with a few keywords) and, when a snippet is not enough, read_docs_page on a returned Source URL to retrieve accurate information about how to fulfill the user's request.
 - Then immediately use the available tools to guide the user through the application. Do not wait for the user's confirmation before taking action.
 - If you detect a confirmation modal that needs user confirmation, stop the navigation and let the user know that the action is pending confirmation.
 - Use get_triggerable_components to understand available options, and then trigger the components using trigger_component. Then wait a moment before rescanning the current page, and then continue with the next step. Do this 5 times max.
@@ -30,6 +34,10 @@ INSTRUCTIONS:
 - For form inputs where format starts with "resource-" and is not "resource-obj", fetch the available resources using get_available_resources, and then use the resource_path prefixed with "$res:" to fill the input.
 - If you are not sure about an input, set the ones you are sure about, and then ask the user for the value of the input you are not sure about.
 - If the user asks you to make an API call, switch to API mode with the change_mode tool before using the new tools you'll have access to to make the API call.
+
+- When users ask about existing scripts, flows, or building blocks in their workspace, use search_workspace to find them.
+- When users want to understand a specific script or flow (inputs, description, what it does), use get_runnable_details.
+- When users ask you to navigate to a specific script or flow, first search for it, then use the navigation tools to go to it.
 
 GENERAL PRINCIPLES:
 - Be concise but thorough
@@ -53,29 +61,11 @@ When you complete the user's request, do not say "I created..." or "I updated...
 
 Example of good behavior:
 - User: "How can I set my AI providers?"
-- You: <call get_documentation and fetch relevant documentation>
+- You: <call search_docs (and read_docs_page if needed) to fetch relevant documentation>
 - You: <call get_triggerable_components to find relevant components>
 - You: <trigger the components>
 - You: "<precisions about the request based on the documentation>"
 `
-
-const GET_DOCUMENTATION_TOOL: ChatCompletionTool = {
-	type: 'function',
-	function: {
-		name: 'get_documentation',
-		description: 'Get the documentation for the user request',
-		parameters: {
-			type: 'object',
-			properties: {
-				request: {
-					type: 'string',
-					description: 'The user request'
-				}
-			},
-			required: ['request']
-		}
-	}
-}
 
 // Tool definitions
 const GET_TRIGGERABLE_COMPONENTS_TOOL: ChatCompletionTool = {
@@ -228,47 +218,6 @@ function triggerComponent(args: { id: string; value: string }): string {
 	}
 }
 
-async function getDocumentation(args: { request: string }): Promise<string> {
-	const retrieval = await fetch('/api/inkeep', {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify({
-			query: args.request
-		})
-	})
-
-	if (!retrieval.ok) {
-		const errorText = await retrieval.text()
-		throw new Error(errorText)
-	}
-
-	const data = await retrieval.json()
-	if (!data.choices?.[0]?.message?.content) {
-		return 'No documentation found for this request'
-	}
-
-	// Parse the raw response
-	const raw = data.choices[0].message.content
-	const parsed = JSON.parse(raw)
-
-	// Clean up the response to include only essential information
-	if (parsed.content && Array.isArray(parsed.content)) {
-		const cleanedContent = parsed.content.map((item: any) => ({
-			title: item.title,
-			url: item.url,
-			content: item.source?.content.map((c: any) => c.text).join('\n') || []
-		}))
-		// Limit the response to 30000 characters max
-		const stringified = JSON.stringify({ content: cleanedContent }).slice(0, 30000)
-
-		return stringified
-	}
-
-	return data.choices[0].message.content
-}
-
 async function getAvailableResources(args: { resource_type: string }): Promise<string> {
 	const resources = await ResourceService.listResource({
 		workspace: get(workspaceStore) as string,
@@ -291,6 +240,7 @@ const triggerComponentTool: Tool<{}> = {
 
 const getTriggerableComponentsTool: Tool<{}> = {
 	def: GET_TRIGGERABLE_COMPONENTS_TOOL,
+	planModeSafe: true,
 	fn: async ({ toolId, toolCallbacks }) => {
 		toolCallbacks.setToolStatus(toolId, {
 			content: 'Scanning the page...'
@@ -305,6 +255,7 @@ const getTriggerableComponentsTool: Tool<{}> = {
 
 const getCurrentPageNameTool: Tool<{}> = {
 	def: GET_CURRENT_PAGE_NAME_TOOL,
+	planModeSafe: true,
 	fn: async ({ toolId, toolCallbacks }) => {
 		const pageName = getCurrentPageName()
 		toolCallbacks.setToolStatus(toolId, { content: 'Retrieved current page name' })
@@ -312,29 +263,9 @@ const getCurrentPageNameTool: Tool<{}> = {
 	}
 }
 
-export const getDocumentationTool: Tool<{}> = {
-	def: GET_DOCUMENTATION_TOOL,
-	fn: async ({ args, toolId, toolCallbacks }) => {
-		toolCallbacks.setToolStatus(toolId, { content: 'Getting documentation...' })
-		try {
-			const docResult = await getDocumentation(args)
-			toolCallbacks.setToolStatus(toolId, { content: 'Retrieved documentation' })
-			return docResult
-		} catch (error) {
-			toolCallbacks.setToolStatus(toolId, {
-				content: 'Error getting documentation',
-				error: 'Error getting documentation'
-			})
-			console.error('Error getting documentation:', error)
-			const errorMessage =
-				error instanceof Error ? error.message : 'An error occurred while getting documentation'
-			return `Failed to get documentation: ${errorMessage}, pursuing with the user request...`
-		}
-	}
-}
-
 const getAvailableResourcesTool: Tool<{}> = {
 	def: GET_AVAILABLE_RESOURCES_TOOL,
+	planModeSafe: true,
 	fn: async ({ args, toolId, toolCallbacks }) => {
 		toolCallbacks.setToolStatus(toolId, { content: 'Getting available resources...' })
 		try {
@@ -355,9 +286,12 @@ const getAvailableResourcesTool: Tool<{}> = {
 export const navigatorTools: Tool<{}>[] = [
 	getTriggerableComponentsTool,
 	triggerComponentTool,
-	getDocumentationTool,
+	searchDocsTool,
+	readDocsPageTool,
 	getCurrentPageNameTool,
-	getAvailableResourcesTool
+	getAvailableResourcesTool,
+	createSearchWorkspaceTool(),
+	createGetRunnableDetailsTool()
 ]
 
 export function prepareNavigatorSystemMessage(

@@ -7,6 +7,7 @@
 	import NumberTypeNarrowing from '../NumberTypeNarrowing.svelte'
 	import StringTypeNarrowing from '../StringTypeNarrowing.svelte'
 	import Tooltip from '../Tooltip.svelte'
+	import Toggle from '../Toggle.svelte'
 
 	import EditableSchemaForm from '../EditableSchemaForm.svelte'
 	import { deepEqual } from 'fast-equals'
@@ -35,6 +36,7 @@
 		nonEmpty?: boolean | undefined
 		isFlowInput?: boolean
 		isAppInput?: boolean
+		showSensitiveToggle?: boolean
 		order?: string[] | undefined
 		itemsType?:
 			| {
@@ -47,6 +49,7 @@
 			| undefined
 		typeeditor?: import('svelte').Snippet
 		children?: import('svelte').Snippet
+		workspace?: string | undefined
 	}
 
 	let {
@@ -66,10 +69,12 @@
 		properties = $bindable(),
 		isFlowInput = false,
 		isAppInput = false,
+		showSensitiveToggle = false,
 		order = $bindable(),
 		itemsType = $bindable(undefined),
 		typeeditor,
-		children
+		children,
+		workspace
 	}: Props = $props()
 
 	$effect.pre(() => {
@@ -222,6 +227,7 @@
 				bind:itemsType
 				canEditResourceType={isFlowInput || isAppInput}
 				bind:nonEmpty
+				{workspace}
 			/>
 		{:else if type == 'string' || ['number', 'integer'].includes(type ?? '')}
 			<div>
@@ -249,6 +255,7 @@
 								bind:max={extra['max']}
 								bind:currency={extra['currency']}
 								bind:currencyLocale={extra['currencyLocale']}
+								bind:seconds={extra['seconds']}
 							/>
 						{/if}
 					</div>
@@ -272,6 +279,7 @@
 						uiOnly
 						jsonEnabled={false}
 						editTab="inputEditor"
+						{workspace}
 					/>
 				</div>
 			{/if}
@@ -284,10 +292,31 @@
 					uiOnly
 					jsonEnabled={false}
 					editTab="inputEditor"
+					{workspace}
 				/>
 			</div>
 		{/if}
 
 		{@render children?.()}
+
+		{#if type == 'object' && showSensitiveToggle}
+			<Toggle
+				size="xs"
+				options={{
+					right: 'Is sensitive',
+					rightTooltip:
+						'The value will be stored as an ephemeral secret variable in the user space of the caller of the job, only viewable by him.'
+				}}
+				checked={extra['password'] ?? false}
+				on:change={(e) => {
+					if (e.detail) {
+						extra['password'] = true
+					} else {
+						extra['password'] = undefined
+					}
+					dispatch('change')
+				}}
+			/>
+		{/if}
 	</div>
 </div>

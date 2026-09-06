@@ -16,17 +16,58 @@ use windmill_parser::{json_to_typ, Arg, MainArgSignature, ObjectType, Typ};
 use rustpython_parser::{
     ast::{
         Constant, Expr, ExprAttribute, ExprConstant, ExprDict, ExprList, ExprName, Stmt,
-        StmtAssign, StmtClassDef, StmtFunctionDef, Suite,
+        StmtAssign, StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef, Suite,
     },
     Parse,
 };
 
-pub mod asset_parser;
 pub mod pydantic_parser;
 
-pub use asset_parser::parse_assets;
-
 const FUNCTION_CALL: &str = "<function call>";
+
+/// Get the simple type name from an expression (e.g. `str`, `int`).
+fn simple_type_name(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Name(ExprName { id, .. }) => Some(id.as_ref()),
+        _ => None,
+    }
+}
+
+/// If `e` is `list[T]` or `List[T]`, return the inner expression `T`.
+fn list_elem_expr(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Subscript(x) => match x.value.as_ref() {
+            Expr::Name(ExprName { id, .. }) if id == "list" || id == "List" => {
+                Some(x.slice.as_ref())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Detect `T | list[T]` or `list[T] | T` union patterns.
+/// Returns the original type string (e.g. "str | list[str]") for use as `otyp`.
+fn detect_py_union_array_otyp(e: &Expr) -> Option<String> {
+    let Expr::BinOp(x) = e else { return None };
+    // T | list[T]
+    if let (Some(scalar), Some(elem)) = (simple_type_name(&x.left), list_elem_expr(&x.right)) {
+        if let Some(elem_name) = simple_type_name(elem) {
+            if scalar == elem_name {
+                return Some(format!("{} | list[{}]", scalar, elem_name));
+            }
+        }
+    }
+    // list[T] | T
+    if let (Some(elem), Some(scalar)) = (list_elem_expr(&x.left), simple_type_name(&x.right)) {
+        if let Some(elem_name) = simple_type_name(elem) {
+            if scalar == elem_name {
+                return Some(format!("list[{}] | {}", elem_name, scalar));
+            }
+        }
+    }
+    None
+}
 
 /// Cheap string-based check to see if code might contain Pydantic models or dataclasses.
 /// Returns true if we should do full AST parsing for type detection, false otherwise.
@@ -42,13 +83,21 @@ fn should_parse_for_models(code: &str) -> bool {
 
 fn filter_non_main(code: &str, main_name: &str) -> String {
     let def_main = format!("def {}(", main_name);
+    let async_def_main = format!("async def {}(", main_name);
     let mut filtered_code = String::new();
     let mut code_iter = code.split("\n");
     let mut remaining: String = String::new();
     while let Some(line) = code_iter.next() {
-        if line.starts_with(&def_main) {
+        if line.starts_with(&async_def_main) {
+            filtered_code += &async_def_main;
+            remaining += line.strip_prefix(&async_def_main).unwrap();
+            remaining += "\n";
+            remaining += &code_iter.join("\n");
+            break;
+        } else if line.starts_with(&def_main) {
             filtered_code += &def_main;
             remaining += line.strip_prefix(&def_main).unwrap();
+            remaining += "\n";
             remaining += &code_iter.join("\n");
             break;
         }
@@ -269,6 +318,11 @@ pub fn parse_python_signature(
             Stmt::FunctionDef(StmtFunctionDef { name, args, .. }) if name == &main_name => {
                 Some(args.as_ref().clone())
             }
+            Stmt::AsyncFunctionDef(StmtAsyncFunctionDef { name, args, .. })
+                if name == &main_name =>
+            {
+                Some(args.as_ref().clone())
+            }
             _ => None,
         });
 
@@ -287,6 +341,11 @@ pub fn parse_python_signature(
                 Stmt::FunctionDef(StmtFunctionDef { name, args, .. }) if &name == &main_name => {
                     Some(*args)
                 }
+                Stmt::AsyncFunctionDef(StmtAsyncFunctionDef { name, args, .. })
+                    if &name == &main_name =>
+                {
+                    Some(*args)
+                }
                 _ => None,
             });
 
@@ -294,14 +353,26 @@ pub fn parse_python_signature(
         }
     };
 
+    // Mirror the runtime detector `is_wac_v2_py` in `windmill-worker/src/wac_executor.rs`:
+    // a wmill import + an `@workflow` decorator is sufficient. `@task` is optional —
+    // a workflow that only uses inline `step()` calls still goes through the WAC runner,
+    // and labelling it as `wac` here is what aligns the editor badge with execution.
+    let is_wac_v2 = (code.contains("@workflow") || code.contains("workflow("))
+        && (code.contains("import wmill") || code.contains("from wmill"));
+
     // Check if main function was found
     if params.is_none() {
         return Ok(MainArgSignature {
             star_args: false,
             star_kwargs: false,
             args: vec![],
-            no_main_func: Some(true),
+            auto_kind: if is_wac_v2 {
+                Some("wac".to_string())
+            } else {
+                Some("lib".to_string())
+            },
             has_preprocessor: Some(has_preprocessor),
+            ..Default::default()
         });
     }
 
@@ -390,26 +461,50 @@ pub fn parse_python_signature(
                         _ => {}
                     }
 
+                    // Detect T | list[T] union types and set otyp for
+                    // debounce accumulation support. Falls back to docstring
+                    // description if no union array pattern is found.
+                    let union_otyp = params.args[i]
+                        .as_arg()
+                        .annotation
+                        .as_ref()
+                        .and_then(|ann| detect_py_union_array_otyp(ann.as_ref()));
+
                     Arg {
-                        otyp: metadata.descriptions.get(&arg_name).map(|d| d.to_string()),
+                        otyp: union_otyp.or_else(|| {
+                            metadata.descriptions.get(&arg_name).map(|d| d.to_string())
+                        }),
                         name: arg_name,
                         typ,
                         has_default: has_default || default.is_some(),
                         default,
                         oidx: None,
+                        otyp_inferred: false,
                     }
                 })
                 .collect(),
-            no_main_func: Some(false),
+            auto_kind: if is_wac_v2 {
+                Some("wac".to_string())
+            } else {
+                None
+            },
             has_preprocessor: Some(has_preprocessor),
+            ..Default::default()
         })
     } else {
         Ok(MainArgSignature {
             star_args: false,
             star_kwargs: false,
             args: vec![],
-            no_main_func: Some(params.is_none()),
+            auto_kind: if is_wac_v2 {
+                Some("wac".to_string())
+            } else if params.is_none() {
+                Some("lib".to_string())
+            } else {
+                None
+            },
             has_preprocessor: Some(has_preprocessor),
+            ..Default::default()
         })
     }
 }
@@ -422,11 +517,15 @@ fn parse_expr(
     match e.as_ref() {
         Expr::Name(ExprName { id, .. }) => (parse_typ(id.as_ref(), enums, module), false),
         Expr::Attribute(x) => {
-            if x.value
-                .as_name_expr()
-                .is_some_and(|x| x.id.as_str() == "wmill")
-            {
-                (parse_typ(x.attr.as_str(), enums, module), false)
+            if let Some(name) = x.value.as_name_expr() {
+                match name.id.as_str() {
+                    "wmill" => (parse_typ(x.attr.as_str(), enums, module), false),
+                    "datetime" => {
+                        let full_name = format!("datetime.{}", x.attr.as_str());
+                        (parse_typ(&full_name, enums, module), false)
+                    }
+                    _ => (Typ::Unknown, false),
+                }
             } else {
                 (Typ::Unknown, false)
             }
@@ -437,6 +536,9 @@ fn parse_expr(
                 Expr::Constant(ExprConstant { value: Constant::None, .. })
             ) {
                 (parse_expr(&x.left, enums, module).0, true)
+            } else if detect_py_union_array_otyp(e.as_ref()).is_some() {
+                // T | list[T] — parsed type is Unknown; otyp is set separately
+                (Typ::Unknown, false)
             } else {
                 (Typ::Unknown, false)
             }
@@ -493,6 +595,8 @@ fn parse_typ(id: &str, enums: &HashMap<String, EnumInfo>, module: Option<&[Stmt]
         "bytes" => Typ::Bytes,
         "datetime" => Typ::Datetime,
         "datetime.datetime" => Typ::Datetime,
+        "date" => Typ::Date,
+        "datetime.date" => Typ::Date,
         "Sql" | "sql" => Typ::Sql,
         x @ _ if x.starts_with("DynSelect_") => {
             Typ::DynSelect(x.strip_prefix("DynSelect_").unwrap().to_string())
@@ -615,15 +719,17 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         typ: Typ::Str(None),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
                         name: "name".to_string(),
-                        typ: Typ::Unknown,
+                        typ: Typ::Datetime,
                         default: Some(json!("<function call>")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -631,7 +737,8 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         typ: Typ::Bytes,
                         default: Some(json!("<function call>")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -639,7 +746,8 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         typ: Typ::Str(None),
                         default: Some(json!("wewe")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -647,7 +755,8 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         typ: Typ::Int,
                         default: Some(json!(21)),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -655,7 +764,8 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         typ: Typ::List(Box::new(Typ::Int)),
                         default: Some(json!([1, 2])),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -663,11 +773,13 @@ def main(test1: str, name: datetime.datetime = datetime.now(), byte: bytes = byt
                         typ: Typ::Bool,
                         default: Some(json!(true)),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -704,15 +816,17 @@ def main(test1: str,
                         typ: Typ::Str(None),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
                         name: "name".to_string(),
-                        typ: Typ::Unknown,
+                        typ: Typ::Datetime,
                         default: Some(json!("<function call>")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -720,7 +834,8 @@ def main(test1: str,
                         typ: Typ::Bytes,
                         default: Some(json!("<function call>")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -728,11 +843,13 @@ def main(test1: str,
                         typ: Typ::Resource("postgresql".to_string()),
                         default: Some(json!("$res:g/all/resource")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     }
                 ],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -764,7 +881,8 @@ def main(test1: str,
                         typ: Typ::Str(None),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -772,7 +890,8 @@ def main(test1: str,
                         typ: Typ::Resource("s3_object".to_string()),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -780,7 +899,8 @@ def main(test1: str,
                         typ: Typ::Str(None),
                         default: Some(json!("test")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -788,11 +908,13 @@ def main(test1: str,
                         typ: Typ::Bytes,
                         default: Some(json!("<function call>")),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     }
                 ],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -821,7 +943,8 @@ def main(test1: Literal["foo", "bar"], test2: List[Literal["foo", "bar"]]): retu
                         typ: Typ::Str(Some(vec!["foo".to_string(), "bar".to_string()])),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -832,11 +955,13 @@ def main(test1: Literal["foo", "bar"], test2: List[Literal["foo", "bar"]]): retu
                         ])))),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     }
                 ],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -864,10 +989,12 @@ def main(test1: DynSelect_foo): return
                     typ: Typ::DynSelect("foo".to_string()),
                     default: None,
                     has_default: false,
-                    oidx: None
+                    oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -890,8 +1017,9 @@ def hello(): return
                 star_args: false,
                 star_kwargs: false,
                 args: vec![],
-                no_main_func: Some(true),
-                has_preprocessor: Some(false)
+                auto_kind: Some("lib".to_string()),
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -918,11 +1046,92 @@ def main(): return
                 star_args: false,
                 star_kwargs: false,
                 args: vec![],
-                no_main_func: Some(false),
-                has_preprocessor: Some(true)
+                auto_kind: None,
+                has_preprocessor: Some(true),
+                ..Default::default()
             }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_python_sig_trailing_comment_on_def_line() -> anyhow::Result<()> {
+        let code = r#"
+def main(  # comment
+    test1: str,
+    test2: int,
+): return
+"#;
+        assert_eq!(
+            parse_python_signature(code, None, false)?,
+            MainArgSignature {
+                star_args: false,
+                star_kwargs: false,
+                args: vec![
+                    Arg {
+                        otyp: None,
+                        name: "test1".to_string(),
+                        typ: Typ::Str(None),
+                        default: None,
+                        has_default: false,
+                        oidx: None,
+                        otyp_inferred: false,
+                    },
+                    Arg {
+                        otyp: None,
+                        name: "test2".to_string(),
+                        typ: Typ::Int,
+                        default: None,
+                        has_default: false,
+                        oidx: None,
+                        otyp_inferred: false,
+                    }
+                ],
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_python_wac_step_only() -> anyhow::Result<()> {
+        // A WAC script that uses inline step() instead of @task should still be
+        // detected as auto_kind = "wac" — the runtime path treats @task as
+        // optional, and the editor badge needs to match.
+        let code = r#"
+from wmill import workflow, step
+
+@workflow
+async def main(x: str):
+    return await step("k", lambda: x.upper())
+"#;
+        let sig = parse_python_signature(code, None, false)?;
+        assert_eq!(sig.auto_kind, Some("wac".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_python_wac_main_decorator() -> anyhow::Result<()> {
+        // Reproducer for issue #8945: a workflow-as-code script using the
+        // standard `@workflow async def main(...)` template must be detected
+        // as auto_kind = "wac", not None.
+        let code = r#"
+from wmill import task, workflow
+
+@task()
+async def process(x: str) -> str:
+    return x
+
+@workflow
+async def main(x: str):
+    return await process(x)
+"#;
+        let sig = parse_python_signature(code, None, false)?;
+        assert_eq!(sig.auto_kind, Some("wac".to_string()));
         Ok(())
     }
 
@@ -948,7 +1157,8 @@ def main(a: list, e: List[int], b: list = [1,2,3,4], c = [1,2,3,4], d = ["a", "b
                         typ: Typ::List(Box::new(Typ::Str(None))),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -956,7 +1166,8 @@ def main(a: list, e: List[int], b: list = [1,2,3,4], c = [1,2,3,4], d = ["a", "b
                         typ: Typ::List(Box::new(Typ::Int)),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -964,7 +1175,8 @@ def main(a: list, e: List[int], b: list = [1,2,3,4], c = [1,2,3,4], d = ["a", "b
                         typ: Typ::List(Box::new(Typ::Int)),
                         default: Some(json!([1, 2, 3, 4])),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -972,7 +1184,8 @@ def main(a: list, e: List[int], b: list = [1,2,3,4], c = [1,2,3,4], d = ["a", "b
                         typ: Typ::List(Box::new(Typ::Int)),
                         default: Some(json!([1, 2, 3, 4])),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -980,11 +1193,13 @@ def main(a: list, e: List[int], b: list = [1,2,3,4], c = [1,2,3,4], d = ["a", "b
                         typ: Typ::List(Box::new(Typ::Str(None))),
                         default: Some(json!(["a", "b"])),
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     }
                 ],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
 
@@ -1013,7 +1228,8 @@ def main(a: str, b: Optional[str], c: str | None): return
                         typ: Typ::Str(None),
                         default: None,
                         has_default: false,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -1021,7 +1237,8 @@ def main(a: str, b: Optional[str], c: str | None): return
                         typ: Typ::Str(None),
                         default: None,
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         otyp: None,
@@ -1029,13 +1246,42 @@ def main(a: str, b: Optional[str], c: str | None): return
                         typ: Typ::Str(None),
                         default: None,
                         has_default: true,
-                        oidx: None
+                        oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
-                has_preprocessor: Some(false)
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_python_union_array_type() -> anyhow::Result<()> {
+        let code = r#"
+def main(items: str | list[str], numbers: list[int] | int, plain: str):
+    pass
+"#;
+        let result = parse_python_signature(code, None, false)?;
+        assert_eq!(result.args.len(), 3);
+
+        // str | list[str] → otyp set, typ Unknown
+        assert_eq!(result.args[0].name, "items");
+        assert_eq!(result.args[0].otyp, Some("str | list[str]".to_string()));
+        assert_eq!(result.args[0].typ, Typ::Unknown);
+
+        // list[int] | int → otyp set, typ Unknown
+        assert_eq!(result.args[1].name, "numbers");
+        assert_eq!(result.args[1].otyp, Some("list[int] | int".to_string()));
+        assert_eq!(result.args[1].typ, Typ::Unknown);
+
+        // plain str → no otyp
+        assert_eq!(result.args[2].name, "plain");
+        assert_eq!(result.args[2].otyp, None);
+        assert_eq!(result.args[2].typ, Typ::Str(None));
 
         Ok(())
     }

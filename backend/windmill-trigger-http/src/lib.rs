@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use quick_cache::sync::Cache;
 use serde::{Deserialize, Serialize};
@@ -7,11 +8,12 @@ use tokio::sync::{RwLock, RwLockReadGuard};
 use windmill_common::{
     error::{Error, Result},
     flows::Retry,
-    s3_helpers::S3Object,
+    global_settings::HTTP_ROUTE_WORKSPACED_ROUTE,
     utils::ExpiringCacheEntry,
     worker::CLOUD_HOSTED,
     DB,
 };
+use windmill_types::s3::S3Object;
 
 use windmill_api_auth::ApiAuthed;
 use windmill_trigger::TriggerMode;
@@ -26,8 +28,11 @@ lazy_static::lazy_static! {
     pub static ref HTTP_ROUTERS_CACHE: RwLock<RoutersCache> = RwLock::new(RoutersCache {
         routers: HashMap::new(),
         version: 0,
+        invalidations: 0,
     });
 }
+
+static HTTP_ROUTERS_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TriggerRoute {
@@ -39,7 +44,7 @@ pub struct TriggerRoute {
     pub request_type: RequestType,
     pub authentication_method: AuthenticationMethod,
     pub edited_by: String,
-    pub email: String,
+    pub permissioned_as: String,
     pub static_asset_config: Option<sqlx::types::Json<S3Object>>,
     pub is_static_website: bool,
     pub authentication_resource_path: Option<String>,
@@ -55,6 +60,10 @@ pub struct TriggerRoute {
 pub struct RoutersCache {
     pub routers: HashMap<HttpMethod, matchit::Router<TriggerRoute>>,
     pub version: i64,
+    /// `HTTP_ROUTERS_INVALIDATIONS` as of the moment these rows were read. A rebuild that
+    /// started before an invalidation publishes a count behind the current one, which is what
+    /// stops it from passing its own stale rows off as covering that invalidation.
+    invalidations: u64,
 }
 
 #[derive(Serialize, Deserialize, sqlx::Type, Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -222,12 +231,24 @@ pub fn validate_authentication_method(
     }
 }
 
-pub async fn refresh_routers(db: &DB) -> Result<(bool, RwLockReadGuard<'_, RoutersCache>)> {
+/// `force` rebuilds unconditionally. `nextval` on `http_trigger_version_seq` runs inside the
+/// writing transaction and sequences are non-transactional, so another session can cache the
+/// bumped version against still-uncommitted rows, after which every version-gated refresh is a
+/// no-op. Force when reacting to a bump that could have been observed before its own rows were.
+pub async fn refresh_routers(
+    db: &DB,
+    force: bool,
+) -> Result<(bool, RwLockReadGuard<'_, RoutersCache>)> {
+    let invalidations = HTTP_ROUTERS_INVALIDATIONS.load(Ordering::Relaxed);
     let version = sqlx::query_scalar!("SELECT last_value FROM http_trigger_version_seq",)
         .fetch_one(db)
         .await?;
     let routers_cache = HTTP_ROUTERS_CACHE.read().await;
-    if routers_cache.version == 0 || version > routers_cache.version {
+    if force
+        || routers_cache.version == 0
+        || version > routers_cache.version
+        || invalidations != routers_cache.invalidations
+    {
         drop(routers_cache);
         let mut routers = HashMap::new();
 
@@ -251,7 +272,7 @@ pub async fn refresh_routers(db: &DB) -> Result<(bool, RwLockReadGuard<'_, Route
                         request_type AS "request_type: _",
                         authentication_method  AS "authentication_method: _",
                         edited_by,
-                        email,
+                        permissioned_as,
                         static_asset_config AS "static_asset_config: _",
                         wrap_body,
                         raw_string,
@@ -273,13 +294,16 @@ pub async fn refresh_routers(db: &DB) -> Result<(bool, RwLockReadGuard<'_, Route
             .await?;
 
             let mut router = matchit::Router::new();
+            let http_route_workspaced =
+                HTTP_ROUTE_WORKSPACED_ROUTE.load(std::sync::atomic::Ordering::Relaxed);
 
             for trigger in triggers {
-                let full_path = if trigger.workspaced_route || *CLOUD_HOSTED {
-                    format!("/{}/{}", trigger.workspace_id, trigger.route_path)
-                } else {
-                    format!("/{}", trigger.route_path)
-                };
+                let full_path =
+                    if trigger.workspaced_route || *CLOUD_HOSTED || http_route_workspaced {
+                        format!("/{}/{}", trigger.workspace_id, trigger.route_path)
+                    } else {
+                        format!("/{}", trigger.route_path)
+                    };
 
                 if trigger.is_static_website {
                     router
@@ -303,7 +327,7 @@ pub async fn refresh_routers(db: &DB) -> Result<(bool, RwLockReadGuard<'_, Route
         }
 
         let mut routers_cache = HTTP_ROUTERS_CACHE.write().await;
-        *routers_cache = RoutersCache { routers, version };
+        *routers_cache = RoutersCache { routers, version, invalidations };
 
         Ok((true, routers_cache.downgrade()))
     } else {
@@ -312,11 +336,19 @@ pub async fn refresh_routers(db: &DB) -> Result<(bool, RwLockReadGuard<'_, Route
     }
 }
 
+/// Record that the cache no longer covers everything committed, so the next refresh rebuilds
+/// whatever the version says. The routes already loaded keep being served in the meantime. Use
+/// after a forced refresh fails: its change is inside the cached version, so nothing else would
+/// retry it.
+pub fn invalidate_routers() {
+    HTTP_ROUTERS_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub async fn refresh_routers_loop(
     db: &DB,
     mut killpill_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> () {
-    match refresh_routers(db).await {
+    match refresh_routers(db, false).await {
         Ok(_) => {
             tracing::info!("Loaded HTTP routers");
         }
@@ -332,7 +364,7 @@ pub async fn refresh_routers_loop(
                     break;
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    match refresh_routers(&db).await {
+                    match refresh_routers(&db, false).await {
                         Ok((true, _)) => {
                             tracing::info!("Refreshed HTTP routers");
                         }
@@ -409,5 +441,201 @@ mod tests {
         }"#;
         let config: HttpConfigRequest = serde_json::from_str(json_both).unwrap();
         assert_eq!(config.request_type, RequestType::SyncSse);
+    }
+
+    // --- HttpMethod ---
+
+    #[test]
+    fn test_http_method_from_http_get() {
+        let method = HttpMethod::try_from(&http::Method::GET).unwrap();
+        assert_eq!(method, HttpMethod::Get);
+    }
+
+    #[test]
+    fn test_http_method_from_http_post() {
+        let method = HttpMethod::try_from(&http::Method::POST).unwrap();
+        assert_eq!(method, HttpMethod::Post);
+    }
+
+    #[test]
+    fn test_http_method_from_http_put() {
+        let method = HttpMethod::try_from(&http::Method::PUT).unwrap();
+        assert_eq!(method, HttpMethod::Put);
+    }
+
+    #[test]
+    fn test_http_method_from_http_delete() {
+        let method = HttpMethod::try_from(&http::Method::DELETE).unwrap();
+        assert_eq!(method, HttpMethod::Delete);
+    }
+
+    #[test]
+    fn test_http_method_from_http_patch() {
+        let method = HttpMethod::try_from(&http::Method::PATCH).unwrap();
+        assert_eq!(method, HttpMethod::Patch);
+    }
+
+    #[test]
+    fn test_http_method_unsupported() {
+        let result = HttpMethod::try_from(&http::Method::HEAD);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_http_method_options_unsupported() {
+        let result = HttpMethod::try_from(&http::Method::OPTIONS);
+        assert!(result.is_err());
+    }
+
+    // --- HttpMethod serde ---
+
+    #[test]
+    fn test_http_method_serde_roundtrip() {
+        for method in [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Delete,
+            HttpMethod::Patch,
+        ] {
+            let json = serde_json::to_value(method).unwrap();
+            let deserialized: HttpMethod = serde_json::from_value(json).unwrap();
+            assert_eq!(method, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_http_method_serialize_lowercase() {
+        assert_eq!(serde_json::to_value(HttpMethod::Get).unwrap(), "get");
+        assert_eq!(serde_json::to_value(HttpMethod::Post).unwrap(), "post");
+    }
+
+    // --- RequestType serde ---
+
+    #[test]
+    fn test_request_type_serde_roundtrip() {
+        for rt in [RequestType::Sync, RequestType::Async, RequestType::SyncSse] {
+            let json = serde_json::to_value(rt).unwrap();
+            let deserialized: RequestType = serde_json::from_value(json).unwrap();
+            assert_eq!(rt, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_request_type_serialize_values() {
+        assert_eq!(serde_json::to_value(RequestType::Sync).unwrap(), "sync");
+        assert_eq!(serde_json::to_value(RequestType::Async).unwrap(), "async");
+        assert_eq!(
+            serde_json::to_value(RequestType::SyncSse).unwrap(),
+            "sync_sse"
+        );
+    }
+
+    // --- AuthenticationMethod serde ---
+
+    #[test]
+    fn test_authentication_method_serde_roundtrip() {
+        for method in [
+            AuthenticationMethod::None,
+            AuthenticationMethod::Windmill,
+            AuthenticationMethod::ApiKey,
+            AuthenticationMethod::BasicHttp,
+            AuthenticationMethod::CustomScript,
+            AuthenticationMethod::Signature,
+        ] {
+            let json = serde_json::to_value(method).unwrap();
+            let deserialized: AuthenticationMethod = serde_json::from_value(json).unwrap();
+            assert_eq!(method, deserialized);
+        }
+    }
+
+    // --- validate_authentication_method ---
+
+    #[test]
+    fn test_validate_auth_none_ok() {
+        assert!(validate_authentication_method(AuthenticationMethod::None, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_auth_windmill_ok() {
+        assert!(validate_authentication_method(AuthenticationMethod::Windmill, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_auth_custom_script_requires_raw() {
+        assert!(validate_authentication_method(AuthenticationMethod::CustomScript, None).is_err());
+        assert!(
+            validate_authentication_method(AuthenticationMethod::CustomScript, Some(false))
+                .is_err()
+        );
+        assert!(
+            validate_authentication_method(AuthenticationMethod::CustomScript, Some(true)).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_auth_signature_without_raw_ok() {
+        assert!(validate_authentication_method(AuthenticationMethod::Signature, None).is_ok());
+    }
+
+    // --- Route path regex ---
+
+    #[test]
+    fn test_valid_route_path() {
+        assert!(VALID_ROUTE_PATH_RE.is_match("users"));
+        assert!(VALID_ROUTE_PATH_RE.is_match("users/:id"));
+        assert!(VALID_ROUTE_PATH_RE.is_match("api/v1/users"));
+        assert!(VALID_ROUTE_PATH_RE.is_match("api/v1/:id"));
+        assert!(VALID_ROUTE_PATH_RE.is_match("files/*path"));
+    }
+
+    #[test]
+    fn test_invalid_route_path() {
+        assert!(!VALID_ROUTE_PATH_RE.is_match(""));
+        assert!(!VALID_ROUTE_PATH_RE.is_match("/leading-slash"));
+    }
+
+    #[test]
+    fn test_route_path_key_regex() {
+        assert!(ROUTE_PATH_KEY_RE.is_match("/:id"));
+        assert!(ROUTE_PATH_KEY_RE.is_match("/*path"));
+        assert!(ROUTE_PATH_KEY_RE.is_match("/users/:userId/posts/:postId"));
+    }
+
+    // --- HttpConfig deserialization ---
+
+    #[test]
+    fn test_http_config_request_full() {
+        let json = r#"{
+            "route_path": "api/v1/users",
+            "request_type": "async",
+            "authentication_method": "api_key",
+            "http_method": "post",
+            "is_static_website": false,
+            "workspaced_route": true,
+            "wrap_body": true,
+            "raw_string": false
+        }"#;
+        let config: HttpConfigRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(config.route_path, "api/v1/users");
+        assert_eq!(config.request_type, RequestType::Async);
+        assert_eq!(config.authentication_method, AuthenticationMethod::ApiKey);
+        assert_eq!(config.http_method, HttpMethod::Post);
+        assert_eq!(config.workspaced_route, Some(true));
+        assert_eq!(config.wrap_body, Some(true));
+    }
+
+    #[test]
+    fn test_http_config_request_minimal() {
+        let json = r#"{
+            "authentication_method": "none",
+            "http_method": "get",
+            "is_static_website": false
+        }"#;
+        let config: HttpConfigRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(config.route_path, "");
+        assert_eq!(config.request_type, RequestType::Sync);
+        assert!(config.workspaced_route.is_none());
+        assert!(config.summary.is_none());
     }
 }

@@ -72,6 +72,66 @@
 	}
 
 	const barHeight = 32
+
+	// Whole approval-wait machinery below is inert unless a step actually has a suspend config,
+	// so large suspend-free flows pay nothing for the flatten/sort and the per-tick recompute.
+	const hasSuspendModule = $derived(flowModules.some((m) => m.suspend))
+
+	// Push times of every job on the timeline, ascending. Used to locate when the step
+	// that follows an approval step started — i.e. the moment the approval was granted.
+	const allCreatedAts = $derived(
+		hasSuspendModule
+			? Object.values(items ?? {})
+					.flat()
+					.map((j) => j.created_at)
+					.filter((t): t is number => t != undefined)
+					.sort((a, b) => a - b)
+			: []
+	)
+
+	// Heuristic: the grant moment is approximated by the next job pushed anywhere on the
+	// timeline. Exact for sequential flows; for an approval step inside one branch of a
+	// parallel branchall a concurrent sibling job can land first and understate the wait.
+	function nextCreatedAtAfter(t: number): number | undefined {
+		return allCreatedAts.find((c) => c > t)
+	}
+
+	// For a completed suspend/approval step, the time spent waiting for the approval is the
+	// gap between the step finishing and the next step being pushed (or now, if still waiting).
+	function approvalWait(b: {
+		started_at?: number
+		duration_ms?: number
+	}): { start: number; len: number; running: boolean } | undefined {
+		if (b.started_at == undefined || b.duration_ms == undefined) {
+			return undefined
+		}
+		const end = b.started_at + b.duration_ms
+		const next = nextCreatedAtAfter(end)
+		const waitEnd = next ?? (flowDone ? undefined : now)
+		if (waitEnd == undefined) {
+			return undefined
+		}
+		const len = waitEnd - end
+		if (len < 100) {
+			return undefined
+		}
+		return { start: end, len, running: next == undefined }
+	}
+
+	// Approval wait per module id, computed once and consumed by both the rows and the legend.
+	const approvalWaitByModule = $derived.by(() => {
+		const result: Record<string, { start: number; len: number; running: boolean }> = {}
+		for (const m of flowModules) {
+			if (!m.suspend) continue
+			const sub = (items?.[m.id] ?? []).filter((x) => x.created_at && x.started_at)
+			if (sub.length !== 1) continue
+			const aw = approvalWait(sub[0])
+			if (aw) result[m.id] = aw
+		}
+		return result
+	})
+
+	const hasApprovalWait = $derived(Object.keys(approvalWaitByModule).length > 0)
 </script>
 
 <OnChange
@@ -81,36 +141,37 @@
 	}}
 />
 {#if items}
-	<div class="divide-y border-b">
-		<div class="px-2 py-2 grid grid-cols-12 w-full"
-			><div></div>
-			<div class="col-span-11 pt-1 px-2 flex text-2xs text-secondary justify-between"
-				><div>{min ? displayDate(new Date(min), true) : ''}</div>{#if max && min}<div
-						class="hidden lg:block">{msToSec(max - min, 1)}s</div
-					>
-				{/if}<div class="flex gap-1 items-center font-mono"
-					>{max ? displayDate(new Date(max), true) : ''}{#if !max && min}{#if now}
-							{msToSec(now - min, 1)}s
-						{/if}<Loader2 size={14} class="animate-spin" />{/if}</div
-				></div
-			>
-		</div>
-		<div class="flex flex-row-reverse items-center text-sm text-secondary p-2">
-			<div class="flex gap-4 items-center text-2xs">
-				<div class="flex gap-2 items-center">
-					<div>Waiting for executor/Suspend</div>
-					<div class="h-4 w-4 bg-gray-500"></div>
+	<div class="divide-y">
+		<div class="px-3 py-1.5 flex items-center justify-between text-2xs text-secondary">
+			<div class="flex gap-1 items-center font-mono">
+				{min ? displayDate(new Date(min), true) : ''}
+			</div>
+			<div class="flex gap-3 items-center">
+				<div class="flex gap-1.5 items-center">
+					<div class="h-2.5 w-2.5 rounded-sm bg-gray-400 dark:bg-gray-500"></div>
+					<span>Wait</span>
 				</div>
-
-				<div class="flex gap-2 items-center">
-					<div>Execution</div>
-					<div class="h-4 w-4 bg-blue-500/90"></div>
+				<div class="flex gap-1.5 items-center">
+					<div class="h-2.5 w-2.5 rounded-sm bg-blue-500/90"></div>
+					<span>Execution</span>
 				</div>
+				{#if hasApprovalWait}
+					<div class="flex gap-1.5 items-center">
+						<div class="h-2.5 w-2.5 rounded-sm bg-purple-400/80"></div>
+						<span>Approval wait</span>
+					</div>
+				{/if}
+				{#if max && min}
+					<span class="font-mono">{msToSec(max - min, 1)}s</span>
+				{/if}
+				{#if !max && min}{#if now}
+						<span class="font-mono">{msToSec(now - min, 1)}s</span>
+					{/if}<Loader2 size={14} class="animate-spin" />{/if}
 			</div>
 		</div>
 		{#if selfWaitTime}
-			<div class="px-2 py-2 grid grid-cols-6 w-full">
-				root:
+			<div class="px-3 py-1.5 flex items-center gap-2">
+				<span class="text-xs text-secondary">root:</span>
 				<WaitTimeWarning
 					self_wait_time_ms={selfWaitTime}
 					aggregate_wait_time_ms={aggregateWaitTime}
@@ -118,11 +179,11 @@
 				/>
 			</div>
 		{/if}
-		{#each flowModules as { id: k, type: typ } (k)}
+		{#each flowModules as { id: k, type: typ, suspend: isSuspend } (k)}
 			{@const subItems = items?.[k]?.filter((x) => x.created_at && x.started_at)}
-			<div class="shadow-inner dark:shadow-gray-700 relative">
-				<div class="px-2 py-2 grid grid-cols-6 w-full">
-					<div class="truncate"
+			<div class="relative px-3 py-1.5">
+				<div class="flex items-center justify-between mb-0.5">
+					<div class="text-xs font-medium"
 						>{k.startsWith('subflow:') ? k.substring(8) : k}
 						{#if localModuleStates[k]?.selectedForloop && (typ == 'forloopflow' || typ == 'whileloopflow')}
 							<span class="text-xs font-mono font-medium inline-flex items-center -my-2">
@@ -141,67 +202,78 @@
 							</span>
 						{/if}
 					</div>
-					<div class="col-span-5 flex">
-						{#if subItems?.length > 1}
-							<div class="text-xs text-secondary absolute top-1 right-2">
-								{subItems?.length} jobs
-							</div>
-						{/if}
-						{#if min && total}
-							<VirtualList
-								width="100%"
-								height={Math.min(400, (subItems?.length ?? 0) * barHeight)}
-								itemCount={subItems?.length ?? 0}
-								itemSize={barHeight}
-								getKey={(index) => subItems?.[index]?.id}
-							>
-								{#snippet item({ index, style })}
-									{@const b = subItems?.[index]}
-									{#if b?.created_at}
-										<!-- <div class="text-xs text-secondary">{JSON.stringify(b)}</div> -->
-										{@const waitingLen = b?.created_at
-											? b.started_at
-												? b.started_at - b?.created_at
-												: b.duration_ms
-													? 0
-													: now - b?.created_at
-											: 0}
-										<div class="flex w-full p-1 pb-2 pl-12" {style}>
+					{#if subItems?.length > 1}
+						<span class="text-2xs text-secondary bg-surface-hover px-1.5 py-0.5 rounded-full">
+							{subItems?.length} jobs
+						</span>
+					{/if}
+				</div>
+				<div class="w-full">
+					{#if min && total}
+						<VirtualList
+							width="100%"
+							height={Math.min(400, (subItems?.length ?? 0) * barHeight)}
+							itemCount={subItems?.length ?? 0}
+							itemSize={barHeight}
+							getKey={(index) => subItems?.[index]?.id ?? `_${index}`}
+						>
+							{#snippet item({ index, style })}
+								{@const b = subItems?.[index]}
+								{#if b?.created_at}
+									{@const waitingLen = b?.created_at
+										? b.started_at
+											? b.started_at - b?.created_at
+											: b.duration_ms
+												? 0
+												: now - b?.created_at
+										: 0}
+									{@const aw = isSuspend ? approvalWaitByModule[k] : undefined}
+									<div class="flex w-full py-0.5 items-center" {style}>
+										<TimelineBar
+											position="left"
+											id={b?.id}
+											{total}
+											{min}
+											gray
+											spacerClass="bg-gray-100 dark:bg-gray-800/50 rounded-l-md"
+											started_at={b.created_at}
+											len={waitingLen < 100 ? 0 : waitingLen - 100}
+											running={b?.started_at == undefined}
+										/>
+										{#if b.started_at}
 											<TimelineBar
-												position="left"
+												position={aw || waitingLen < 100 ? 'center' : 'right'}
 												id={b?.id}
 												{total}
 												{min}
-												gray
-												started_at={b.created_at}
-												len={waitingLen < 100 ? 0 : waitingLen - 100}
-												running={b?.started_at == undefined}
+												concat
+												started_at={b.started_at}
+												len={b.started_at ? (b?.duration_ms ?? now - b?.started_at) : 0}
+												running={b?.duration_ms == undefined}
 											/>
-											{#if b.started_at}
-												<TimelineBar
-													position={waitingLen < 100 ? 'center' : 'right'}
-													id={b?.id}
-													{total}
-													{min}
-													concat
-													started_at={b.started_at}
-													len={b.started_at ? (b?.duration_ms ?? now - b?.started_at) : 0}
-													running={b?.duration_ms == undefined}
-												/>
-											{/if}
-										</div>
-									{:else}
-										<div class="flex w-full p-1 pb-2 pl-12">
-											<div class="text-xs text-secondary">
-												<!-- Waiting for executor/Suspend {JSON.stringify(b)} -->
-											</div>
-										</div>
-									{/if}
-								{/snippet}
-							</VirtualList>
-						{/if}</div
-					></div
-				>
+										{/if}
+										{#if aw}
+											<TimelineBar
+												position="right"
+												id={b?.id}
+												{total}
+												{min}
+												concat
+												colorClass="bg-purple-400/80"
+												tooltip={`Waiting for approval — ${msToSec(aw.len, 1)}s`}
+												started_at={aw.start}
+												len={aw.len}
+												running={aw.running}
+											/>
+										{/if}
+									</div>
+								{:else}
+									<div class="flex w-full py-0.5"></div>
+								{/if}
+							{/snippet}
+						</VirtualList>
+					{/if}
+				</div>
 			</div>
 		{/each}
 	</div>

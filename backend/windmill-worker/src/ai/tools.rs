@@ -1,11 +1,8 @@
-use windmill_common::ai_types::OpenAIToolCall;
-use crate::ai::query_builder::StreamEventProcessor;
-use crate::ai::types::McpToolSource;
-use crate::ai::types::*;
+use crate::ai::stream_event_processor::StreamEventProcessor;
 use crate::ai::utils::{
     add_message_to_conversation, execute_mcp_tool, get_step_name_from_flow,
-    update_flow_status_module_with_actions, update_flow_status_module_with_actions_success,
-    FlowContext,
+    is_completed_input_transform, update_flow_status_module_with_actions,
+    update_flow_status_module_with_actions_success, FlowContext,
 };
 use crate::common::OccupancyMetrics;
 use crate::result_processor::handle_non_flow_job_error;
@@ -21,7 +18,7 @@ use mappable_rc::Marc;
 use serde_json::value::RawValue;
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
-use windmill_common::flows::InputTransform;
+use windmill_ai::{ai_types::OpenAIToolCall, query_builder::StreamEventSink, types::*};
 use windmill_common::jobs::JobPayload;
 
 #[cfg(feature = "mcp")]
@@ -35,16 +32,20 @@ type McpClient = McpClientStub;
 use windmill_common::{
     client::AuthedClient,
     db::DB,
-    error::{to_anyhow, Error},
+    error::Error,
     flow_conversations::MessageType,
     flow_status::AgentAction,
     flows::FlowModuleValue,
     worker::{to_raw_value, Connection},
 };
 use windmill_queue::{
-    get_mini_pulled_job, push, JobCompleted, MiniCompletedJob, MiniPulledJob, PushArgs,
-    PushIsolationLevel,
+    add_completed_job, add_completed_job_error, get_mini_pulled_job, push, MiniCompletedJob,
+    MiniPulledJob, PushArgs, PushIsolationLevel,
 };
+
+/// Shared collection of abort handles for spawned tool tasks.
+/// Used to abort in-flight tasks when the parent agent is force-cancelled.
+pub type ToolAbortHandles = Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>;
 
 /// Context for tool execution containing all required references and state
 pub struct ToolExecutionContext<'a> {
@@ -54,8 +55,9 @@ pub struct ToolExecutionContext<'a> {
 
     // Job context
     pub job: &'a MiniPulledJob,
-    pub parent_job: &'a Uuid,
+    pub parent_job: Option<&'a Uuid>,
     pub summary: &'a Option<&'a str>,
+    pub flow_step_id_override: Option<&'a str>,
 
     // Execution parameters
     pub client: &'a AuthedClient,
@@ -66,14 +68,17 @@ pub struct ToolExecutionContext<'a> {
 
     // Runtime state
     pub occupancy_metrics: &'a mut OccupancyMetrics,
-    pub job_completed_tx: &'a JobCompletedSender,
     pub killpill_rx: &'a mut tokio::sync::broadcast::Receiver<()>,
 
     // Optional streaming & chat
     pub stream_event_processor: Option<&'a StreamEventProcessor>,
     pub flow_context: &'a mut FlowContext,
+    pub omit_output_from_conversation: bool,
     pub previous_result: &'a Option<Box<RawValue>>,
     pub id_context: &'a Option<crate::js_eval::IdContext>,
+
+    // Abort handles for spawned tool tasks (used for force-cancel cleanup)
+    pub tool_abort_handles: ToolAbortHandles,
 }
 
 /// Execute all tool calls from an AI response
@@ -193,6 +198,10 @@ async fn execute_mcp_tool_call(
         arguments: arguments.clone(),
     });
 
+    if let Some(parent_job) = ctx.parent_job {
+        update_flow_status_module_with_actions(ctx.db, parent_job, actions).await?;
+    }
+
     match tool_result {
         Ok(result) => {
             let result_str =
@@ -220,6 +229,10 @@ async fn execute_mcp_tool_call(
                     success: true,
                 };
                 stream_event_processor.send(event, final_events_str).await?;
+            }
+
+            if let Some(parent_job) = ctx.parent_job {
+                update_flow_status_module_with_actions_success(ctx.db, parent_job, true).await?;
             }
 
             // Add tool message to conversation if chat_input_enabled
@@ -254,6 +267,10 @@ async fn execute_mcp_tool_call(
                 stream_event_processor.send(event, final_events_str).await?;
             }
 
+            if let Some(parent_job) = ctx.parent_job {
+                update_flow_status_module_with_actions_success(ctx.db, parent_job, false).await?;
+            }
+
             // Add tool message to conversation if chat_input_enabled
             add_tool_message_to_chat(ctx, None, &error_msg, false).await;
         }
@@ -283,7 +300,9 @@ async fn execute_windmill_tool(
         module_id: tool_module.id.clone(),
     });
 
-    update_flow_status_module_with_actions(ctx.db, ctx.parent_job, actions).await?;
+    if let Some(parent_job) = ctx.parent_job {
+        update_flow_status_module_with_actions(ctx.db, parent_job, actions).await?;
+    }
 
     let raw_tool_call_args = if tool_call.function.arguments.is_empty() {
         "{}".to_string()
@@ -301,11 +320,14 @@ async fn execute_windmill_tool(
         )
     })?;
 
+    let tool_value = tool_module.get_value()?;
+
     // Get input transforms given by the user and merge them with AI given args
-    let input_transforms = match tool_module.get_value()? {
-        FlowModuleValue::Script { input_transforms, .. } => input_transforms,
-        FlowModuleValue::RawScript { input_transforms, .. } => input_transforms,
-        FlowModuleValue::FlowScript { input_transforms, .. } => input_transforms,
+    let input_transforms = match &tool_value {
+        FlowModuleValue::Script { input_transforms, .. }
+        | FlowModuleValue::RawScript { input_transforms, .. }
+        | FlowModuleValue::FlowScript { input_transforms, .. }
+        | FlowModuleValue::AIAgent { input_transforms, .. } => input_transforms,
         _ => {
             return Err(Error::internal_err(format!(
                 "Unsupported tool: {}",
@@ -331,17 +353,8 @@ async fn execute_windmill_tool(
     // Evaluate each input transform and merge with AI-provided args
     for (key, transform) in input_transforms.iter() {
         // We skip static empty / null values, those are the one the AI will fill in
-        match transform {
-            InputTransform::Static { value } => {
-                let val = value.get().trim();
-                if val.is_empty() || val == "null" {
-                    continue;
-                }
-            }
-            InputTransform::Ai => {
-                continue;
-            }
-            _ => (),
+        if !is_completed_input_transform(transform) {
+            continue;
         }
         let result = evaluate_input_transform::<Box<RawValue>>(
             transform,
@@ -356,7 +369,9 @@ async fn execute_windmill_tool(
         tool_call_args.insert(key.clone(), result);
     }
 
-    let job_payload = match tool_module.get_value()? {
+    let is_ai_agent_tool = matches!(tool_value, FlowModuleValue::AIAgent { .. });
+
+    let job_payload = match tool_value {
         FlowModuleValue::Script { path: script_path, hash: script_hash, tag_override, .. } => {
             script_to_payload(
                 script_hash,
@@ -380,7 +395,6 @@ async fn execute_windmill_tool(
         } => {
             let path = path
                 .unwrap_or_else(|| format!("{}/tools/{}", ctx.job.runnable_path(), tool_module.id));
-
             raw_script_to_payload(
                 path,
                 content,
@@ -390,12 +404,12 @@ async fn execute_windmill_tool(
                 tool_module,
                 tag,
                 tool_module.delete_after_use.unwrap_or(false),
+                None,
             )
         }
         FlowModuleValue::FlowScript { id, language, concurrency_settings, tag, .. } => {
             let path = format!("{}/tools/{}", ctx.job.runnable_path(), tool_module.id);
-
-            let payload = JobPayloadWithTag {
+            JobPayloadWithTag {
                 payload: JobPayload::FlowScript {
                     id,
                     language,
@@ -407,10 +421,35 @@ async fn execute_windmill_tool(
                 },
                 tag: tag.clone(),
                 delete_after_use: tool_module.delete_after_use.unwrap_or(false),
+                delete_after_secs: None,
                 timeout: None,
                 on_behalf_of: None,
-            };
-            payload
+            }
+        }
+        FlowModuleValue::AIAgent { tools: sub_tools, .. } => {
+            let has_nested_agent_tools = sub_tools.iter().any(|t| {
+                matches!(
+                    t.value,
+                    windmill_common::flows::ToolValue::FlowModule(FlowModuleValue::AIAgent { .. })
+                )
+            });
+            if has_nested_agent_tools {
+                return Err(Error::internal_err(
+                    "AI agent tools cannot be nested beyond 2 levels. The nested agent tool contains \
+                     AIAgent sub-tools, which would exceed the maximum nesting depth.".to_string()
+                ));
+            }
+            let path = format!("{}/tools/{}", ctx.job.runnable_path(), tool_module.id);
+            // tool jobs are pushed with the parent agent job's tag and executed inline on the
+            // same worker, so a tag override on a nested agent tool does not apply here
+            JobPayloadWithTag {
+                payload: JobPayload::AIAgent { path },
+                tag: None,
+                delete_after_use: tool_module.delete_after_use.unwrap_or(false),
+                delete_after_secs: None,
+                timeout: None,
+                on_behalf_of: None,
+            }
         }
         _ => {
             return Err(Error::internal_err(format!(
@@ -450,10 +489,11 @@ async fn execute_windmill_tool(
         permissioned_as,
         Some(&format!("job-span-{}", ctx.job.id)),
         None,
+        None,
         ctx.job.schedule_path(),
         Some(ctx.job.id),
-        None,
-        None,
+        ctx.job.root_job.or(Some(ctx.job.id)),
+        ctx.job.flow_innermost_root_job.or(Some(ctx.job.id)),
         Some(job_id),
         false,
         false,
@@ -535,16 +575,24 @@ async fn execute_windmill_tool(
         (result, occupancy_metrics_spawn)
     });
 
+    // Register abort handle so the task can be killed on force-cancel
+    let abort_handle = join_handle.abort_handle();
+    // unwrap safe: lock is only held briefly for push/drain, no panic possible inside
+    ctx.tool_abort_handles.lock().unwrap().push(abort_handle);
+
     // Await the spawned task
-    let (handle_result, updated_occupancy) = join_handle
-        .await
-        .map_err(|e| Error::internal_err(format!("Tool execution task failed: {}", e)))?;
+    let (handle_result, updated_occupancy) = join_handle.await.map_err(|e| {
+        if e.is_cancelled() {
+            Error::ExecutionErr("Tool execution task was cancelled".to_string())
+        } else {
+            Error::internal_err(format!("Tool execution task failed: {}", e))
+        }
+    })?;
 
     // Merge occupancy metrics back
     ctx.occupancy_metrics.total_duration_of_running_jobs =
         updated_occupancy.total_duration_of_running_jobs;
 
-    // Continue with match on handle_result
     match handle_result {
         Err(err) => {
             handle_tool_execution_error(
@@ -559,13 +607,14 @@ async fn execute_windmill_tool(
             )
             .await?;
         }
-        Ok(success) => {
+        Ok(outcome) => {
             handle_tool_execution_success(
                 ctx,
                 tool_call,
                 tool_module,
                 job_id,
-                success,
+                outcome.is_success(),
+                is_ai_agent_tool,
                 inner_job_completed_rx,
                 messages,
                 final_events_str,
@@ -627,12 +676,23 @@ async fn handle_tool_execution_error(
             .await?;
     }
 
-    update_flow_status_module_with_actions_success(ctx.db, ctx.parent_job, false).await?;
+    if let Some(parent_job) = ctx.parent_job {
+        update_flow_status_module_with_actions_success(ctx.db, parent_job, false).await?;
+    }
 
     // Add tool message to conversation if chat_input_enabled (error case)
     add_tool_message_to_chat(ctx, Some(job_id), &error_message, false).await;
 
     Ok(())
+}
+
+/// Extract the `output` field of an `AIAgentResult` envelope, serialized back to JSON.
+/// Returns `None` if the result is not a JSON object carrying an `output` field.
+fn extract_ai_agent_output(result: &RawValue) -> Option<String> {
+    serde_json::from_str::<HashMap<String, &RawValue>>(result.get())
+        .ok()?
+        .get("output")
+        .map(|output| output.get().to_string())
 }
 
 /// Handle tool execution success
@@ -642,38 +702,77 @@ async fn handle_tool_execution_success(
     tool_module: &windmill_common::flows::FlowModule,
     job_id: Uuid,
     success: bool,
+    is_ai_agent_tool: bool,
     inner_job_completed_rx: JobCompletedReceiver,
     messages: &mut Vec<OpenAIMessage>,
     final_events_str: &mut String,
 ) -> Result<(), Error> {
     let send_result = inner_job_completed_rx.bounded_rx.try_recv().ok();
 
-    let result = if let Some(SendResult {
-        result: SendResultPayload::JobCompleted(JobCompleted { result, .. }),
+    let (result, job_success) = if let Some(SendResult {
+        result: SendResultPayload::JobCompleted(ref jc),
         ..
-    }) = send_result.as_ref()
+    }) = send_result
     {
-        let result = result.clone();
-        ctx.job_completed_tx
-            .send(send_result.unwrap().result, true)
+        let result = jc.result.clone();
+        // Write tool completion to the DB inline instead of forwarding through
+        // the parent channel. Forwarding would deadlock for nested agents: the
+        // sub-tool result would fill the parent's bounded(1) channel, leaving
+        // no room for the agent's own completion from process_result.
+        if jc.success {
+            add_completed_job(
+                ctx.db,
+                &jc.job,
+                true,
+                false,
+                sqlx::types::Json(&*jc.result),
+                jc.result_columns.clone(),
+                jc.mem_peak,
+                jc.canceled_by.clone(),
+                false,
+                jc.duration,
+                jc.from_cache.unwrap_or(false),
+            )
             .await
-            .map_err(to_anyhow)?;
-        result
-    } else {
-        if let Some(send_result) = send_result {
-            ctx.job_completed_tx
-                .send(send_result.result, true)
-                .await
-                .map_err(to_anyhow)?;
+            .map_err(|e| Error::internal_err(format!("Failed to add completed job: {e}")))?;
+        } else {
+            let error_value: serde_json::Value =
+                serde_json::from_str(jc.result.get()).unwrap_or_else(|_| {
+                    serde_json::json!({ "message": format!("Non serializable error: {}", jc.result.get()) })
+                });
+            add_completed_job_error(
+                ctx.db,
+                &jc.job,
+                jc.mem_peak,
+                jc.canceled_by.clone(),
+                error_value,
+                ctx.worker_name,
+                false,
+                jc.duration,
+            )
+            .await
+            .map_err(|e| Error::internal_err(format!("Failed to add completed job error: {e}")))?;
         }
+        (result, jc.success)
+    } else {
         return Err(Error::internal_err(
             "Tool job completed but no result".to_string(),
         ));
     };
 
+    // A nested agent returns the whole `AIAgentResult` envelope: on top of `output` it carries
+    // the child's entire message history, stream log and token usage. Feeding that back would
+    // grow the caller's context by the child's full transcript on every call, so the caller only
+    // sees `output`. The envelope stays intact in the tool job's completed row.
+    let tool_result = if is_ai_agent_tool && job_success {
+        extract_ai_agent_output(&result).unwrap_or_else(|| result.get().to_string())
+    } else {
+        result.get().to_string()
+    };
+
     messages.push(OpenAIMessage {
         role: "tool".to_string(),
-        content: Some(OpenAIContent::Text(result.get().to_string())),
+        content: Some(OpenAIContent::Text(tool_result.clone())),
         tool_call_id: Some(tool_call.id.clone()),
         agent_action: Some(AgentAction::ToolCall {
             job_id,
@@ -688,7 +787,7 @@ async fn handle_tool_execution_success(
         let tool_result_event = StreamingEvent::ToolResult {
             call_id: tool_call.id.clone(),
             function_name: tool_call.function.name.clone(),
-            result: result.get().to_string(),
+            result: tool_result,
             success: true,
         };
         stream_event_processor
@@ -696,7 +795,9 @@ async fn handle_tool_execution_success(
             .await?;
     }
 
-    update_flow_status_module_with_actions_success(ctx.db, ctx.parent_job, success).await?;
+    if let Some(parent_job) = ctx.parent_job {
+        update_flow_status_module_with_actions_success(ctx.db, parent_job, success).await?;
+    }
 
     // Add tool message to conversation if chat_input_enabled
     let content = if success {
@@ -717,6 +818,10 @@ async fn add_tool_message_to_chat(
     content: &str,
     success: bool,
 ) {
+    if ctx.omit_output_from_conversation {
+        return;
+    }
+
     let chat_enabled = ctx
         .flow_context
         .flow_status
@@ -731,8 +836,10 @@ async fn add_tool_message_to_chat(
             .and_then(|fs| fs.memory_id)
         {
             let db_clone = ctx.db.clone();
-            let step_name =
-                get_step_name_from_flow(ctx.summary.as_deref(), ctx.job.flow_step_id.as_deref());
+            let effective_step_id = ctx
+                .flow_step_id_override
+                .or(ctx.job.flow_step_id.as_deref());
+            let step_name = get_step_name_from_flow(ctx.summary.as_deref(), effective_step_id);
             let content = content.to_string();
 
             // Spawn task because we do not need to wait for the result
@@ -756,5 +863,27 @@ async fn add_tool_message_to_chat(
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_ai_agent_output;
+    use serde_json::value::RawValue;
+
+    #[test]
+    fn extracts_only_the_output_of_an_agent_result() {
+        let envelope = RawValue::from_string(
+            r#"{"output":{"answer":"42"},"messages":[{"role":"user","content":"hi"}],"wm_stream":"...","usage":{"total_tokens":10}}"#
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            extract_ai_agent_output(&envelope).as_deref(),
+            Some(r#"{"answer":"42"}"#)
+        );
+
+        let not_an_envelope = RawValue::from_string(r#"["a"]"#.to_string()).unwrap();
+        assert_eq!(extract_ai_agent_output(&not_an_envelope), None);
     }
 }

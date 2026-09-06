@@ -2,7 +2,7 @@
 
 import { untrack } from 'svelte'
 import { deepEqual } from 'fast-equals'
-import type { StateStore } from './utils'
+import { readFieldsRecursively, type StateStore } from './utils'
 import { resource, watch, type ResourceReturn } from 'runed'
 
 export function withProps<Component, Props>(component: Component, props: Props) {
@@ -18,9 +18,7 @@ export function createState<T>(initialValue: T): T {
 	return s
 }
 
-export function stateSnapshot<T>(state: T) {
-	return $state.snapshot(state)
-}
+export { stateSnapshot } from './stateSnapshot.svelte'
 export function refreshStateStore<T>(store: StateStore<T>): void {
 	store.val = $state.snapshot(store.val) as any
 }
@@ -413,5 +411,332 @@ export function useInfiniteQuery<TData, TPageParam = number>(
 		},
 		fetchNextPage,
 		reset
+	}
+}
+
+export function useKeyPressed<Key extends string>(
+	keys: Key[],
+	params?: {
+		onKeyUp?: (key: Key, e: KeyboardEvent) => void
+		onKeyDown?: (key: Key, e: KeyboardEvent) => void
+	}
+): Record<Key, boolean> {
+	if (typeof window === 'undefined')
+		return Object.fromEntries(keys.map((key) => [key, false])) as Record<Key, boolean>
+	let obj = $state(Object.fromEntries(keys.map((key) => [key, false])) as Record<Key, boolean>)
+	$effect(() => {
+		const handleKeyDown = (event: KeyboardEvent) => {
+			for (const key of keys) {
+				if (event.key.toLowerCase() === key.toLowerCase()) {
+					obj[key] = true
+					params?.onKeyDown?.(key, event)
+				}
+			}
+		}
+
+		const handleKeyUp = (event: KeyboardEvent) => {
+			for (const key of keys) {
+				if (event.key.toLowerCase() === key.toLowerCase()) {
+					obj[key] = false
+					params?.onKeyUp?.(key, event)
+				}
+			}
+		}
+
+		// Reset all keys when window loses focus or visibility changes to prevent stuck keys
+		const resetAllKeys = () => {
+			for (const key of keys) obj[key] = false
+		}
+
+		window.addEventListener('keydown', handleKeyDown)
+		window.addEventListener('keyup', handleKeyUp)
+		window.addEventListener('blur', resetAllKeys)
+		document.addEventListener('visibilitychange', resetAllKeys)
+		return () => {
+			window.removeEventListener('keydown', handleKeyDown)
+			window.removeEventListener('keyup', handleKeyUp)
+			window.removeEventListener('blur', resetAllKeys)
+			document.removeEventListener('visibilitychange', resetAllKeys)
+		}
+	})
+	return obj
+}
+
+export function useTransformedSyncedValue<T, U>(
+	source: [() => T, (val: T) => void],
+	transform: (val: T) => U,
+	inverseTransform: (val: U) => T
+) {
+	let st = $state(transform(source[0]()))
+
+	let skipUpdate = false
+	watch(source[0], (val) => {
+		if (skipUpdate) {
+			skipUpdate = false
+			return
+		}
+		st = transform(val)
+	})
+
+	return {
+		get val() {
+			return st
+		},
+		set val(newVal) {
+			skipUpdate = true
+			st = newVal
+			source[1](inverseTransform(newVal))
+			setTimeout(() => {
+				skipUpdate = false
+			})
+		},
+		reparse() {
+			st = transform(source[0]())
+		}
+	}
+}
+
+/**
+ * Maintains a local copy of a value that syncs back to the parent state in a debounced way.
+ *
+ * Useful for inputs where you want immediate local reactivity but don't want to
+ * flood the parent with updates (e.g. text fields, sliders).
+ *
+ * @param getter - Reads the canonical value from the parent
+ * @param setter - Writes a new canonical value to the parent (called debounced)
+ * @param react - A function that reads the fields to react to.
+ * @param delay - Debounce delay in ms (default: 300)
+ *
+ * @example
+ * const debounced = new DebouncedTempValue(
+ *   () => props.value,
+ *   (v) => { props.value = v },
+ *   (t) => t, // react to the value itself
+ *   300
+ * )
+ * // Use debounced.current in the template; writes are debounced to the parent.
+ */
+export class DebouncedTempValue<T> {
+	current: T
+	#timer: ReturnType<typeof setTimeout> | undefined
+	#skipNextParentUpdate = false
+	#skipNextCurrentUpdate = false
+
+	constructor(
+		getter: () => T,
+		private setter: (val: T) => void,
+		react: (t: T) => void,
+		private delay: number = 300
+	) {
+		this.current = $state(untrack(getter))
+
+		watch(getter, (val) => {
+			if (this.#timer !== undefined) {
+				// An in-flight local edit is pending — don't overwrite it with stale parent data
+				return
+			}
+			if (this.#skipNextParentUpdate) {
+				// The parent just updated in response to our local edit — skip this update as it's not new data
+				this.#skipNextParentUpdate = false
+				return
+			}
+			this.#skipNextCurrentUpdate = true
+			this.current = val
+			setTimeout(() => (this.#skipNextCurrentUpdate = false), 0)
+		})
+
+		watch(
+			() => react(this.current),
+			() => {
+				if (this.#skipNextCurrentUpdate) return
+				if (this.#timer !== undefined) clearTimeout(this.#timer)
+				this.#timer = setTimeout(() => {
+					this.#timer = undefined
+					this.#skipNextParentUpdate = true
+					this.setter(this.current)
+					setTimeout(() => (this.#skipNextParentUpdate = false), 0)
+				}, this.delay)
+			}
+		)
+	}
+
+	/** Flush any pending debounced write immediately. */
+	flush(): void {
+		if (this.#timer !== undefined) {
+			clearTimeout(this.#timer)
+			this.#timer = undefined
+			this.setter(this.current)
+		}
+	}
+}
+
+export function useLocalStorageValue<T>(
+	key: string,
+	defaultValue: T,
+	typ?: 'string' | 'number' | 'boolean',
+	options?: {
+		saveInitialValue?: boolean
+		/**
+		 * Coalesce localStorage writes within a sliding window. When set to a
+		 * positive number, repeated mutations within `debounce` ms produce a
+		 * single localStorage write at the end of the window. The in-memory
+		 * `$state` is updated immediately on each change — only the persistence
+		 * side-effect is deferred. Readers of `.val` always see the latest
+		 * value; readers of `localStorage` may see a stale value during the
+		 * window. A pending write fires from a plain `setTimeout`, which
+		 * keeps running across SPA route teardown — only a hard browser tab
+		 * close drops it.
+		 */
+		debounce?: number
+		/**
+		 * Transform applied to the value just before serialisation, on every
+		 * persist (both setter-driven and deep-mutation-driven). The in-memory
+		 * `$state` is left as-is. Useful for injecting per-write metadata
+		 * (timestamps, counters) that must reflect the actual write time, not
+		 * the last `.val =` assignment — deep mutations don't re-run the
+		 * setter, so a timestamp set via `.val =` would otherwise grow stale
+		 * across long editing sessions.
+		 */
+		transformBeforePersist?: (val: T) => T
+		/**
+		 * Register a `$effect` that walks the stored value on every access and
+		 * persists when any nested field mutated. Required for callers that
+		 * mutate the value in place (`s.foo = bar`) rather than reassigning
+		 * via the setter. Setter-only callers (e.g. a flat string slot) should
+		 * leave this `false` — the `$effect` requires a Svelte effect scope,
+		 * so enabling it forces the hook to be called from inside a component.
+		 */
+		reactToNestedUpdates?: boolean
+	}
+): { val: T; skipNextWriteOnce(): void; setWithoutPersist(newVal: T): void } {
+	const saveInitialValue = options?.saveInitialValue ?? true
+	const debounceMs = options?.debounce ?? 0
+	const transformBeforePersist = options?.transformBeforePersist
+	const reactToNestedUpdates = options?.reactToNestedUpdates ?? false
+	const serialize = (val: T) =>
+		typ === 'string' || typ === 'number' || typ === 'boolean' ? String(val) : JSON.stringify(val)
+	const deserialize = (val: string): T => {
+		if (typ === 'string') return val as any
+		if (typ === 'number') return Number(val) as any
+		if (typ === 'boolean') return (val === 'true') as any
+		return JSON.parse(val) as T
+	}
+	const persist = (val: T | undefined) => {
+		try {
+			if (val === undefined) {
+				localStorage.removeItem(key)
+			} else {
+				const toStore = transformBeforePersist ? transformBeforePersist(val as T) : (val as T)
+				localStorage.setItem(key, serialize(toStore))
+			}
+		} catch (e) {
+			console.error('useLocalStorageValue: localStorage write failed', e)
+		}
+	}
+
+	if (typeof window === 'undefined') {
+		return { val: defaultValue, skipNextWriteOnce: () => {}, setWithoutPersist: () => {} }
+	}
+	const savedValue = localStorage.getItem(key)
+	let s = $state<T>(
+		savedValue != null && savedValue !== 'undefined' ? (deserialize(savedValue) as T) : defaultValue
+	)
+
+	// Track the serialized form last written so we can detect deep mutations
+	// (changes that didn't go through the setter) without double-writing on
+	// every setter call. The first effect run sees identical serialized output
+	// and is a no-op (avoids persisting the default value on mount).
+	let lastSerialized: string | undefined = untrack(() =>
+		s === undefined ? undefined : serialize(s)
+	)
+	// When saveInitialValue=false, the first time the value actually changes
+	// (either via the setter or a deep mutation) is treated as "loading the
+	// initial value" rather than a user edit — we update lastSerialized so
+	// future writes are detected, but we don't persist.
+	let skipNextWrite = !saveInitialValue
+
+	// Debounce wrapper. Captures the latest pending value; a follow-up call
+	// within the window replaces the queued payload and resets the timer.
+	let debounceTimer: ReturnType<typeof setTimeout> | undefined
+	let pendingValue: T | undefined
+	const schedulePersist = (val: T | undefined) => {
+		if (debounceMs <= 0) {
+			persist(val)
+			return
+		}
+		pendingValue = val
+		if (debounceTimer != null) clearTimeout(debounceTimer)
+		debounceTimer = setTimeout(() => {
+			debounceTimer = undefined
+			persist(pendingValue)
+			pendingValue = undefined
+		}, debounceMs)
+	}
+	const cancelPendingWrite = () => {
+		if (debounceTimer != null) {
+			clearTimeout(debounceTimer)
+			debounceTimer = undefined
+		}
+		pendingValue = undefined
+	}
+
+	if (reactToNestedUpdates) {
+		$effect(() => {
+			readFieldsRecursively(s)
+			const next = s === undefined ? undefined : serialize(s)
+			if (next === lastSerialized) return
+			lastSerialized = next
+			if (skipNextWrite) {
+				skipNextWrite = false
+				return
+			}
+			schedulePersist(s)
+		})
+	}
+
+	return {
+		get val() {
+			return s
+		},
+		set val(newVal: T) {
+			// In-memory state is updated synchronously; the localStorage write
+			// is debounced when `options.debounce` is set. Callers that read
+			// `.val` get the latest value either way; only direct localStorage
+			// reads see the stale value during the debounce window.
+			const next = newVal === undefined ? undefined : serialize(newVal as T)
+			if (next !== lastSerialized) {
+				lastSerialized = next
+				if (skipNextWrite) {
+					skipNextWrite = false
+				} else {
+					schedulePersist(newVal)
+				}
+			}
+			s = newVal
+		},
+		/**
+		 * Arm the persist skip so the next `set val` (or deep-mutation flush)
+		 * updates only the in-memory cell and leaves localStorage untouched.
+		 */
+		skipNextWriteOnce(): void {
+			skipNextWrite = true
+		},
+		/**
+		 * Reset the in-memory state while canceling any queued debounced write.
+		 * Used when a caller performs its own synchronous persistence action.
+		 */
+		setWithoutPersist(newVal: T): void {
+			cancelPendingWrite()
+			lastSerialized = newVal === undefined ? undefined : serialize(newVal)
+			skipNextWrite = false
+			s = newVal
+		}
+	}
+}
+
+export function onCustomEvent(node, { event, handler }) {
+	node.addEventListener(event, handler)
+	return {
+		destroy: () => node.removeEventListener(event, handler)
 	}
 }

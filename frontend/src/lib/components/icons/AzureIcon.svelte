@@ -1,35 +1,86 @@
 <script lang="ts">
+	import { twMerge } from 'tailwind-merge'
+
 	interface Props {
-		height?: string;
-		width?: string;
+		size?: number
+		class?: string
 	}
 
-	let { height = '24px', width = '24px' }: Props = $props();
+	let { size = 16, class: clazz = '' }: Props = $props()
 </script>
 
-<svg id="azure" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 374.5 377.3" {width} {height}
-	><style>
-		.st0-azure {
-			fill: #00bef2;
-		}
-		.st1-azure {
-			fill: #fff;
-			stroke: #fff;
-			stroke-width: 1.2357;
-			stroke-linecap: round;
-			stroke-linejoin: round;
-		}
-	</style><g id="layer1" transform="translate(-39.022 -78.115)"
-		><g id="g1016" transform="translate(-63.947 -88.179)"
-			><path
-				id="path1008"
-				class="st0-azure"
-				d="M290 166.3c.4 0 .8.5 1.4 1.4.5.8 42.6 51.3 93.6 112.2 51 60.9 92.6 111 92.4 111.3-.1.3-40.7 33.6-90.2 73.9s-91.6 74.6-93.5 76.2c-3.3 2.7-3.5 2.8-4.7 1.6-.7-.7-42.9-35.2-93.8-76.7S102.8 390.5 103 390c.2-.5 42-50.4 93.1-111s92.9-110.7 93.1-111.5c.2-.8.5-1.2.8-1.2z"
-			/><path
-				id="path923"
-				class="st1-azure"
-				d="M283.1 483.6c-5.8-2.1-12.8-8.1-15.7-13.7-3.6-6.9-3.3-17.7.7-26.3 3.1-6.4 3.1-6.6 1.1-8.1-1.1-.8-14.4-8.2-29.4-16.3-15-8.1-28.1-15.2-29-15.7-1.2-.7-3.2 0-6.8 2.3-11.7 7.4-23.9 6.6-33.5-2.3-6.9-6.4-8.9-10.9-8.9-20.1 0-8.9 1.8-13.5 7.5-19.2 7.7-7.7 18-10.3 27.9-7 5.4 1.8 5.5 1.8 8.9-.8 4-3 36.1-32.3 51.6-47l10.7-10.2-3.2-6.7c-6.5-13.5-3.2-28.5 8.2-37.5 6.2-4.9 10.8-6.4 19.7-6.4 20.8 0 35.3 21.8 27.5 41.3-2.1 5.4-2.1 5.5-.1 8.8 1.7 2.9 30.6 37.8 45.9 55.6 2.7 3.1 5.7 5.6 6.7 5.6s4.4-1 7.6-2.2c14.9-5.9 30.6.7 36.8 15.5 4 9.5.5 22.3-8 30-6 5.4-10.4 7.1-18.4 7.1-5.6 0-7.7-.6-13.6-3.8-4.4-2.4-7.8-3.6-9.2-3.2-2.4.6-39.3 25.9-47.5 32.5-5 4.1-5.4 5.6-2.8 11.7 2.5 6 2.2 15.4-.6 21.3-3.1 6.5-10.8 13-17.5 15-6.8 1.9-10.9 1.9-16.6-.2zm1.7-110.2v-57l-3.2-4.4c-1.8-2.4-3.5-4.4-3.8-4.4-1.3 0-65.9 58.7-65.9 59.9 0 .3 1 3.3 2.2 6.5 1.2 3.3 2.1 8 2 10.7-.1 2.7-.1 5.7-.1 6.7.1 2.3 21.7 16.1 54.1 34.8 8.9 5.2 12 6.5 13.1 5.6 1.3-1.1 1.6-12.2 1.6-58.4zm27.4 50.4c42.8-26.9 50.8-32.3 51.3-34.3.3-1.2.7-5.9.8-10.6l.3-8.4-21.8-25.9c-23.4-27.7-32-37.1-34-37.1-.7 0-4.2 2-7.8 4.4l-6.6 4.4.3 56.9c.3 51 .7 59.6 2.6 59.6.2.1 7-4 14.9-9z"
-			/></g
-		></g
-	></svg
+<!-- Microsoft's own logo_azure.svg (learn.microsoft.com/media/logos/logo_azure.svg): #0078d4 with
+	the #114a8b->#0669bc and #3ccbf4->#2892df gradients. Shipped unmodified apart from namespacing
+	the gradient ids, which are document-global. Microsoft's icon terms say to use the icons "as they
+	would appear within Azure" and forbid changing them, so it must not be recoloured or drawn
+	monochrome; their permitted use is diagrams, training and documentation
+	(learn.microsoft.com/azure/architecture/icons). -->
+<svg
+	width={`${size}px`}
+	height={`${size}px`}
+	viewBox="0.341 0.591 255.818 255.818"
+	xmlns="http://www.w3.org/2000/svg"
+	role="img"
+	aria-label="Azure"
+	class={twMerge(clazz)}
 >
+	<defs>
+		<linearGradient
+			id="azure-grad-2"
+			x1="-960.6062"
+			y1="283.3968"
+			x2="-1032.5112"
+			y2="70.9723"
+			gradientTransform="matrix(1, 0, 0, -1, 1075, 318)"
+			gradientUnits="userSpaceOnUse"
+		>
+			<stop offset="0" stop-color="#114a8b" />
+			<stop offset="1" stop-color="#0669bc" />
+		</linearGradient>
+		<linearGradient
+			id="azure-grad-3"
+			x1="-938.1444"
+			y1="184.4016"
+			x2="-954.7776"
+			y2="178.7775"
+			gradientTransform="matrix(1, 0, 0, -1, 1075, 318)"
+			gradientUnits="userSpaceOnUse"
+		>
+			<stop offset="0" stop-opacity="0.3" />
+			<stop offset="0.0712" stop-opacity="0.2" />
+			<stop offset="0.321" stop-opacity="0.1" />
+			<stop offset="0.6231" stop-opacity="0.05" />
+			<stop offset="1" stop-opacity="0" />
+		</linearGradient>
+		<linearGradient
+			id="azure-grad-1"
+			x1="-947.2919"
+			y1="289.5941"
+			x2="-868.3628"
+			y2="79.3082"
+			gradientTransform="matrix(1, 0, 0, -1, 1075, 318)"
+			gradientUnits="userSpaceOnUse"
+		>
+			<stop offset="0" stop-color="#3ccbf4" />
+			<stop offset="1" stop-color="#2892df" />
+		</linearGradient>
+	</defs>
+	<g>
+		<path
+			d="M89.1583,18.266h69.238L86.5228,231.2237a11.0411,11.0411,0,0,1-10.4612,7.51H22.1787a11.0229,11.0229,0,0,1-10.4446-14.5479l66.9633-198.41A11.0406,11.0406,0,0,1,89.1583,18.266Z"
+			fill="url(#azure-grad-2)"
+		/>
+		<path
+			d="M189.7708,161.1044H79.9752a5.0829,5.0829,0,0,0-3.4681,8.7988l70.5517,65.8479a11.0915,11.0915,0,0,0,7.5668,2.9829h62.1675Z"
+			fill="#0078d4"
+		/>
+		<path
+			d="M89.1583,18.266A10.95,10.95,0,0,0,78.675,25.92L11.8168,224.0061A11.0094,11.0094,0,0,0,22.21,238.734H77.4839a11.8143,11.8143,0,0,0,9.0688-7.7138L99.8838,191.73l47.6243,44.4181a11.2671,11.2671,0,0,0,7.0889,2.5863h61.9371l-27.1656-77.63-79.1905.0176,48.47-142.856Z"
+			fill="url(#azure-grad-3)"
+		/>
+		<path
+			d="M177.592,25.7643a11.0227,11.0227,0,0,0-10.4439-7.4983H89.9841a11.0245,11.0245,0,0,1,10.445,7.4983l66.967,198.4209a11.0245,11.0245,0,0,1-10.445,14.5488h77.164a11.0235,11.0235,0,0,0,10.444-14.5488Z"
+			fill="url(#azure-grad-1)"
+		/>
+	</g>
+</svg>

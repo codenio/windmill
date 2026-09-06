@@ -8,17 +8,27 @@
 		type TriggersCount,
 		type WorkspaceDeployUISettings
 	} from '$lib/gen'
-	import { canWrite, defaultIfEmptyString, emptyString, urlParamsToObject } from '$lib/utils'
+	import {
+		canWrite,
+		defaultIfEmptyString,
+		emptyString,
+		urlParamsToObject,
+		extractTagFromSharableHash,
+		interpolateTag,
+		isDynamicTag,
+		isTagTemplate
+	} from '$lib/utils'
 	import { isDeployable, ALL_DEPLOYABLE } from '$lib/utils_deployable'
 
 	import DetailPageLayout from '$lib/components/details/DetailPageLayout.svelte'
+	import OnBehalfOfBadge from '$lib/components/details/OnBehalfOfBadge.svelte'
 	import { goto } from '$lib/navigation'
 	import { base } from '$lib/base'
 	import { Badge as HeaderBadge, Alert } from '$lib/components/common'
 	import MoveDrawer from '$lib/components/MoveDrawer.svelte'
 	import RunForm from '$lib/components/RunForm.svelte'
 	import ShareModal from '$lib/components/ShareModal.svelte'
-	import { enterpriseLicense, userStore, workspaceStore } from '$lib/stores'
+	import { enterpriseLicense, userStore, userWorkspaces, workspaceStore } from '$lib/stores'
 	import { sendUserToast } from '$lib/toast'
 	import DeployWorkspaceDrawer from '$lib/components/DeployWorkspaceDrawer.svelte'
 	import SavedInputsV2 from '$lib/components/SavedInputsV2.svelte'
@@ -28,7 +38,7 @@
 		Archive,
 		Trash,
 		ChevronUpSquare,
-		Share,
+		Shield,
 		Loader2,
 		GitFork,
 		Play,
@@ -41,8 +51,7 @@
 
 	import DetailPageHeader from '$lib/components/details/DetailPageHeader.svelte'
 	import FlowGraphViewer from '$lib/components/FlowGraphViewer.svelte'
-	import { createAppFromFlow } from '$lib/components/details/createAppFromScript'
-	import { importStore } from '$lib/components/apps/store'
+	import { createRawAppFromFlow } from '$lib/components/details/createRawAppFromScript'
 	import TimeAgo from '$lib/components/TimeAgo.svelte'
 	import FlowGraphViewerStep from '$lib/components/FlowGraphViewerStep.svelte'
 	import GfmMarkdown from '$lib/components/GfmMarkdown.svelte'
@@ -66,14 +75,27 @@
 	import FlowChat from '$lib/components/flows/conversations/FlowChat.svelte'
 	import { slide } from 'svelte/transition'
 	import { twMerge } from 'tailwind-merge'
+	import CiTestResults from '$lib/components/CiTestResults.svelte'
+	import NoDirectDeployAlert from '$lib/components/NoDirectDeployAlert.svelte'
+	import {
+		buildForkEditUrl,
+		editInForkAllowed,
+		editInForkLabel,
+		onEditInForkClick
+	} from '$lib/utils/editInFork'
+	import { isCloudHosted } from '$lib/cloud'
+	import { agentStreamingEnabled } from '$lib/components/flows/agentFormFields'
 
 	let flow: Flow | undefined = $state()
-	let can_write = false
+	let can_write = $state(false)
 	let shareModal: ShareModal | undefined = $state()
 
 	let scheduledForStr: string | undefined = $state(undefined)
 	let invisible_to_owner: boolean | undefined = $state(undefined)
 	let overrideTag: string | undefined = $state(undefined)
+	let overrideTagNote: string | undefined = $state(undefined)
+	// Tag carried over from 'Run again', pending the dynamic-tag check in loadFlow
+	let carriedTag: string | undefined = undefined
 	let inputSelected: 'saved' | 'history' | undefined = $state(undefined)
 	let jsonView = $state(false)
 	let deploymentInProgress = $state(false)
@@ -103,7 +125,8 @@
 		initFlowGraphAssetsCtx({ getModules: () => flow?.value.modules ?? [] })
 	)
 
-	let previousPath: string | undefined = $state(undefined)
+	// `${path}|${version}` so navigating between pinned and latest re-runs loadFlow.
+	let previousLoadKey: string | undefined = $state(undefined)
 
 	async function archiveFlow(): Promise<void> {
 		await FlowService.archiveFlowByPath({
@@ -138,12 +161,47 @@
 		)
 	}
 
+	let pinnedVersion: number | undefined = $state(undefined)
+
 	async function loadFlow(): Promise<void> {
-		flow = await FlowService.getFlowByPath({
-			workspace: $workspaceStore!,
-			path,
-			withStarredInfo: true
-		})
+		const versionParam = page.url.searchParams.get('version')
+		const versionId = versionParam ? Number(versionParam) : NaN
+		if (Number.isFinite(versionId)) {
+			const versioned = await FlowService.getFlowVersion({
+				workspace: $workspaceStore!,
+				version: versionId
+			})
+			if (versioned.path !== path) {
+				sendUserToast(`Flow version ${versionId} belongs to ${versioned.path}, not ${path}.`, true)
+				goto(`/flows/get/${versioned.path}?workspace=${$workspaceStore}&version=${versionId}`)
+				return
+			}
+			flow = versioned
+			pinnedVersion = versionId
+		} else {
+			flow = await FlowService.getFlowByPath({
+				workspace: $workspaceStore!,
+				path,
+				withStarredInfo: true
+			})
+			pinnedVersion = undefined
+		}
+		// A carried non-template value equal to the resolution of the flow's own dynamic
+		// tag for these args is not an override but the previous run's pinned resolution:
+		// drop it so the backend re-resolves from the (possibly edited) args. A differing
+		// value is a genuine user override and a template re-resolves at push, so both stay.
+		if (
+			carriedTag &&
+			isDynamicTag(flow.tag) &&
+			!isTagTemplate(carriedTag) &&
+			interpolateTag(flow.tag ?? '', $workspaceStore!, args) === carriedTag
+		) {
+			if (overrideTag === carriedTag) {
+				overrideTag = undefined
+				overrideTagNote = `tag ${flow.tag} is resolved at run time, so the previous run's tag ${carriedTag} was not applied`
+			}
+			carriedTag = undefined
+		}
 		if (!flow.path.startsWith(`u/${$userStore?.username}`) && flow.path.split('/').length > 2) {
 			invisible_to_owner = flow.visible_to_runner_only
 		}
@@ -222,6 +280,8 @@
 	if (hash.length > 1) {
 		try {
 			let searchParams = new URLSearchParams(hash.slice(1))
+			carriedTag = extractTagFromSharableHash(searchParams)
+			overrideTag = carriedTag
 			let params = [...Object.entries(urlParamsToObject(searchParams))].map(([k, v]) => [
 				k,
 				JSON.parse(v)
@@ -246,7 +306,27 @@
 					href: `${base}/flows/add?template=${flow.path}`,
 					variant: 'subtle',
 					unifiedSize: 'md',
+					disabled: !showEditButtons,
 					startIcon: GitFork
+				}
+			})
+		}
+
+		if (
+			flow &&
+			!$userStore?.operator &&
+			!isCloudHosted() &&
+			editInForkAllowed($workspaceStore, $userWorkspaces)
+		) {
+			buttons.push({
+				label: editInForkLabel($workspaceStore, $userWorkspaces),
+				buttonProps: {
+					href: buildForkEditUrl('flow', flow.path),
+					onClick: (e: Event | undefined) =>
+						onEditInForkClick(e, 'flow', flow.path, { hasHref: true }),
+					unifiedSize: 'md',
+					variant: !showEditButtons ? 'default' : 'subtle',
+					startIcon: Pen
 				}
 			})
 		}
@@ -284,12 +364,15 @@
 				label: 'Build app',
 				buttonProps: {
 					onClick: async () => {
-						const app = createAppFromFlow(flow.path, flow.schema)
-						$importStore = JSON.parse(JSON.stringify(app))
-						await goto('/apps/add?nodraft=true')
+						const app = createRawAppFromFlow(flow.path, flow.summary, flow.schema)
+						// /apps_raw/add hard-reloads (cross-origin isolation), so the
+						// in-memory importStore would be dropped; hand off via sessionStorage.
+						sessionStorage.setItem('rawAppImport', JSON.stringify(app))
+						await goto('/apps_raw/add')
 					},
 					unifiedSize: 'md',
 					variant: 'subtle',
+					disabled: !showEditButtons,
 					startIcon: LayoutDashboard
 				}
 			})
@@ -297,10 +380,10 @@
 			buttons.push({
 				label: 'Edit',
 				buttonProps: {
-					href: `${base}/flows/edit/${path}?nodraft=true`,
+					href: `${base}/flows/edit/${path}`,
 					variant: 'accent',
 					unifiedSize: 'md',
-					disabled: !can_write,
+					disabled: !can_write || !showEditButtons,
 					startIcon: Pen
 				}
 			})
@@ -315,7 +398,7 @@
 			deployUiSettings = ALL_DEPLOYABLE
 			return
 		}
-		let settings = await WorkspaceService.getSettings({ workspace: $workspaceStore! })
+		let settings = await WorkspaceService.getPublicSettings({ workspace: $workspaceStore! })
 		deployUiSettings = settings.deploy_ui ?? ALL_DEPLOYABLE
 	}
 	getDeployUiSettings()
@@ -329,17 +412,19 @@
 		const menuItems: any = []
 
 		menuItems.push({
-			label: 'Share',
+			label: 'Permissions',
 			onclick: () => shareModal?.openDrawer(flow?.path ?? '', 'flow'),
-			Icon: Share,
+			Icon: Shield,
 			disabled: !can_write
 		})
 
-		menuItems.push({
-			label: 'Move/Rename',
-			onclick: () => moveDrawer?.openDrawer(flow?.path ?? '', flow?.summary, 'flow'),
-			Icon: FolderOpen
-		})
+		if (showEditButtons) {
+			menuItems.push({
+				label: 'Move/Rename',
+				onclick: () => moveDrawer?.openDrawer(flow?.path ?? '', flow?.summary, 'flow'),
+				Icon: FolderOpen
+			})
+		}
 
 		menuItems.push({
 			label: 'Audit logs',
@@ -357,7 +442,7 @@
 			})
 		}
 
-		if (can_write) {
+		if (can_write && showEditButtons) {
 			menuItems.push({
 				label: 'Deployments',
 				onclick: () => flowHistory?.open(),
@@ -423,8 +508,10 @@
 	})
 	$effect(() => {
 		if ($workspaceStore && $userStore && page.params.path) {
-			if (previousPath !== path) {
-				previousPath = path
+			const versionParam = page.url.searchParams.get('version') ?? ''
+			const loadKey = `${$workspaceStore}|${path}|${versionParam}`
+			if (previousLoadKey !== loadKey) {
+				previousLoadKey = loadKey
 				untrack(() => {
 					loadFlow()
 					loadTriggersCount()
@@ -433,16 +520,14 @@
 			}
 		}
 	})
+	let showEditButtons = $state(false)
 	let mainButtons = $derived(getMainButtons(flow, args))
 	let chatInputEnabled = $derived(flow?.value?.chat_input_enabled ?? false)
 	let shouldUseStreaming = $derived.by(() => {
 		const modules = flow?.value?.modules
 		const lastModule = modules && modules.length > 0 ? modules[modules.length - 1] : undefined
-		return (
-			lastModule?.value?.type === 'aiagent' &&
-			lastModule?.value?.input_transforms?.streaming?.type === 'static' &&
-			lastModule?.value?.input_transforms?.streaming?.value === true
-		)
+		if (lastModule?.value?.type !== 'aiagent') return false
+		return agentStreamingEnabled(lastModule.value)
 	})
 </script>
 
@@ -488,10 +573,20 @@
 			scriptOrFlowPath={flow?.path ?? ''}
 			errorHandlerKind="flow"
 			tag={flow?.tag ?? ''}
+			labels={flow?.labels}
+			inheritedLabels={flow?.inherited_labels}
 			summary={flow?.summary}
 			path={flow?.path}
+			onSaved={can_write
+				? async (newPath) => {
+						if (newPath !== flow?.path) {
+							await goto(`/flows/get/${newPath}?workspace=${$workspaceStore}`)
+						} else {
+							loadFlow()
+						}
+					}
+				: undefined}
 		>
-			<!-- @migration-task: migrate this slot by hand, `trigger-badges` is an invalid identifier -->
 			{#snippet trigger_badges()}
 				<TriggersBadge
 					showOnlyWithCount={true}
@@ -511,6 +606,11 @@
 			{#if $workspaceStore && flow}
 				<Star kind="flow" path={flow.path} summary={flow.summary} />
 			{/if}
+			<OnBehalfOfBadge
+				onBehalfOf={flow?.on_behalf_of}
+				onBehalfOfEmail={flow?.on_behalf_of_email}
+				kind="flow"
+			/>
 			{#if flow?.value?.priority != undefined}
 				<div class="hidden md:block">
 					<HeaderBadge color="blue" variant="outlined" size="xs">
@@ -528,6 +628,9 @@
 		</DetailPageHeader>
 	{/snippet}
 	{#snippet form()}
+		<div class="px-3">
+			<NoDirectDeployAlert onUpdateCanEditStatus={(v) => (showEditButtons = v)} />
+		</div>
 		{#if flow}
 			<div class="flex flex-col h-full bg-surface divide-y" bind:clientHeight={paneHeight}>
 				<div bind:clientHeight={topSectionHeight} class={twMerge(chatInputEnabled ? 'h-full' : '')}>
@@ -538,8 +641,22 @@
 							'mx-auto'
 						)}
 					>
+						{#if flow?.path}
+							<CiTestResults path={flow.path} kind="flow" />
+						{/if}
+
 						{#if flow?.archived}
 							<Alert type="error" title="Archived">This flow was archived</Alert>
+							<div class="h-4"></div>
+						{/if}
+
+						{#if pinnedVersion !== undefined}
+							<Alert type="info" title="Viewing pinned version {pinnedVersion}">
+								This is a historical version of the flow, not the latest.
+								<a class="underline" href="/flows/get/{path}?workspace={$workspaceStore}">
+									View latest
+								</a>
+							</Alert>
 							<div class="h-4"></div>
 						{/if}
 
@@ -613,9 +730,6 @@
 													rightTooltip: 'Fill args from JSON'
 												}}
 												lightMode
-												on:change={(e) => {
-													runForm?.setCode(JSON.stringify(args ?? {}, null, '\t'))
-												}}
 											/>
 										{/if}
 									</div>
@@ -628,6 +742,7 @@
 											goto(`/flows/edit/${flow?.path}`)
 										}}
 										runnableType="flow"
+										path={flow?.path}
 									/>
 								{/if}
 
@@ -635,6 +750,7 @@
 									bind:scheduledForStr
 									bind:invisible_to_owner
 									bind:overrideTag
+									{overrideTagNote}
 									viewKeybinding
 									{loading}
 									autofocus
@@ -696,7 +812,7 @@
 				const nargs = JSON.parse(JSON.stringify(e.detail))
 				args = nargs
 				if (jsonView) {
-					runForm?.setCode(JSON.stringify(args ?? {}, null, '\t'))
+					runForm?.syncJsonEditor()
 				}
 			}}
 		/>

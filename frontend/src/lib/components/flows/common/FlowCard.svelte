@@ -5,6 +5,9 @@
 	interface Props {
 		title?: string | undefined
 		summary?: string | undefined
+		description?: string | undefined
+		subtitle?: string | undefined
+		subtitleDocLink?: string | undefined
 		noEditor: boolean
 		noHeader?: boolean
 		flowModuleValue?: FlowModuleValue | undefined
@@ -12,18 +15,23 @@
 		action?: import('svelte').Snippet
 		children?: import('svelte').Snippet
 		isAgentTool?: boolean
+		siblingToolNames?: string[]
 	}
 
 	let {
 		title = undefined,
 		summary = $bindable(undefined),
+		description = $bindable(undefined),
+		subtitle = undefined,
+		subtitleDocLink = undefined,
 		noEditor,
 		noHeader = false,
 		flowModuleValue = undefined,
 		header,
 		action,
 		children,
-		isAgentTool = false
+		isAgentTool = false,
+		siblingToolNames = undefined
 	}: Props = $props()
 </script>
 
@@ -33,11 +41,16 @@
 			<FlowCardHeader
 				on:setHash
 				on:reload
+				on:fork
 				{title}
 				bind:summary
+				bind:description
+				{subtitle}
+				{subtitleDocLink}
 				{flowModuleValue}
 				{action}
 				{isAgentTool}
+				{siblingToolNames}
 			>
 				{@render header?.()}
 			</FlowCardHeader>

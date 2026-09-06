@@ -13,11 +13,10 @@ use itertools::Itertools;
 #[cfg(feature = "csharp")]
 use tokio::{fs::File, io::AsyncReadExt, process::Command};
 #[cfg(feature = "csharp")]
-use windmill_common::{
-    utils::calculate_hash,
-    worker::{save_cache, write_file},
-};
+use windmill_common::worker::write_file;
 
+#[cfg(feature = "csharp")]
+use crate::global_cache::save_cache;
 use windmill_common::error::{self, Error};
 #[cfg(feature = "csharp")]
 use windmill_queue::append_logs;
@@ -28,11 +27,14 @@ use windmill_queue::CanceledBy;
 use crate::{
     common::{
         build_command_with_isolation, check_executor_binary_exists, create_args_and_out_file,
-        get_reserved_variables, read_result, start_child_process, DEV_CONF_NSJAIL,
+        get_reserved_variables, read_result, resolve_nsjail_timeout,
+        resolve_nsjail_tmp_mount_block, start_child_process, DEV_CONF_NSJAIL,
     },
-    handle_child::handle_child, get_proxy_envs_for_lang,
-    CSHARP_CACHE_DIR, DISABLE_NSJAIL, DISABLE_NUSER, DOTNET_PATH, HOME_ENV, NSJAIL_PATH,
-    NUGET_CONFIG, PATH_ENV, TRACING_PROXY_CA_CERT_PATH, TZ_ENV,
+    get_proxy_envs_for_lang,
+    handle_child::handle_child,
+    is_sandboxing_enabled, read_ee_registry_with_workspace_override, CSHARP_CACHE_DIR,
+    DISABLE_NUSER, DOTNET_PATH, HOME_ENV, NSJAIL_PATH, NUGET_CONFIG, PATH_ENV,
+    TRACING_PROXY_CA_CERT_PATH, TZ_ENV,
 };
 #[cfg(feature = "csharp")]
 use windmill_common::scripts::ScriptLang;
@@ -55,17 +57,39 @@ const DOTNET_ROOT_DEFAULT: &str = "C:\\Program Files\\dotnet";
 const DOTNET_ROOT_DEFAULT: &str = "/usr/share/dotnet";
 
 #[cfg(feature = "csharp")]
+const DOTNET_TARGET_FRAMEWORK_DEFAULT: &str = "net9.0";
+
+#[cfg(feature = "csharp")]
 lazy_static::lazy_static! {
     static ref DOTNET_ROOT: String = std::env::var("DOTNET_ROOT").unwrap_or_else(|_| DOTNET_ROOT_DEFAULT.to_string());
+    static ref DOTNET_TARGET_FRAMEWORK: String = std::env::var("DOTNET_TARGET_FRAMEWORK").unwrap_or_else(|_| DOTNET_TARGET_FRAMEWORK_DEFAULT.to_string());
 }
 
 #[cfg(feature = "csharp")]
-const CSHARP_OBJECT_STORE_PREFIX: &str = const_format::concatcp!(
-    std::env::consts::OS,
-    "_",
-    std::env::consts::ARCH,
-    "_csharpbin/"
-);
+const CSHARP_OBJECT_STORE_PREFIX: &str =
+    const_format::concatcp!(crate::global_cache::TARGET, "_csharpbin/");
+
+/// Cache key of a C# build. The run path and the deploy-time prebuild must derive it the
+/// same way or the prebuilt binary is never found and gets rebuilt on first run.
+#[cfg(feature = "csharp")]
+async fn csharp_cache_key(
+    code: &str,
+    requirements_o: Option<&str>,
+    w_id: &str,
+    modules: Option<&HashMap<String, windmill_common::scripts::ScriptModule>>,
+) -> String {
+    // The SDK project globs every `.cs` under the job dir, so companion modules are
+    // compiled into the binary this key names and have to be part of it.
+    let base = format!(
+        "{}{}{}",
+        code,
+        requirements_o.unwrap_or(""),
+        DOTNET_TARGET_FRAMEWORK.as_str()
+    );
+    let mut hash = crate::worker::artifact_cache_name(base, modules);
+    hash.push_str(&crate::workspace_registry_cache_suffix(w_id).await);
+    hash
+}
 
 #[cfg(feature = "csharp")]
 pub async fn generate_nuget_lockfile(
@@ -81,8 +105,19 @@ pub async fn generate_nuget_lockfile(
 ) -> error::Result<String> {
     check_executor_binary_exists("dotnet", DOTNET_PATH.as_str(), "C#")?;
 
-    if let Some(nuget_config) = NUGET_CONFIG.read().await.clone() {
-        write_file(job_dir, "nuget.config", &nuget_config)?;
+    if let Some(nuget_config) = read_ee_registry_with_workspace_override(
+        NUGET_CONFIG.read().await.clone(),
+        "nuget_config",
+        "nuget config",
+        job_id,
+        w_id,
+        conn,
+    )
+    .await
+    {
+        if !nuget_config.trim().is_empty() {
+            write_file(job_dir, "nuget.config", &nuget_config)?;
+        }
     }
 
     let (reqs, lines_to_remove) = parse_csharp_reqs(code);
@@ -92,7 +127,12 @@ pub async fn generate_nuget_lockfile(
     let mut gen_lockfile_cmd = Command::new(DOTNET_PATH.as_str());
     gen_lockfile_cmd
         .current_dir(job_dir)
+        .env("DOTNET_CLI_HOME", &*CSHARP_CACHE_DIR)
+        .env("NUGET_PACKAGES", format!("{}/nuget", *CSHARP_CACHE_DIR))
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "true")
+        .env("DOTNET_NOLOGO", "true")
         .env("MSBUILDDISABLENODEREUSE", "1")
+        .env("DOTNET_ROOT", DOTNET_ROOT.as_str())
         .args(vec!["restore", "--use-lock-file"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -198,6 +238,7 @@ fn gen_cs_proj(
         )
     };
 
+    let target_framework = DOTNET_TARGET_FRAMEWORK.as_str();
     write_file(
         job_dir,
         "Main.csproj",
@@ -205,7 +246,7 @@ fn gen_cs_proj(
             r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>{target_framework}</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <StartupObject>WindmillScriptCSharpInternal.Wrapper</StartupObject>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
@@ -328,8 +369,19 @@ async fn build_cs_proj(
     hash: &str,
     occupancy_metrics: &mut OccupancyMetrics,
 ) -> error::Result<String> {
-    if let Some(nuget_config) = NUGET_CONFIG.read().await.clone() {
-        write_file(job_dir, "nuget.config", &nuget_config)?;
+    if let Some(nuget_config) = read_ee_registry_with_workspace_override(
+        NUGET_CONFIG.read().await.clone(),
+        "nuget_config",
+        "nuget config",
+        job_id,
+        w_id,
+        conn,
+    )
+    .await
+    {
+        if !nuget_config.trim().is_empty() {
+            write_file(job_dir, "nuget.config", &nuget_config)?;
+        }
     }
 
     let mut build_cs_cmd = Command::new(DOTNET_PATH.as_str());
@@ -339,6 +391,8 @@ async fn build_cs_proj(
         .env("PATH", PATH_ENV.as_str())
         .env("BASE_INTERNAL_URL", base_internal_url)
         .env("HOME", HOME_ENV.as_str())
+        .env("DOTNET_CLI_HOME", &*CSHARP_CACHE_DIR)
+        .env("NUGET_PACKAGES", format!("{}/nuget", *CSHARP_CACHE_DIR))
         .env("DOTNET_CLI_TELEMETRY_OPTOUT", "true")
         .env("DOTNET_NOLOGO", "true")
         .env("MSBUILDDISABLENODEREUSE", "1")
@@ -348,7 +402,7 @@ async fn build_cs_proj(
             "--configuration",
             "Release",
             "-o",
-            job_dir,
+            &format!("{job_dir}/out"),
             "--no-self-contained",
             "-p:PublishSingleFile=true",
             "-p:IncludeNativeLibrariesForSelfExtract=true",
@@ -404,11 +458,11 @@ async fn build_cs_proj(
         }
     }
 
-    let bin_path = format!("{}/{hash}", CSHARP_CACHE_DIR);
+    let bin_path = format!("{}/{hash}", *CSHARP_CACHE_DIR);
     #[cfg(unix)]
-    let target = format!("{job_dir}/Main");
+    let target = format!("{job_dir}/out/Main");
     #[cfg(windows)]
-    let target = format!("{job_dir}/Main.exe");
+    let target = format!("{job_dir}/out/Main.exe");
 
     match save_cache(
         &bin_path,
@@ -419,12 +473,57 @@ async fn build_cs_proj(
     .await
     {
         Err(e) => {
-            let em = format!("could not save {job_dir}/Main to C# cache: {e:?}",);
+            let em = format!("could not save {job_dir}/out/Main to C# cache: {e:?}",);
             tracing::error!(em);
             Ok(em)
         }
         Ok(logs) => Ok(logs),
     }
+}
+
+/// Build a deployed C# script ahead of its first run and push the binary to the shared
+/// cache.
+#[cfg(feature = "csharp")]
+pub async fn prebuild_csharp_binary(
+    job: &MiniPulledJob,
+    code: &str,
+    lock: &str,
+    mem_peak: &mut i32,
+    canceled_by: &mut Option<CanceledBy>,
+    job_dir: &str,
+    conn: &Connection,
+    worker_name: &str,
+    base_internal_url: &str,
+    occupancy_metrics: &mut OccupancyMetrics,
+    modules: Option<&HashMap<String, windmill_common::scripts::ScriptModule>>,
+) -> error::Result<Option<String>> {
+    check_executor_binary_exists("dotnet", DOTNET_PATH.as_str(), "C#")?;
+
+    let hash = csharp_cache_key(code, Some(lock), &job.workspace_id, modules).await;
+    let remote_path = format!("{CSHARP_OBJECT_STORE_PREFIX}{hash}");
+    if crate::global_cache::exists_in_object_store(&remote_path).await {
+        return Ok(None);
+    }
+
+    let (reqs, lines_to_remove) = parse_csharp_reqs(code);
+    gen_cs_proj(code, job_dir, reqs, lines_to_remove)?;
+    write_file(job_dir, "packages.lock.json", lock)?;
+
+    let logs = build_cs_proj(
+        &job.id,
+        mem_peak,
+        canceled_by,
+        job_dir,
+        conn,
+        worker_name,
+        &job.workspace_id,
+        base_internal_url,
+        &hash,
+        occupancy_metrics,
+    )
+    .await?;
+    crate::global_cache::ensure_pushed_to_object_store(&remote_path).await?;
+    Ok(Some(logs))
 }
 
 #[cfg(feature = "csharp")]
@@ -459,6 +558,7 @@ pub async fn handle_csharp_job(
     _worker_name: &str,
     _envs: HashMap<String, String>,
     _occupancy_metrics: &mut OccupancyMetrics,
+    _modules: Option<&HashMap<String, windmill_common::scripts::ScriptModule>>,
 ) -> Result<Box<RawValue>, Error> {
     Err(anyhow!("C# is not available because the feature is not enabled").into())
 }
@@ -478,28 +578,36 @@ pub async fn handle_csharp_job(
     worker_name: &str,
     envs: HashMap<String, String>,
     occupancy_metrics: &mut OccupancyMetrics,
+    modules: Option<&HashMap<String, windmill_common::scripts::ScriptModule>>,
 ) -> Result<Box<RawValue>, Error> {
     check_executor_binary_exists("dotnet", DOTNET_PATH.as_str(), "C#")?;
 
-    let hash = calculate_hash(&format!(
-        "{}{}",
+    let hash = csharp_cache_key(
         inner_content,
-        requirements_o.unwrap_or(&String::new())
-    ));
-    let bin_path = format!("{}/{hash}", CSHARP_CACHE_DIR);
+        requirements_o.map(|x| x.as_str()),
+        &job.workspace_id,
+        modules,
+    )
+    .await;
+    let bin_path = format!("{}/{hash}", *CSHARP_CACHE_DIR);
     let remote_path = format!("{CSHARP_OBJECT_STORE_PREFIX}{hash}");
 
-    let (cache, cache_logs) =
-        windmill_common::worker::load_cache(&bin_path, &remote_path, false).await;
+    let (cache, cache_logs) = crate::global_cache::load_cache(&bin_path, &remote_path, false).await;
 
     let cache_logs = if cache {
         #[cfg(unix)]
         {
-            let target = format!("{job_dir}/Main");
+            let out_dir = format!("{job_dir}/out");
+            std::fs::create_dir_all(&out_dir).map_err(|e| {
+                Error::ExecutionErr(format!(
+                    "could not create output directory {out_dir}: {e:?}"
+                ))
+            })?;
+            let target = format!("{out_dir}/Main");
             let symlink = std::os::unix::fs::symlink(&bin_path, &target);
             symlink.map_err(|e| {
                 Error::ExecutionErr(format!(
-                    "could not copy cached binary from {bin_path} to {job_dir}/Main: {e:?}"
+                    "could not copy cached binary from {bin_path} to {target}: {e:?}"
                 ))
             })?;
         }
@@ -555,18 +663,25 @@ pub async fn handle_csharp_job(
     let reserved_variables =
         get_reserved_variables(job, &client.token, conn, parent_runnable_path).await?;
 
-    let child = if !*DISABLE_NSJAIL {
+    let child = if is_sandboxing_enabled() {
+        let nsjail_timeout =
+            resolve_nsjail_timeout(conn, &job.workspace_id, job.id, job.timeout).await;
         write_file(
             job_dir,
             "run.config.proto",
             &NSJAIL_CONFIG_RUN_CSHARP_CONTENT
                 .replace("{JOB_DIR}", job_dir)
-                .replace("{CACHE_DIR}", CSHARP_CACHE_DIR)
+                .replace("{CACHE_DIR}", &*CSHARP_CACHE_DIR)
                 .replace("{CACHE_HASH}", &hash)
                 .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
                 .replace("{SHARED_MOUNT}", shared_mount)
-                .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
-                .replace("#{DEV}", DEV_CONF_NSJAIL),
+                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
+                .replace("#{DEV}", DEV_CONF_NSJAIL)
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
+                .replace("{TIMEOUT}", &nsjail_timeout),
         )?;
         let mut nsjail_cmd = Command::new(NSJAIL_PATH.as_str());
         nsjail_cmd
@@ -574,10 +689,21 @@ pub async fn handle_csharp_job(
             .env_clear()
             .envs(envs)
             .envs(reserved_variables)
-            .envs(get_proxy_envs_for_lang(&ScriptLang::CSharp).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::CSharp,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
             .env("PATH", PATH_ENV.as_str())
             .env("TZ", TZ_ENV.as_str())
             .env("BASE_INTERNAL_URL", base_internal_url)
+            .env("DOTNET_CLI_HOME", &*CSHARP_CACHE_DIR)
+            .env("NUGET_PACKAGES", format!("{}/nuget", *CSHARP_CACHE_DIR))
             .env("DOTNET_CLI_TELEMETRY_OPTOUT", "true")
             .env("DOTNET_NOLOGO", "true")
             .env("DOTNET_ROOT", DOTNET_ROOT.as_str())
@@ -591,12 +717,12 @@ pub async fn handle_csharp_job(
         start_child_process(nsjail_cmd, NSJAIL_PATH.as_str(), true).await?
     } else {
         #[cfg(unix)]
-        let compiled_executable_name = "./Main".to_string();
+        let compiled_executable_name = "./out/Main".to_string();
         #[cfg(windows)]
         let compiled_executable_name = if cache {
             bin_path.to_string()
         } else {
-            format!("{job_dir}/Main.exe")
+            format!("{job_dir}/out/Main.exe")
         };
 
         let mut run_csharp = build_command_with_isolation(&compiled_executable_name, &[]);
@@ -605,9 +731,20 @@ pub async fn handle_csharp_job(
             .env_clear()
             .envs(envs)
             .envs(reserved_variables)
-            .envs(get_proxy_envs_for_lang(&ScriptLang::CSharp).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::CSharp,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
             .env("PATH", PATH_ENV.as_str())
             .env("TZ", TZ_ENV.as_str())
+            .env("DOTNET_CLI_HOME", &*CSHARP_CACHE_DIR)
+            .env("NUGET_PACKAGES", format!("{}/nuget", *CSHARP_CACHE_DIR))
             .env("DOTNET_CLI_TELEMETRY_OPTOUT", "true")
             .env("DOTNET_NOLOGO", "true")
             .env("DOTNET_ROOT", DOTNET_ROOT.as_str())
@@ -649,7 +786,7 @@ pub async fn handle_csharp_job(
         mem_peak,
         canceled_by,
         child,
-        !*DISABLE_NSJAIL,
+        is_sandboxing_enabled(),
         worker_name,
         &job.workspace_id,
         "csharp run",

@@ -7,6 +7,7 @@
 	interface Props {
 		disabled?: boolean
 		apiKey?: string | undefined
+		workspace?: string | undefined
 		resourcePath?: string | undefined
 		aiProvider: AIProvider
 		model: string
@@ -15,6 +16,7 @@
 	let {
 		disabled = false,
 		apiKey = undefined,
+		workspace = undefined,
 		resourcePath = undefined,
 		aiProvider,
 		model
@@ -24,7 +26,7 @@
 </script>
 
 <Button
-	size="xs"
+	unifiedSize="md"
 	variant="default"
 	{disabled}
 	{loading}
@@ -38,6 +40,7 @@
 
 			await testKey({
 				apiKey,
+				workspace,
 				resourcePath,
 				messages: [
 					{

@@ -5,9 +5,9 @@
 
 	import CenteredPage from '$lib/components/CenteredPage.svelte'
 	import { Button, Drawer, DrawerContent, Skeleton } from '$lib/components/common'
-	import Popover from '$lib/components/meltComponents/Popover.svelte'
 	import Dropdown from '$lib/components/DropdownV2.svelte'
-	import GroupEditor from '$lib/components/GroupEditor.svelte'
+	import GroupEditorDrawer from '$lib/components/GroupEditorDrawer.svelte'
+	import InstanceGroupEditor from '$lib/components/InstanceGroupEditor.svelte'
 	import GroupInfo from '$lib/components/GroupInfo.svelte'
 	import PageHeader from '$lib/components/PageHeader.svelte'
 	import SharedBadge from '$lib/components/SharedBadge.svelte'
@@ -19,15 +19,18 @@
 	import Cell from '$lib/components/table/Cell.svelte'
 	import Row from '$lib/components/table/Row.svelte'
 	import { untrack } from 'svelte'
-	import TextInput from '$lib/components/text_input/TextInput.svelte'
 	import { Tooltip } from '$lib/components/meltComponents'
+	import { DEMO_RESTRICTION_HINT, isDemoWorkspaceRestricted } from '$lib/cloud'
 
 	type GroupW = Group & { canWrite: boolean }
 
-	let newGroupName: string = $state('')
+	let restricted = $derived(
+		isDemoWorkspaceRestricted($workspaceStore, $userStore?.is_admin, $userStore?.is_super_admin)
+	)
+
 	let groups: GroupW[] | undefined = $state(undefined)
 	let instanceGroups: InstanceGroupWithWorkspaces[] | undefined = $state(undefined)
-	let groupDrawer: Drawer | undefined = $state()
+	let groupEditorDrawer: GroupEditorDrawer | undefined = $state()
 
 	async function loadGroups(): Promise<void> {
 		groups = (await GroupService.listGroups({ workspace: $workspaceStore! })).map((x) => {
@@ -43,24 +46,6 @@
 		}
 	}
 
-	function handleKeyUp(event: KeyboardEvent, close: () => void) {
-		const key = event.key
-		if (key === 'Enter') {
-			event.preventDefault()
-			addGroup()
-			close()
-		}
-	}
-	async function addGroup() {
-		await GroupService.createGroup({
-			workspace: $workspaceStore ?? '',
-			requestBody: { name: newGroupName }
-		})
-		loadGroups()
-		editGroupName = newGroupName
-		groupDrawer?.openDrawer()
-	}
-
 	$effect(() => {
 		untrack(() => loadInstanceGroups())
 		if ($workspaceStore && $userStore) {
@@ -68,12 +53,18 @@
 		}
 	})
 
-	let editGroupName: string = $state('')
+	let instanceGroupDrawer: Drawer | undefined = $state()
+	let editInstanceGroupName: string = $state('')
 </script>
 
-<Drawer bind:this={groupDrawer}>
-	<DrawerContent title="Group {editGroupName}" on:close={groupDrawer.closeDrawer}>
-		<GroupEditor on:update={loadGroups} name={editGroupName} />
+<GroupEditorDrawer bind:this={groupEditorDrawer} onSaved={loadGroups} />
+
+<Drawer bind:this={instanceGroupDrawer}>
+	<DrawerContent
+		title="Instance Group {editInstanceGroupName}"
+		on:close={instanceGroupDrawer?.closeDrawer}
+	>
+		<InstanceGroupEditor on:update={loadInstanceGroups} name={editInstanceGroupName} />
 	</DrawerContent>
 </Drawer>
 
@@ -91,40 +82,26 @@
 		>
 			<div class="flex flex-row">
 				<div>
-					<Popover
-						floatingConfig={{ strategy: 'absolute', placement: 'bottom-end' }}
-						containerClasses="border rounded-lg shadow-lg p-4 bg-surface"
-					>
-						{#snippet trigger()}
-							<Button unifiedSize="md" variant="accent" startIcon={{ icon: Plus }} nonCaptureEvent
-								>New&nbsp;group</Button
-							>
-						{/snippet}
-						{#snippet content({ close })}
-							<div class="flex-col flex gap-2 p-4">
-								<TextInput
-									size="md"
-									inputProps={{
-										placeholder: 'New group name',
-										onkeyup: (e) => handleKeyUp(e, close)
-									}}
-									bind:value={newGroupName}
-								/>
-								<Button
-									unifiedSize="md"
-									variant="accent"
-									startIcon={{ icon: Plus }}
-									disabled={!newGroupName}
-									on:click={() => {
-										addGroup()
-										close()
-									}}
-								>
-									Create
-								</Button>
-							</div>
-						{/snippet}
-					</Popover>
+					{#if restricted}
+						<Button
+							unifiedSize="md"
+							variant="accent"
+							startIcon={{ icon: Plus }}
+							disabled
+							title={DEMO_RESTRICTION_HINT}
+						>
+							New&nbsp;group
+						</Button>
+					{:else}
+						<Button
+							unifiedSize="md"
+							variant="accent"
+							startIcon={{ icon: Plus }}
+							on:click={() => groupEditorDrawer?.initNew()}
+						>
+							New&nbsp;group
+						</Button>
+					{/if}
 				</div>
 			</div>
 		</PageHeader>
@@ -135,7 +112,7 @@
 					<tr>
 						<Cell head first>Name</Cell>
 						<Cell head>Members</Cell>
-						<Cell head last />
+						<Cell head last actions>Actions</Cell>
 					</tr>
 				</Head>
 				<tbody class="divide-y">
@@ -149,13 +126,7 @@
 						{/each}
 					{:else}
 						{#each groups as { name, summary, extra_perms, canWrite } (name)}
-							<Row
-								hoverable
-								on:click={() => {
-									editGroupName = name
-									groupDrawer?.openDrawer()
-								}}
-							>
+							<Row hoverable on:click={() => groupEditorDrawer?.initEdit(name)}>
 								<Cell first>
 									<div class="flex flex-row gap-2 justify-between">
 										<div>
@@ -171,7 +142,7 @@
 								<Cell>
 									<GroupInfo {name} />
 								</Cell>
-								<Cell>
+								<Cell last actions shouldStopPropagation>
 									<Dropdown
 										items={[
 											{
@@ -180,8 +151,7 @@
 												disabled: !canWrite,
 												action: (e) => {
 													e?.stopPropagation()
-													editGroupName = name
-													groupDrawer?.openDrawer()
+													groupEditorDrawer?.initEdit(name)
 												}
 											},
 											{
@@ -220,25 +190,27 @@
 						<tr>
 							<Cell head first>Name</Cell>
 							<Cell head>Members</Cell>
+							<Cell head>Instance Role</Cell>
 							<Cell head last>Workspaces</Cell>
 						</tr>
 					</Head>
 					<tbody class="divide-y">
-						{#each instanceGroups ?? [] as { name, emails, workspaces }}
+						{#each instanceGroups ?? [] as { name, emails, instance_role, workspaces }}
 							<Row>
 								<Cell first>
 									<a
 										href="#{name}"
 										onclick={() => {
 											if (name) {
-												editGroupName = name
-												groupDrawer?.openDrawer()
+												editInstanceGroupName = name
+												instanceGroupDrawer?.openDrawer()
 											}
 										}}
 										>{name}
 									</a>
 								</Cell>
 								<Cell>{emails?.length ?? 0} members</Cell>
+								<Cell>{instance_role ?? '-'}</Cell>
 								<Cell last>
 									{#if workspaces && workspaces.length > 0}
 										{#each workspaces as workspace, index}

@@ -2,11 +2,16 @@
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-nocheck This file is copied from a JS project, so it's not type-safe.
 
-import { colors, encodeHex, log, SEP } from "../../deps.ts";
+import { colors } from "@cliffy/ansi/colors";
+import * as log from "../core/log.ts";
+import { sep as SEP } from "node:path";
 import crypto from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import { fetchVersion } from "../core/context.ts";
 import { updateGlobalVersions } from "../commands/sync/global.ts";
 import { isRawAppPath } from "./resource_folders.ts";
+import { VERSION } from "../core/constants.ts";
 
 export function deepEqual<T>(a: T, b: T): boolean {
   if (a === b) return true;
@@ -86,7 +91,7 @@ export function deepEqual<T>(a: T, b: T): boolean {
 }
 
 export function getHeaders(): Record<string, string> | undefined {
-  const headers = Deno.env.get("HEADERS");
+  const headers = process.env["HEADERS"];
   if (headers) {
     const parsedHeaders = Object.fromEntries(
       headers.split(",").map((h) => h.split(":").map((s) => s.trim()))
@@ -102,11 +107,13 @@ export function getHeaders(): Record<string, string> | undefined {
 
 export async function digestDir(path: string, conf: string) {
   const hashes: string = [];
-  for await (const e of Deno.readDir(path)) {
+  const entries = await readdir(path, { withFileTypes: true });
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const e of entries) {
     const npath = path + "/" + e.name;
-    if (e.isFile) {
-      hashes.push(await generateHashFromBuffer(await Deno.readFile(npath)));
-    } else if (e.isDirectory && !e.isSymlink) {
+    if (e.isFile()) {
+      hashes.push(await generateHashFromBuffer(await readFile(npath)));
+    } else if (e.isDirectory() && !e.isSymbolicLink()) {
       hashes.push(await digestDir(npath, ""));
     }
   }
@@ -122,16 +129,56 @@ export async function generateHashFromBuffer(
   content: BufferSource
 ): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", content);
-  return encodeHex(hashBuffer);
+  return Buffer.from(hashBuffer).toString("hex");
 }
 
-// export async function readInlinePath(path: string): Promise<string> {
-//   return await Deno.readTextFile(path.replaceAll("/", SEP));
-// }
+function decodeBufferAsUtf8(buf: Buffer, path: string | URL): string {
+  if (buf.length >= 2) {
+    if (buf[0] === 0xff && buf[1] === 0xfe) {
+      if (buf.length >= 4 && buf[2] === 0x00 && buf[3] === 0x00) {
+        throw new Error(
+          `File ${path} is encoded as UTF-32 LE, which is not supported. Please convert it to UTF-8.`
+        );
+      }
+      throw new Error(
+        `File ${path} is encoded as UTF-16 LE, which is not supported. Please convert it to UTF-8.`
+      );
+    }
+    if (buf[0] === 0xfe && buf[1] === 0xff) {
+      throw new Error(
+        `File ${path} is encoded as UTF-16 BE, which is not supported. Please convert it to UTF-8.`
+      );
+    }
+    if (buf.length >= 4 && buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0xfe && buf[3] === 0xff) {
+      throw new Error(
+        `File ${path} is encoded as UTF-32 BE, which is not supported. Please convert it to UTF-8.`
+      );
+    }
+  }
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return buf.subarray(3).toString("utf-8");
+  }
+  return buf.toString("utf-8");
+}
+
+export function stripBom(content: string): string {
+  if (content.charCodeAt(0) === 0xfeff) {
+    return content.slice(1);
+  }
+  return content;
+}
+
+export async function readTextFile(path: string | URL): Promise<string> {
+  return decodeBufferAsUtf8(await readFile(path), path);
+}
+
+export function readTextFileSync(path: string | URL): string {
+  return decodeBufferAsUtf8(readFileSync(path), path);
+}
 
 export function readInlinePathSync(path: string): string {
   try {
-    return Deno.readTextFileSync(path.replaceAll("/", SEP));
+    return readTextFileSync(path.replaceAll("/", SEP));
   } catch (error) {
     log.warn(`Error reading inline path: ${path}, ${error}`);
     return "";
@@ -153,6 +200,25 @@ export function isFileResource(path: string): boolean {
   );
 }
 
+/**
+ * Local resource path -> the resource's path on the server. The suffix is
+ * `.resource.<yaml|json>` on a metadata file but `.resource.file.<ext>` on a
+ * file resource, so its length depends on which of the two the path is.
+ */
+export function removeResourceSuffix(path: string): string {
+  if (isFileResource(path)) {
+    // isFileResource only matches a dotless extension, so the resource path is
+    // everything before the trailing `resource`, `file`, `<ext>` segments.
+    return path.split(".").slice(0, -3).join(".");
+  }
+  return path.replace(/\.resource\.(yaml|json)$/, "");
+}
+
+/** Matches children inside a .fileset/ directory, not the directory itself. */
+export function isFilesetResource(path: string): boolean {
+  return path.includes(".fileset/") || path.includes(".fileset\\");
+}
+
 export function isRawAppFile(path: string): boolean {
   return isRawAppPath(path);
 }
@@ -161,13 +227,10 @@ export function isWorkspaceDependencies(path: string): boolean {
   return path.startsWith("dependencies/");
 }
 
-export function printSync(input: string | Uint8Array, to = Deno.stdout) {
-  let bytesWritten = 0;
-  const bytes =
-    typeof input === "string" ? new TextEncoder().encode(input) : input;
-  while (bytesWritten < bytes.length) {
-    bytesWritten += to.writeSync(bytes.subarray(bytesWritten));
-  }
+export function printSync(input: string | Uint8Array) {
+  process.stdout.write(
+    typeof input === "string" ? input : Buffer.from(input)
+  );
 }
 
 // Repository interface for shared selection logic
@@ -194,7 +257,7 @@ export async function selectRepository<T extends Repository>(
   }
 
   // Check if we're in a non-interactive environment
-  const isInteractive = Deno.stdin.isTerminal() && Deno.stdout.isTerminal();
+  const isInteractive = !!process.stdin.isTTY && !!process.stdout.isTTY;
 
   if (!isInteractive) {
     const repoPaths = repositories.map((r) =>
@@ -208,7 +271,7 @@ export async function selectRepository<T extends Repository>(
   }
 
   // Import Select dynamically to avoid dependency issues
-  const { Select } = await import("../../deps.ts");
+  const { Select } = await import("@cliffy/prompt/select");
 
   console.log(
     `\nMultiple repositories found. Please select which repository to ${
@@ -249,21 +312,19 @@ export async function getIsWin(): Promise<boolean> {
  */
 export function writeIfChanged(path: string, content: string): boolean {
   try {
-    const existing = Deno.readTextFileSync(path);
+    const existing = readTextFileSync(path);
     if (existing === content) {
-      // console.log(`Content unchanged for ${path}`);
       return false; // Content unchanged, skip write
     }
-  } catch (error) {
+  } catch (error: any) {
     // File doesn't exist or can't be read, proceed with write
-    if (!(error instanceof Deno.errors.NotFound)) {
+    if (error?.code !== "ENOENT") {
       // If it's not a "not found" error, we might want to know about it
       // but still proceed with the write attempt
     }
   }
 
-  // console.log(`Writing content to ${path}`);
-  Deno.writeTextFileSync(path, content);
+  writeFileSync(path, content, "utf-8");
   return true; // File was written
 }
 
@@ -274,6 +335,7 @@ export async function fetchRemoteVersion(
   if (version) {
     updateGlobalVersions(version);
   }
+  log.info(colors.gray("CLI version: " + VERSION));
   log.info(colors.gray("Remote version: " + version));
 }
 
@@ -285,4 +347,25 @@ export function toCamel(s: string) {
 
 export function capitalize(str: string): string {
   return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+export function formatTimestamp(ts: string): string {
+  return new Date(ts).toISOString().replace("T", " ").substring(0, 19);
+}
+
+/**
+ * Validate that required arguments are present when no -d data was provided.
+ * Fetches the schema from the API and checks required fields.
+ * @param schema - The JSON schema object from the script/flow definition
+ * @throws Error if required arguments are missing
+ */
+export function validateRequiredArgs(
+  schema: Record<string, unknown> | undefined | null,
+): void {
+  const required = (schema as { required?: string[] })?.required ?? [];
+  if (required.length > 0) {
+    throw new Error(
+      `Missing required arguments: ${required.join(", ")}.\nUse -d '{"${required[0]}": ...}' to provide input data.`
+    );
+  }
 }

@@ -10,16 +10,13 @@ import { deepEqual } from 'fast-equals'
 import YAML from 'yaml'
 import { type UserExt } from './stores'
 import { sendUserToast } from './toast'
-import type { Job, RunnableKind, Script, ScriptLang, Retry } from './gen'
+import type { CompletedJob, Job, RunnableKind, Script, ScriptLang, Retry } from './gen'
 import type { EnumType, SchemaProperty } from './common'
 import type { Schema } from './common'
 export { sendUserToast }
 import type { AnyMeltElement } from '@melt-ui/svelte'
 import type { TriggerKind } from './components/triggers'
 import { stateSnapshot } from './svelte5Utils.svelte'
-import { validate, dereference } from '@scalar/openapi-parser'
-
-export type RunsSelectionMode = 'cancel' | 're-run'
 
 export namespace OpenApi {
 	export enum OpenApiVersion {
@@ -61,6 +58,7 @@ export namespace OpenApi {
 	 * @throws Will throw an error if the specification is invalid or cannot be parsed.
 	 */
 	export async function parse(api: string): Promise<[OpenAPI.Document, OpenApiVersion]> {
+		const { validate, dereference } = await import('@scalar/openapi-parser')
 		const { valid, errors } = await validate(api)
 
 		if (!valid) {
@@ -86,15 +84,21 @@ export function isJobReRunnable(j: Job): boolean {
 	return (j.job_kind === 'script' || j.job_kind === 'flow') && j.parent_job === undefined
 }
 
-export const WORKER_NAME_PREFIX = 'wk'
-
-export function isJobSelectable(selectionType: RunsSelectionMode) {
-	const f: (j: Job) => boolean = {
-		cancel: isJobCancelable,
-		're-run': isJobReRunnable
-	}[selectionType]
-	return f
+// Only a top-level failure can carry a resolution: cancellations and skipped steps are not
+// failures, and a flow step resolved on its own would render orange inside a flow whose status
+// is still red. The resolve endpoint enforces the same three conditions.
+// Runs obscured from another workspace stand in with `id: '-'`; they look like failures but
+// address nothing, and one reaching the endpoint fails the whole batch on UUID parsing.
+export function isJobResolvable(j: Job): j is CompletedJob {
+	return j.type === 'CompletedJob' && !j.success && !j.canceled && !j.is_flow_step && j.id !== '-'
 }
+
+// Mirror the caps enforced by /jobs/completed/resolve, so the UI can chunk and validate
+// before the API rejects a whole action.
+export const MAX_RESOLUTION_BATCH = 1000
+export const MAX_RESOLUTION_NOTE_LEN = 2000
+
+export const WORKER_NAME_PREFIX = 'wk'
 
 export function escapeHtml(unsafe: string) {
 	return unsafe
@@ -303,7 +307,7 @@ export function validatePassword(password: string): boolean {
 	return re.test(password)
 }
 
-const portalDivs = ['#app-editor-select', '.select-dropdown-portal']
+const portalDivs = ['#app-editor-select', '.dropdown-portal', '[data-context-menu]']
 
 interface ClickOutsideOptions {
 	capture?: boolean
@@ -854,6 +858,21 @@ export function isMac(): boolean {
 	return navigator.userAgent.indexOf('Mac OS X') !== -1
 }
 
+/**
+ * True on Chromium-based browsers (Chrome, Edge, Brave, Opera, ...). Gates
+ * capabilities that are only faithful on Blink, e.g. DOM screenshot capture.
+ * userAgentData is itself Chromium-only; the UA fallback covers Chromium
+ * versions predating it ("Chrome/" never appears in Gecko or WebKit UAs).
+ */
+export function isChromiumBrowser(): boolean {
+	if (typeof navigator === 'undefined') return false
+	const brands = (navigator as any).userAgentData?.brands
+	if (Array.isArray(brands)) {
+		return brands.some((entry) => typeof entry?.brand === 'string' && /chromium/i.test(entry.brand))
+	}
+	return /chrome\//i.test(navigator.userAgent)
+}
+
 export function getModifierKey(): string {
 	return isMac() ? '⌘' : 'Ctrl+'
 }
@@ -1032,6 +1051,16 @@ export function generateRandomString(len: number = 24): string {
 	return result
 }
 
+/** `u/<sanitized-username>/` — the default scope prefix for items owned by the
+ * current user. The username is normalized so emails and special characters
+ * don't leak into paths. */
+export function userPathPrefix(username: string | undefined): string {
+	const u = username?.includes('@')
+		? username.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '')
+		: (username ?? '')
+	return `u/${u}/`
+}
+
 export function deepMergeWithPriority<T>(target: T, source: T): T {
 	if (typeof target !== 'object' || typeof source !== 'object') {
 		return source
@@ -1137,8 +1166,19 @@ export function extractCustomProperties(styleStr: string): string {
 	return customStyleStr
 }
 
-export function computeSharableHash(args: any) {
-	let nargs = {}
+// Value prefix marking the reserved `__tag` key as a carried tag: no JSON-encoded
+// arg value can start with `t:` (JSON strings start with `"`, numbers with a digit
+// or `-`, etc.), so it cannot be confused with a genuine arg named `__tag`
+const SHARABLE_HASH_TAG_PREFIX = 't:'
+
+// `tag` is carried as the reserved key `__tag` with a SHARABLE_HASH_TAG_PREFIX value;
+// entry pairs allow a duplicate `__tag` key so an arg with that name can coexist with
+// the carried tag (they are told apart by the value prefix)
+export function computeSharableHash(args: any, tag?: string) {
+	let entries: [string, string][] = []
+	if (tag) {
+		entries.push(['__tag', SHARABLE_HASH_TAG_PREFIX + tag])
+	}
 	for (let k in args) {
 		let v = args[k]
 		if (v !== undefined) {
@@ -1148,16 +1188,95 @@ export function computeSharableHash(args: any) {
 				console.error(`Value at key ${k} too big (${size}) to be shared`)
 				return ''
 			}
-			nargs[k] = JSON.stringify(v)
+			entries.push([k, JSON.stringify(v)])
 		}
 	}
 	try {
-		let r = new URLSearchParams(nargs).toString()
+		let r = new URLSearchParams(entries).toString()
 		return r.length > 1000000 ? '' : r
 	} catch (e) {
 		console.error('Error computing sharable hash', e)
 		return ''
 	}
+}
+
+// `$args[...]` tags are resolved by the backend at push time from the run's args; a
+// job's stored tag is the resolved value, so re-running with it would pin a value
+// that no longer matches edited args. `$workspace` is also interpolated but resolves
+// identically on a re-run (same workspace), so it does not make a tag dynamic here.
+export function isDynamicTag(tag: string | undefined): boolean {
+	return !!tag && tag.includes('$args[')
+}
+
+// Must mirror the backend's RE_ARG_TAG (windmill-queue/src/jobs.rs) so frontend
+// interpolation resolves exactly the same placeholders as push time.
+const RE_ARG_TAG = /\$args\[((?:\w+\.)*\w+)\]/
+
+// True when the tag contains placeholders that the backend resolves at push time.
+// A carried tag override that is itself a template re-resolves on every run, so
+// it never pins a stale resolved value.
+export function isTagTemplate(tag: string | undefined): boolean {
+	return !!tag && (tag.includes('$workspace') || RE_ARG_TAG.test(tag))
+}
+
+// Frontend mirror of the backend's `interpolate_args` (windmill-queue/src/jobs.rs):
+// `$workspace` first, then each `$args[name]` from the run's args — simple names use
+// the arg's JSON text with surrounding quotes trimmed, dotted names traverse nested
+// objects, anything missing resolves to the empty string.
+export function interpolateTag(
+	template: string,
+	workspaceId: string,
+	args: Record<string, any> | undefined
+): string {
+	const workspaced = template.replaceAll('$workspace', workspaceId)
+	return workspaced.replace(new RegExp(RE_ARG_TAG.source, 'g'), (_, name: string) => {
+		const parts = name.split('.')
+		let value: any = args?.[parts[0]]
+		for (const part of parts.slice(1)) {
+			value = value != null && typeof value === 'object' ? value[part] : undefined
+		}
+		if (value === undefined) {
+			return ''
+		}
+		return (JSON.stringify(value) ?? '').replace(/^"+|"+$/g, '')
+	})
+}
+
+// Maps a job's stored (resolved) tag back to the raw custom-tag entry it can only
+// have come from: an exact entry, or a templated entry that resolves to it with the
+// job's workspace and args. Custom tags are the only tags a user can pick as an
+// override and the only ones non-superadmins may pass explicitly, so a tag that maps
+// to no entry is backend-derived and must be re-derived on re-run, not carried.
+export function findMatchingCustomTag(
+	resolvedTag: string,
+	customTags: string[],
+	workspaceId: string,
+	args: Record<string, any> | undefined
+): string | undefined {
+	if (customTags.includes(resolvedTag)) {
+		return resolvedTag
+	}
+	return customTags.find(
+		(t) => isTagTemplate(t) && interpolateTag(t, workspaceId, args) === resolvedTag
+	)
+}
+
+// Counterpart of computeSharableHash's `tag`: extracts and removes the carried tag.
+// Only SHARABLE_HASH_TAG_PREFIX-prefixed `__tag` values are carried tags; any other
+// `__tag` value is a genuine arg with that name and is left in `params` for arg parsing.
+export function extractTagFromSharableHash(params: URLSearchParams): string | undefined {
+	const values = params.getAll('__tag')
+	const carried = values.find((v) => v.startsWith(SHARABLE_HASH_TAG_PREFIX))
+	if (carried == undefined) {
+		return undefined
+	}
+	params.delete('__tag')
+	for (const v of values) {
+		if (!v.startsWith(SHARABLE_HASH_TAG_PREFIX)) {
+			params.append('__tag', v)
+		}
+	}
+	return carried.slice(SHARABLE_HASH_TAG_PREFIX.length)
 }
 
 export function toCamel(s: string) {
@@ -1186,9 +1305,24 @@ export function isCodeInjection(expr: string | undefined): boolean {
 	return dynamicTemplateRegex.test(expr)
 }
 
-export function urlParamsToObject(params: URLSearchParams): Record<string, string> {
+// Query params Windmill consumes internally and that should not be exposed to
+// app logic via the `query` context. Only params we actually own are listed
+// here — the `wm_` prefix is a naming convention, not a reserved namespace, so
+// we don't strip it wholesale (that would break apps reading their own `wm_*`
+// params). `wm_coep` is a transport flag for cross-origin isolation headers;
+// `wm_embed`/`wm_embedder_origin` are the opaque app viewer transport params
+// (see PublicAppFrame).
+export const WINDMILL_RESERVED_QUERY_PARAMS = new Set(['wm_coep', 'wm_embed', 'wm_embedder_origin'])
+
+export function urlParamsToObject(
+	params: URLSearchParams,
+	opts?: { stripReserved?: boolean }
+): Record<string, string> {
 	const result: Record<string, string> = {}
 	params.forEach((value, key) => {
+		if (opts?.stripReserved && WINDMILL_RESERVED_QUERY_PARAMS.has(key)) {
+			return
+		}
 		result[key] = value
 	})
 	return result
@@ -1283,18 +1417,61 @@ function replaceFalseWithUndefinedRec(obj: any) {
 	return obj
 }
 
+// Keys that are server-managed bookkeeping, never user-editable, and therefore
+// must not surface in any value diff or unsaved-change comparison. `getScriptByPath`
+// (and the flow/app equivalents) return the full DB row, so the editing object
+// carries these while the deployed side is fetched trimmed — leaving them in would
+// render as spurious metadata diff.
+//
+// `hash` is the deployed version's identity, `assets` is re-derived from the
+// script content by the editor, and `inherited_labels` is computed at read time
+// from the parent folder — none is editable content, so all three are noise in a
+// fork/workspace or version diff.
+//
+// `lock` and `extra_perms` are deliberately NOT in this set: both are legitimate,
+// user-meaningful fields in some diff contexts (lockfile changes in version-to-version
+// diffs, folder sharing-permission changes in workspace/fork diffs). The script-editor
+// noise they would otherwise cause is stripped at the source instead (the deployed side
+// in `ScriptBuilder.syncWithDeployed`, the current side in `ScriptBuilder.openDiffDrawer`).
+const CLEANED_VALUE_KEYS = new Set([
+	'parent_hash',
+	'hash',
+	'assets',
+	'inherited_labels',
+	'draft',
+	'draft_only',
+	'draft_saved_at',
+	'draft_created_at',
+	'is_draft',
+	'other_drafts_users',
+	'created_at',
+	'created_by',
+	'workspace_id',
+	'parent_hashes',
+	'lock_error_logs'
+])
+
 export function cleanValueProperties(obj: Value) {
 	if (typeof obj !== 'object') {
 		return obj
 	} else {
 		let newObj: any = {}
 		for (const key of Object.keys(obj)) {
-			if (key !== 'parent_hash' && key !== 'draft' && key !== 'draft_only') {
+			if (!CLEANED_VALUE_KEYS.has(key)) {
 				newObj[key] = structuredClone(stateSnapshot(obj[key]))
 			}
 		}
 		return newObj
 	}
+}
+
+export function hasUnsavedChanges(saved: Value, modified: Value): boolean {
+	const normalizedSaved = cleanValueProperties({ ...saved, path: undefined })
+	const normalizedModified = cleanValueProperties({ ...modified, path: undefined })
+	return (
+		orderedJsonStringify(replaceFalseWithUndefined(normalizedSaved)) !==
+		orderedJsonStringify(replaceFalseWithUndefined(normalizedModified))
+	)
 }
 
 export function orderedJsonStringify(obj: any, space?: string | number) {
@@ -1465,6 +1642,35 @@ export function isFlowPreview(job_kind: Job['job_kind'] | undefined) {
 	return !!job_kind && (job_kind === 'flowpreview' || job_kind === 'flownode')
 }
 
+export function isHubFlowPath(scriptPath: string | undefined | null) {
+	return !!scriptPath && scriptPath.startsWith('hub/flows/')
+}
+
+export function getHubFlowIdFromPath(scriptPath: string | undefined | null) {
+	if (!scriptPath || !isHubFlowPath(scriptPath)) {
+		return undefined
+	}
+
+	const hubFlowPath = scriptPath.substring('hub/flows/'.length)
+	const [idPart] = hubFlowPath.split('/')
+	const id = Number(idPart)
+
+	return Number.isInteger(id) && id > 0 ? id : undefined
+}
+
+export function getJobKindDisplayLabel(
+	jobKind: Job['job_kind'] | undefined,
+	scriptPath: string | undefined | null
+) {
+	if (jobKind === 'script_hub') {
+		return 'Script from hub'
+	}
+	if (isFlowPreview(jobKind) && isHubFlowPath(scriptPath)) {
+		return 'Flow from hub'
+	}
+	return jobKind ?? ''
+}
+
 export function isNotFlow(job_kind: Job['job_kind'] | undefined) {
 	return job_kind !== 'flow' && job_kind !== 'singlestepflow' && !isFlowPreview(job_kind)
 }
@@ -1487,6 +1693,8 @@ export type Item = {
 	action?: (e: MouseEvent) => void
 	icon?: any
 	iconColor?: string
+	/** Extra props for `icon`, for an icon that does not take lucide's `size`. */
+	iconProps?: Record<string, any>
 	href?: string
 	hrefTarget?: '_blank' | '_self' | '_parent' | '_top'
 	disabled?: boolean
@@ -1495,6 +1703,16 @@ export type Item = {
 	extra?: Snippet
 	id?: string
 	tooltip?: string
+	separatorTop?: boolean
+	/** Renders an on/off switch at the end of the row, so `icon` keeps the leading
+	 * slot. Presentational: the row's own click is what flips it, so `action` must
+	 * apply the change. */
+	toggle?: boolean
+	submenuItems?: Item[]
+	shortcut?: string
+	// Renders a trailing check on the right of the label to mark the
+	// currently-selected item (for dropdowns used as a single-choice picker).
+	selected?: boolean
 }
 
 export function isObjectTooBig(obj: any): boolean {
@@ -1577,6 +1795,44 @@ export function formatDateShort(dateString: string | undefined): string {
 		month: 'short',
 		day: 'numeric'
 	}).format(date)
+}
+
+export function formatDateRange(
+	start: string | Date | undefined,
+	end: string | Date | undefined
+): string {
+	if (typeof start === 'string') start = new Date(start)
+	if (typeof end === 'string') end = new Date(end)
+
+	if (start && end) {
+		const differentDays =
+			start.getFullYear() !== end.getFullYear() ||
+			start.getMonth() !== end.getMonth() ||
+			start.getDate() !== end.getDate()
+
+		const differentYears = start.getFullYear() !== end.getFullYear()
+
+		if (differentDays || differentYears) {
+			// Clone to avoid mutating originals
+			start = new Date(start)
+			end = new Date(end)
+			// Zero out time for display
+			start.setHours(0, 0, 0, 0)
+			end.setHours(0, 0, 0, 0)
+		}
+
+		if (differentYears) {
+			// Zero out month and day for display
+			start.setMonth(0, 1)
+			end.setMonth(0, 1)
+		}
+
+		return `${formatDatePretty(start)} to ${formatDatePretty(end)}`
+	}
+
+	if (!end && start) return `After ${formatDatePretty(start)}`
+	if (!start && end) return `Before ${formatDatePretty(end)}`
+	return 'No input'
 }
 
 export function toJsonStr(result: any) {
@@ -1779,6 +2035,8 @@ export function validateRetryConfig(retry: Retry | undefined): string | null {
 }
 export type CssColor = keyof (typeof tokensFile)['tokens']['light']
 import tokensFile from './assets/tokens/tokens.json'
+// Hand-authored variant kept out of the Figma-generated tokens.json.
+import githubDarkTokens from './assets/tokens/githubDark.json'
 import { darkModeName, lightModeName } from './assets/tokens/colorTokensConfig'
 import BarsStaggered from './components/icons/BarsStaggered.svelte'
 import { GitIcon } from './components/icons'
@@ -1791,7 +2049,7 @@ export function getCssColor(
 		format = 'css-var'
 	}: {
 		alpha?: number
-		format?: 'css-var' | 'hex-dark' | 'hex-light'
+		format?: 'css-var' | 'hex-dark' | 'hex-light' | 'hex-github-dark'
 	}
 ): string {
 	if (format === 'hex-light') {
@@ -1799,6 +2057,9 @@ export function getCssColor(
 	}
 	if (format === 'hex-dark') {
 		return tokensFile.tokens[darkModeName][color]
+	}
+	if (format === 'hex-github-dark') {
+		return githubDarkTokens[color]
 	}
 	return `rgb(var(--color-${color}) / ${alpha})`
 }
@@ -1989,17 +2250,27 @@ export function pick<T extends object, K extends keyof T>(obj: T, keys: readonly
 
 export function parseDbInputFromAssetSyntax(path: string): DbInput | null {
 	const [p1, _p2] = path.split('://')
-	const [p2, _p3] = _p2.split('/')
-	const [p3, p4] = _p3.split('.')
+	const [p2, _p3] = (_p2 ?? '').split('/')
+	// `_p3` is undefined for a catalog-only path (e.g. `ducklake://main`, no
+	// table segment) — guard the split so the helper returns a table-less input
+	// instead of throwing.
+	const [p3, p4] = (_p3 ?? '').split('.')
+	const specificTable = p4 || p3 || undefined
+	const specificSchema = p4 ? p3 : undefined
 	return p1 === 'ducklake'
-		? { type: 'ducklake', ducklake: p2 || 'main', specificTable: p4 ?? p3 }
+		? {
+				type: 'ducklake',
+				ducklake: p2 || 'main',
+				specificTable,
+				specificSchema
+			}
 		: p1 === 'datatable'
 			? {
 					type: 'database',
 					resourcePath: `datatable://${p2 || 'main'}`,
 					resourceType: 'postgresql',
-					specificTable: p4 ?? p3,
-					specificSchema: p4 ? p3 : undefined
+					specificTable,
+					specificSchema
 				}
 			: null
 }
@@ -2041,4 +2312,172 @@ export function formatMemory(
 	}
 
 	return display
+}
+
+export function assignObjInPlace(
+	target: Record<string, any>,
+	source: Record<string, any>,
+	options: { onDelete?: 'Delete' | 'SetNull' } = { onDelete: 'Delete' }
+) {
+	for (const key in target) {
+		if (!(key in source)) {
+			if (options?.onDelete === 'Delete') delete target[key]
+			else if (options?.onDelete === 'SetNull') target[key] = null
+		}
+	}
+	for (const key in source) target[key] = source[key]
+}
+
+export function isUSLocale(): boolean {
+	try {
+		const locale = Intl.DateTimeFormat().resolvedOptions().locale
+		return locale.startsWith('en-US')
+	} catch {
+		return false
+	}
+}
+
+export function formatDatePretty(date: Date): string {
+	if (!date || isNaN(date.getTime())) return ''
+
+	const now = new Date()
+	const year = date.getFullYear()
+	const month = date.getMonth() + 1
+	const day = date.getDate()
+	const hours = date.getHours()
+	const minutes = date.getMinutes()
+
+	const isCurrentYear = year === now.getFullYear()
+	const isToday = isCurrentYear && month === now.getMonth() + 1 && day === now.getDate()
+	const isOnlyYear = month === 1 && day === 1 && hours === 0 && minutes === 0
+	const hasTime = hours !== 0 || minutes !== 0
+
+	// If only year is defined (rest is 01/01 00:00)
+	if (isOnlyYear) {
+		return String(year)
+	}
+
+	// Format month/day depending on locale: MM/DD for US, DD/MM otherwise
+	const mm = String(month).padStart(2, '0')
+	const dd = String(day).padStart(2, '0')
+	const monthDay = isUSLocale() ? `${mm}/${dd}` : `${dd}/${mm}`
+	// Format time if present (12-hour format with AM/PM)
+	let timeStr = ''
+	if (hasTime) {
+		const isPM = hours >= 12
+		const displayHours = hours % 12 || 12
+		const displayMinutes = String(minutes).padStart(2, '0')
+		timeStr = ` ${displayHours}:${displayMinutes} ${isPM ? 'PM' : 'AM'}`
+	}
+
+	// If today and same year, only show time (if present)
+	if (isToday) {
+		return timeStr ? timeStr.trim() : monthDay
+	}
+
+	// If same year, show month/day and time (if present)
+	if (isCurrentYear) {
+		return `${monthDay}${timeStr}`
+	}
+
+	// Otherwise, show full date with year and time (if present)
+	return `${monthDay}/${year}${timeStr}`
+}
+
+export function parsePrettyDate(text: string): Date | null {
+	if (!text) return null
+
+	const now = new Date()
+	const currentYear = now.getFullYear()
+
+	// Try parsing as year-only (e.g., "2025")
+	if (/^\d{4}$/.test(text)) {
+		const year = parseInt(text)
+		return new Date(year, 0, 1, 0, 0, 0)
+	}
+
+	// Try parsing time-only (e.g., "11:02 AM") - assumes today
+	const timeOnlyMatch = text.match(/^(\d{1,2}):(\d{2})\s+(AM|PM)$/i)
+	if (timeOnlyMatch) {
+		const [, hourStr, minuteStr, meridiem] = timeOnlyMatch
+		let hours = parseInt(hourStr)
+		const minutes = parseInt(minuteStr)
+
+		if (meridiem.toUpperCase() === 'PM' && hours !== 12) hours += 12
+		if (meridiem.toUpperCase() === 'AM' && hours === 12) hours = 0
+
+		return new Date(currentYear, now.getMonth(), now.getDate(), hours, minutes, 0)
+	}
+
+	const usLocale = isUSLocale()
+
+	// Parse a "first/second" pair as month/day (US) or day/month (non-US)
+	function parseFirstSecond(firstStr: string, secondStr: string): { month: number; day: number } {
+		const first = parseInt(firstStr)
+		const second = parseInt(secondStr)
+		return usLocale ? { month: first - 1, day: second } : { month: second - 1, day: first }
+	}
+
+	// Try parsing NN/NN (e.g., "01/04") - assumes current year, no time
+	// US: MM/DD, non-US: DD/MM
+	const monthDayMatch = text.match(/^(\d{2})\/(\d{2})$/)
+	if (monthDayMatch) {
+		const { month, day } = parseFirstSecond(monthDayMatch[1], monthDayMatch[2])
+		return new Date(currentYear, month, day, 0, 0, 0)
+	}
+
+	// Try parsing NN/NN TIME (e.g., "01/04 11:02 AM") - assumes current year with time
+	// US: MM/DD TIME, non-US: DD/MM TIME
+	const monthDayTimeMatch = text.match(/^(\d{2})\/(\d{2})\s+(\d{1,2}):(\d{2})\s+(AM|PM)$/i)
+	if (monthDayTimeMatch) {
+		const { month, day } = parseFirstSecond(monthDayTimeMatch[1], monthDayTimeMatch[2])
+		let hours = parseInt(monthDayTimeMatch[3])
+		const minutes = parseInt(monthDayTimeMatch[4])
+		const meridiem = monthDayTimeMatch[5]
+
+		if (meridiem.toUpperCase() === 'PM' && hours !== 12) hours += 12
+		if (meridiem.toUpperCase() === 'AM' && hours === 12) hours = 0
+
+		return new Date(currentYear, month, day, hours, minutes, 0)
+	}
+
+	// Try parsing NN/NN/YYYY (e.g., "01/04/2025") - no time
+	// US: MM/DD/YYYY, non-US: DD/MM/YYYY
+	const fullDateMatch = text.match(/^(\d{2})\/(\d{2})\/(\d{4})$/)
+	if (fullDateMatch) {
+		const { month, day } = parseFirstSecond(fullDateMatch[1], fullDateMatch[2])
+		const year = parseInt(fullDateMatch[3])
+		return new Date(year, month, day, 0, 0, 0)
+	}
+
+	// Try parsing NN/NN/YYYY TIME (e.g., "01/04/2025 3:00 PM")
+	// US: MM/DD/YYYY TIME, non-US: DD/MM/YYYY TIME
+	const fullDateTimeMatch = text.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s+(AM|PM)$/i)
+	if (fullDateTimeMatch) {
+		const { month, day } = parseFirstSecond(fullDateTimeMatch[1], fullDateTimeMatch[2])
+		const year = parseInt(fullDateTimeMatch[3])
+		let hours = parseInt(fullDateTimeMatch[4])
+		const minutes = parseInt(fullDateTimeMatch[5])
+		const meridiem = fullDateTimeMatch[6]
+
+		if (meridiem.toUpperCase() === 'PM' && hours !== 12) hours += 12
+		if (meridiem.toUpperCase() === 'AM' && hours === 12) hours = 0
+
+		return new Date(year, month, day, hours, minutes, 0)
+	}
+
+	// Fallback to standard Date parsing (e.g., ISO strings)
+	const date = new Date(text)
+	return isNaN(date.getTime()) ? null : date
+}
+
+// Surface the backend's explanation: API errors carry the real message in
+// `.body` (plain text for Windmill 4xx), while `.message` is only the generic
+// status text ("Bad Request") the generated client fills in per status code.
+export function apiErrorMessage(e: any): string {
+	const body = e?.body
+	if (typeof body === 'string' && body.trim() !== '') return body
+	if (body && typeof body === 'object')
+		return body.error?.message ?? body.message ?? JSON.stringify(body)
+	return e?.message ?? String(e)
 }

@@ -1,6 +1,6 @@
 <script>
-	import { FileText } from 'lucide-svelte'
-	import { APP_TO_ICON_COMPONENT } from './icons'
+	import { Boxes, FileText, FolderOpen } from 'lucide-svelte'
+	import { appIconComponent } from './icons'
 	/**
 	 * @typedef {Object} Props
 	 * @property {any} name
@@ -11,6 +11,7 @@
 	 * @property {boolean} [center]
 	 * @property {boolean} [isSelected]
 	 * @property {any} [formatExtension]
+	 * @property {boolean} [isFileset]
 	 */
 
 	/** @type {Props} */
@@ -22,16 +23,11 @@
 		width = '24px',
 		center = false,
 		isSelected = false,
-		formatExtension = undefined
+		formatExtension = undefined,
+		isFileset = false
 	} = $props()
 
-	let iconComponent = $derived(
-		name
-			? name === 'teams'
-				? APP_TO_ICON_COMPONENT.ms_teams_webhook
-				: APP_TO_ICON_COMPONENT[name] || APP_TO_ICON_COMPONENT[name.split('_')[0]]
-			: undefined
-	)
+	let iconComponent = $derived(appIconComponent(name))
 
 	let widthInPixels = $derived(parseInt(width))
 </script>
@@ -45,12 +41,18 @@
 		<span class={isSelected ? 'text-secondary' : 'text-secondary'}>
 			<SvelteComponent {height} {width} size={widthInPixels} />
 		</span>
+	{:else if isFileset}
+		<span class={isSelected ? 'text-secondary' : 'text-secondary grayscale'}>
+			<FolderOpen {height} {width} />
+		</span>
 	{:else if formatExtension}
 		<span class={isSelected ? 'text-secondary' : 'text-secondary grayscale'}>
 			<FileText {height} {width} />
 		</span>
 	{:else}
-		<span style="width: {width}; height: {height}" class="bg-gray-100 rounded-full"></span>
+		<span class="text-hint/60">
+			<Boxes {height} {width} strokeWidth={1.5} />
+		</span>
 	{/if}
 	{#if !silent && after}
 		{name}

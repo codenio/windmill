@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { ResourceService, VariableService } from '$lib/gen'
 	import { workspaceStore } from '$lib/stores'
-	import { getContext, onDestroy } from 'svelte'
+	import { getContext, onDestroy, untrack } from 'svelte'
 	import { Badge, Button } from '../common'
 	import type { PropPickerWrapperContext } from '../flows/propPicker/PropPickerWrapper.svelte'
 
@@ -13,49 +13,60 @@
 	import type { PropPickerContext } from '../prop_picker'
 	import Scrollable from '../Scrollable.svelte'
 
-	export let pickableProperties: PickableProperties
-	export let displayContext = true
-	export let error: boolean = false
-	export let allowCopy = false
-	export let previousId: string | undefined = undefined
-	export let flow_env: Record<string, any> | undefined = undefined
-	export let result: any | undefined = undefined
-	export let extraResults: any = undefined
+	interface Props {
+		pickableProperties: PickableProperties
+		displayContext?: boolean
+		error?: boolean
+		allowCopy?: boolean
+		previousId?: string | undefined
+		result?: any | undefined
+		extraResults?: any
+	}
 
-	let variables: Record<string, string> = {}
-	let resources: Record<string, any> = {}
-	let displayVariable = false
-	let displayResources = false
-	let displayFlowEnv = false
+	let {
+		pickableProperties,
+		displayContext = true,
+		error = false,
+		allowCopy = false,
+		previousId = undefined,
+		result = undefined,
+		extraResults = undefined
+	}: Props = $props()
 
-	let allResultsCollapsed = true
+	let variables: Record<string, string> = $state({})
+	let resources: Record<string, any> = $state({})
+	let displayVariable = $state(false)
+	let displayResources = $state(false)
+
+	let allResultsCollapsed = $state(true)
 	let collapsableInitialState:
 		| {
 				allResultsCollapsed: boolean
 				displayVariable: boolean
 				displayResources: boolean
-				displayFlowEnv: boolean
 		  }
 		| undefined
 
-	let filterActive = false
-
 	const EMPTY_STRING = ''
-	let search = ''
+	let search = $state('')
 
-	const { propPickerConfig, inputMatches } =
-		getContext<PropPickerWrapperContext>('PropPickerWrapper')
+	const {
+		propPickerConfig,
+		inputMatches,
+		exprBeingEdited: propsBeingEdited
+	} = getContext<PropPickerWrapperContext>('PropPickerWrapper')
 
 	const { pickablePropertiesFiltered } = getContext<PropPickerContext>('PropPickerContext')
-	$: $pickablePropertiesFiltered = pickableProperties
+	$effect(() => {
+		$pickablePropertiesFiltered = pickableProperties
+	})
 
-	let flowInputsFiltered: any = pickableProperties.flow_input
-	let resultByIdFiltered: any = pickableProperties.priorIds
-	let flowEnvFiltered: any = pickableProperties.flow_env
+	let flowInputsFiltered: any = $state(untrack(() => pickableProperties).flow_input)
+	let resultByIdFiltered: any = $state(untrack(() => pickableProperties).priorIds)
+	let flowEnvFiltered: any = $state(untrack(() => pickableProperties).flow_env)
 
 	let timeout: number | undefined
 	function onSearch(search: string) {
-		filterActive = false
 		if (timeout) {
 			clearTimeout(timeout)
 		}
@@ -77,11 +88,14 @@
 		}, 50)
 	}
 
-	$: suggestedPropsFiltered =
+	let suggestedPropsFiltered = $derived(
 		$propPickerConfig && $propPickerConfig.propName
 			? keepByKey(pickableProperties.priorIds, $propPickerConfig.propName ?? '')
 			: undefined
-	$: search != undefined && onSearch(search)
+	)
+	$effect(() => {
+		search != undefined && untrack(() => onSearch(search))
+	})
 
 	async function loadVariables() {
 		variables = Object.fromEntries(
@@ -103,9 +117,9 @@
 		)
 	}
 
-	let filteringFlowInputsOrResult = ''
+	let filteringFlowInputsOrResult = $state('')
 	async function filterPickableProperties() {
-		if (!$propPickerConfig || !filterActive) {
+		if ($propsBeingEdited?.length == 0 || $propPickerConfig || !$inputMatches?.length) {
 			if (search === EMPTY_STRING) {
 				flowInputsFiltered = pickableProperties.flow_input
 				resultByIdFiltered = pickableProperties.priorIds
@@ -114,7 +128,6 @@
 			filteringFlowInputsOrResult = ''
 			return
 		}
-
 		if (!$inputMatches?.some((match) => match.word === 'flow_input')) {
 			flowInputsFiltered = {}
 		}
@@ -122,7 +135,9 @@
 			resultByIdFiltered = {}
 		}
 		if (!$inputMatches?.some((match) => match.word === 'flow_env')) {
-			flowEnvFiltered = {}
+			if (search === EMPTY_STRING) {
+				flowEnvFiltered = pickableProperties.flow_env
+			}
 		}
 		if ($inputMatches?.length == 1) {
 			filteringFlowInputsOrResult = $inputMatches[0].value
@@ -168,8 +183,7 @@
 			collapsableInitialState = {
 				allResultsCollapsed,
 				displayVariable,
-				displayResources,
-				displayFlowEnv
+				displayResources
 			}
 		}
 
@@ -183,10 +197,6 @@
 			displayResources = true
 			return
 		}
-		if ($inputMatches[0].word === 'flow_env') {
-			displayFlowEnv = true
-			return
-		}
 		if ($inputMatches[0].word === 'results') {
 			allResultsCollapsed = false
 			return
@@ -197,35 +207,19 @@
 		if (!collapsableInitialState) {
 			return
 		}
-		;({ allResultsCollapsed, displayVariable, displayResources, displayFlowEnv } =
-			collapsableInitialState)
+		;({ allResultsCollapsed, displayVariable, displayResources } = collapsableInitialState)
 		collapsableInitialState = undefined
 	}
 
-	async function updateFilterActive() {
-		const prev = filterActive
-
-		filterActive = Boolean(
-			$inputMatches &&
-				$inputMatches?.length > 0 &&
-				$propPickerConfig?.insertionMode === 'insert' &&
-				search === EMPTY_STRING
-		)
-
-		if (prev && !filterActive) {
-			flowInputsFiltered = pickableProperties.flow_input
-			resultByIdFiltered = pickableProperties.priorIds
-			flowEnvFiltered = pickableProperties.flow_env
-		}
-	}
-
 	async function updateState() {
-		await updateFilterActive()
 		await filterPickableProperties()
 		await updateCollapsable()
 	}
 
-	$: (search, $inputMatches, $propPickerConfig, pickableProperties, updateState())
+	$effect(() => {
+		;[search, $inputMatches, $propPickerConfig, pickableProperties, $propsBeingEdited]
+		untrack(() => updateState())
+	})
 
 	onDestroy(() => {
 		clearTimeout(timeout)
@@ -265,7 +259,7 @@
 				/>
 			</div>
 		{/if}
-		{#if flowInputsFiltered && (Object.keys(flowInputsFiltered ?? {}).length > 0 || !filterActive)}
+		{#if flowInputsFiltered && Object.keys(flowInputsFiltered ?? {}).length > 0}
 			<span class={categoryTitleClasses}>Flow Input</span>
 			<div class={categoryContentClasses}>
 				<ObjectViewer
@@ -273,6 +267,18 @@
 					pureViewer={!$propPickerConfig}
 					json={flowInputsFiltered}
 					prefix="flow_input"
+					on:select
+				/>
+			</div>
+		{/if}
+		{#if flowEnvFiltered && Object.keys(flowEnvFiltered ?? {}).length > 0}
+			<span class={categoryTitleClasses}>Flow Env Variables</span>
+			<div class={categoryContentClasses}>
+				<ObjectViewer
+					{allowCopy}
+					pureViewer={!$propPickerConfig}
+					json={flowEnvFiltered}
+					prefix="flow_env"
 					on:select
 				/>
 			</div>
@@ -338,7 +344,7 @@
 				</div>
 			{/if}
 			{#if Object.keys(pickableProperties.priorIds).length > 0}
-				{#if !filterActive && suggestedPropsFiltered && Object.keys(suggestedPropsFiltered).length > 0}
+				{#if suggestedPropsFiltered && Object.keys(suggestedPropsFiltered).length > 0}
 					<span class={categoryTitleClasses}>Suggested Results</span>
 					<div class={categoryContentClasses}>
 						<ObjectViewer
@@ -369,7 +375,7 @@
 		{/if}
 
 		{#if displayContext}
-			{#if !filterActive || $inputMatches?.some((match) => match.word === 'variable')}
+			{#if !$inputMatches?.length || $inputMatches?.some((match) => match.word === 'variable')}
 				<span class={categoryTitleClasses}>Variables</span>
 				<div class={categoryContentClasses}>
 					{#if displayVariable}
@@ -406,7 +412,7 @@
 					{/if}
 				</div>
 			{/if}
-			{#if !filterActive || $inputMatches?.some((match) => match.word === 'resource')}
+			{#if !$inputMatches?.length || $inputMatches?.some((match) => match.word === 'resource')}
 				<span class={categoryTitleClasses}>Resources</span>
 				<div class={categoryContentClasses}>
 					{#if displayResources}
@@ -434,45 +440,6 @@
 							on:click={async () => {
 								await loadResources()
 								displayResources = true
-							}}
-							wrapperClasses="inline-flex whitespace-nowrap w-fit"
-							btnClasses="font-normal text-2xs rounded-[0.275rem] h-4 px-1"
-						>
-							{'{...}'}
-						</Button>
-					{/if}
-				</div>
-			{/if}
-			{#if flow_env && Object.keys(flow_env).length > 0 && (!filterActive || $inputMatches?.some((match) => match.word === 'flow_env'))}
-				<div class="overflow-y-auto pb-2">
-					<span class="font-normal text-xs text-secondary">Flow Env Variables:</span>
-
-					{#if displayFlowEnv}
-						<Button
-							color="light"
-							size="xs2"
-							variant="border"
-							on:click={() => {
-								displayFlowEnv = false
-							}}
-							wrapperClasses="inline-flex whitespace-nowrap w-fit"
-							btnClasses="font-mono h-4 text-2xs font-thin px-1 rounded-[0.275rem]">-</Button
-						>
-						<ObjectViewer
-							{allowCopy}
-							pureViewer={!$propPickerConfig}
-							rawKey={false}
-							json={flowEnvFiltered}
-							prefix="flow_env"
-							on:select
-						/>
-					{:else}
-						<Button
-							color="light"
-							size="xs2"
-							variant="border"
-							on:click={() => {
-								displayFlowEnv = true
 							}}
 							wrapperClasses="inline-flex whitespace-nowrap w-fit"
 							btnClasses="font-normal text-2xs rounded-[0.275rem] h-4 px-1"

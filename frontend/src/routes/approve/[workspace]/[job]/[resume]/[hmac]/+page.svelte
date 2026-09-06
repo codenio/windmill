@@ -26,6 +26,10 @@
 
 	let job: Job | undefined = $state(undefined)
 	let currentApprovers: { resume_id: number; approver: string }[] = $state([])
+	let viewToken: string | undefined = $state(undefined)
+	// Whether the current visitor is a logged-in member of this workspace — if so we can
+	// surface a clear, ready-to-use run-details link (the view token grants them access).
+	let isWorkspaceMember = $state(false)
 	let approver = page.url.searchParams.get('approver') ?? undefined
 
 	let completed: boolean = $state(false)
@@ -60,6 +64,7 @@
 		}
 		getJob()
 		timeout = setInterval(getJob, 1000)
+		getUserExt(page.params.workspace ?? '').then((u) => (isWorkspaceMember = !!u))
 	})
 
 	onDestroy(() => {
@@ -101,6 +106,7 @@
 		})
 		job = suspendedJobFlow.job as Job
 		currentApprovers = suspendedJobFlow.approvers
+		viewToken = suspendedJobFlow.view_token
 	}
 
 	async function resume() {
@@ -143,6 +149,15 @@
 			.includes(new Number(page.params.resume ?? '').valueOf())
 	)
 	let approvalStep = $derived.by(() => (job?.flow_status?.step ?? 1) - 1)
+	// Carry the share-read-link token so a workspace-member approver can open the run
+	// details of a flow they don't otherwise have read access to.
+	let runDetailsHref = $derived.by(() => {
+		let url = `${base}/run/${job?.id}?workspace=${job?.workspace_id}`
+		if (viewToken) {
+			url += `&view_token=${encodeURIComponent(viewToken)}`
+		}
+		return url
+	})
 	let schema = $derived.by(
 		() => job?.raw_flow?.modules?.[approvalStep]?.suspend?.resume_form?.schema ?? dynamicSchema
 	)
@@ -158,7 +173,7 @@
 
 <ScheduleEditor bind:this={scheduleEditor} />
 
-<CenteredModal title="Approval for resuming of flow" disableLogo centerVertically={false}>
+<CenteredModal title="Approval for resuming of flow" centerVertically={false}>
 	{#if error}
 		<div class="space-y-6">
 			{#if error.startsWith('Not authorized:')}
@@ -290,13 +305,21 @@
 		</div>
 
 		<div class="mt-4 flex flex-row flex-wrap justify-between">
-			<a
-				class="text-accent text-xs"
-				target="_blank"
-				rel="noreferrer"
-				href="{base}/run/{job?.id}?workspace={job?.workspace_id}"
-				>Open run details (require auth) <ExternalLink size={12} class="inline" /></a
-			>
+			{#if isWorkspaceMember}
+				<Button
+					size="xs"
+					variant="accent-secondary"
+					href={runDetailsHref}
+					target="_blank"
+					endIcon={{ icon: ExternalLink }}
+				>
+					Open run details
+				</Button>
+			{:else}
+				<a class="text-accent text-xs" target="_blank" rel="noreferrer" href={runDetailsHref}
+					>Open run details (require auth) <ExternalLink size={12} class="inline" /></a
+				>
+			{/if}
 		</div>
 		{#if job && job.raw_flow && !completed}
 			<h2 class="mt-10 text-sm font-semibold text-emphasis mb-2">Flow details</h2>
@@ -307,6 +330,7 @@
 					earlyStop={job.raw_flow?.skip_expr !== undefined}
 					cache={job.raw_flow?.cache_ttl !== undefined}
 					modules={job.raw_flow?.modules}
+					groups={job.raw_flow?.groups}
 					failureModule={job.raw_flow?.failure_module}
 					preprocessorModule={job.raw_flow?.preprocessor_module}
 					notSelectable

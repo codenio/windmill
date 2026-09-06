@@ -1,11 +1,15 @@
 import process from "node:process";
-import { colors, Confirm, log, yamlParseFile, yamlStringify } from "../../deps.ts";
+import { writeFile } from "node:fs/promises";
+import { colors } from "@cliffy/ansi/colors";
+import { Confirm } from "@cliffy/prompt/confirm";
+import * as log from "./log.ts";
+import { yamlParseFile } from "../utils/yaml.ts";
+import { stringify as yamlStringify } from "yaml";
 import * as wmill from "../../gen/services.gen.ts";
 import { AIConfig, Config, GlobalSetting } from "../../gen/types.gen.ts";
 import { compareInstanceObjects, InstanceSyncOptions } from "../commands/instance/instance.ts";
 import { isSuperset } from "../types.ts";
 import { deepEqual } from "../utils/utils.ts";
-import { removeWorkerPrefix } from "../commands/worker-groups/worker-groups.ts";
 import { decrypt, encrypt } from "../utils/local_encryption.ts";
 
 // New grouped config interfaces
@@ -31,14 +35,14 @@ export interface SuccessHandlerConfig {
 }
 
 export interface SimplifiedSettings {
-  // Grouped format (current)
+  // Grouped format (current). Explicit `null` on error_handler / success_handler
+  // signals "clear the remote value"; `undefined` means "not managed by git".
   auto_invite?: AutoInviteConfig;
-  error_handler?: ErrorHandlerConfig;
-  success_handler?: SuccessHandlerConfig;
+  error_handler?: ErrorHandlerConfig | null;
+  success_handler?: SuccessHandlerConfig | null;
 
   // Other fields
   webhook?: string;
-  deploy_to?: string;
   ai_config?: AIConfig;
   large_file_storage?: any;
   git_sync?: any;
@@ -48,6 +52,12 @@ export interface SimplifiedSettings {
   mute_critical_alerts?: boolean;
   color?: string;
   operator_settings?: any;
+  datatable?: any;
+  slack_team_id?: string;
+  slack_name?: string;
+  slack_command_script?: string;
+  slack_oauth_client_id?: string;
+  slack_oauth_client_secret?: string;
 }
 
 // Legacy settings interface for reading old settings.yaml files
@@ -62,7 +72,6 @@ interface LegacySimplifiedSettings {
   success_handler_extra_args?: any;
   // Other fields same as SimplifiedSettings
   webhook?: string;
-  deploy_to?: string;
   ai_config?: AIConfig;
   large_file_storage?: any;
   git_sync?: any;
@@ -72,6 +81,11 @@ interface LegacySimplifiedSettings {
   mute_critical_alerts?: boolean;
   color?: string;
   operator_settings?: any;
+  slack_team_id?: string;
+  slack_name?: string;
+  slack_command_script?: string;
+  slack_oauth_client_id?: string;
+  slack_oauth_client_secret?: string;
 }
 
 // Helper to convert legacy flat settings to new grouped format
@@ -80,7 +94,6 @@ export function migrateToGroupedFormat(settings: any): SimplifiedSettings {
 
   // Copy non-legacy fields
   if (settings.webhook !== undefined) result.webhook = settings.webhook;
-  if (settings.deploy_to !== undefined) result.deploy_to = settings.deploy_to;
   if (settings.ai_config !== undefined) result.ai_config = settings.ai_config;
   if (settings.large_file_storage !== undefined) result.large_file_storage = settings.large_file_storage;
   if (settings.git_sync !== undefined) result.git_sync = settings.git_sync;
@@ -89,6 +102,12 @@ export function migrateToGroupedFormat(settings: any): SimplifiedSettings {
   if (settings.mute_critical_alerts !== undefined) result.mute_critical_alerts = settings.mute_critical_alerts;
   if (settings.color !== undefined) result.color = settings.color;
   if (settings.operator_settings !== undefined) result.operator_settings = settings.operator_settings;
+  if (settings.datatable !== undefined) result.datatable = settings.datatable;
+  if (settings.slack_team_id !== undefined) result.slack_team_id = settings.slack_team_id;
+  if (settings.slack_name !== undefined) result.slack_name = settings.slack_name;
+  if (settings.slack_command_script !== undefined) result.slack_command_script = settings.slack_command_script;
+  if (settings.slack_oauth_client_id !== undefined) result.slack_oauth_client_id = settings.slack_oauth_client_id;
+  if (settings.slack_oauth_client_secret !== undefined) result.slack_oauth_client_secret = settings.slack_oauth_client_secret;
 
   // Handle auto_invite: check if already grouped or needs migration
   if (settings.auto_invite && typeof settings.auto_invite === "object") {
@@ -102,8 +121,12 @@ export function migrateToGroupedFormat(settings: any): SimplifiedSettings {
     };
   }
 
-  // Handle error_handler: check if already grouped or needs migration
-  if (settings.error_handler && typeof settings.error_handler === "object") {
+  // Handle error_handler: check if already grouped or needs migration.
+  // Preserve explicit null as a signal to clear the remote handler (distinct
+  // from absent = "not managed by git, leave remote alone").
+  if (settings.error_handler === null) {
+    result.error_handler = null;
+  } else if (settings.error_handler && typeof settings.error_handler === "object") {
     result.error_handler = settings.error_handler;
   } else if (typeof settings.error_handler === "string") {
     // Legacy format (error_handler was a string path)
@@ -114,8 +137,10 @@ export function migrateToGroupedFormat(settings: any): SimplifiedSettings {
     };
   }
 
-  // Handle success_handler: check if already grouped or needs migration
-  if (settings.success_handler && typeof settings.success_handler === "object") {
+  // Handle success_handler: same semantics.
+  if (settings.success_handler === null) {
+    result.success_handler = null;
+  } else if (settings.success_handler && typeof settings.success_handler === "object") {
     result.success_handler = settings.success_handler;
   } else if (typeof settings.success_handler === "string") {
     // Legacy format (success_handler was a string path)
@@ -168,7 +193,6 @@ export async function pushWorkspaceSettings(
       error_handler: remoteSettings.error_handler as ErrorHandlerConfig | undefined,
       success_handler: remoteSettings.success_handler as SuccessHandlerConfig | undefined,
       webhook: remoteSettings.webhook,
-      deploy_to: remoteSettings.deploy_to,
       ai_config: remoteSettings.ai_config,
       large_file_storage: remoteSettings.large_file_storage,
       git_sync: remoteSettings.git_sync,
@@ -178,12 +202,22 @@ export async function pushWorkspaceSettings(
       mute_critical_alerts: remoteSettings.mute_critical_alerts,
       color: remoteSettings.color,
       operator_settings: remoteSettings.operator_settings,
+      datatable: remoteSettings.datatable,
+      slack_team_id: remoteSettings.slack_team_id,
+      slack_name: remoteSettings.slack_name,
+      slack_command_script: remoteSettings.slack_command_script,
+      slack_oauth_client_id: remoteSettings.slack_oauth_client_id,
+      slack_oauth_client_secret: remoteSettings.slack_oauth_client_secret,
     };
   } catch (err) {
     throw new Error(`Failed to get workspace settings: ${err}`);
   }
 
-  if (isSuperset(localSettings, settings)) {
+  // Exclude fields that are never applied here: slack_team_id/slack_name are OAuth-only,
+  // and name is not applied on pull (see below), so a name-only diff stays a no-op.
+  const { slack_team_id: _lst, slack_name: _lsn, name: _ln, ...comparableLocal } = localSettings;
+  const { slack_team_id: _rst, slack_name: _rsn, name: _rn, ...comparableRemote } = settings;
+  if (isSuperset(comparableLocal, comparableRemote)) {
     log.debug(`Workspace settings are up to date`);
     return;
   }
@@ -246,7 +280,10 @@ export async function pushWorkspaceSettings(
     });
   }
 
-  // Handle error_handler using grouped format
+  // Handle error_handler using grouped format. YAML is canonical:
+  // absent / null → clear remote; present object → upsert.
+  // (Same "omit = clear" rule as every other workspace setting. Pull always
+  // emits the field as null when remote is NULL, so round-trip is bijective.)
   if (!deepEqual(localSettings.error_handler, settings.error_handler)) {
     log.debug(`Updating error handler...`);
     const localErrorHandler = localSettings.error_handler;
@@ -261,7 +298,7 @@ export async function pushWorkspaceSettings(
     });
   }
 
-  // Handle success_handler using grouped format
+  // Handle success_handler using grouped format. Same semantics as error_handler.
   if (!deepEqual(localSettings.success_handler, settings.success_handler)) {
     log.debug(`Updating success handler...`);
     const localSuccessHandler = localSettings.success_handler;
@@ -270,16 +307,6 @@ export async function pushWorkspaceSettings(
       requestBody: {
         path: localSuccessHandler?.path,
         extra_args: localSuccessHandler?.extra_args,
-      },
-    });
-  }
-
-  if (localSettings.deploy_to != settings.deploy_to) {
-    log.debug(`Updating deploy to...`);
-    await wmill.editDeployTo({
-      workspace,
-      requestBody: {
-        deploy_to: localSettings.deploy_to,
       },
     });
   }
@@ -324,15 +351,10 @@ export async function pushWorkspaceSettings(
     });
   }
 
-  if (localSettings.name != settings.name) {
-    log.debug(`Updating workspace name...`);
-    await wmill.changeWorkspaceName({
-      workspace,
-      requestBody: {
-        new_name: localSettings.name,
-      },
-    });
-  }
+  // Workspace display name is intentionally not applied on pull: settings.yaml is shared
+  // across a repo's branches, so applying it would let one workspace's name overwrite
+  // another's when both sync the same repo. It stays in the file (written on push), but a
+  // live workspace is only renamed by its owner.
 
   if (localSettings.mute_critical_alerts != settings.mute_critical_alerts) {
     log.debug(`Updating mute critical alerts...`);
@@ -361,13 +383,67 @@ export async function pushWorkspaceSettings(
       requestBody: localSettings.operator_settings,
     });
   }
+
+  if (!deepEqual(localSettings.datatable, settings.datatable)) {
+    log.debug(`Updating datatable config...`);
+    await wmill.editDataTableConfig({
+      workspace,
+      requestBody: { settings: localSettings.datatable ?? { datatables: {} } },
+    });
+  }
+
+  if (localSettings.slack_command_script != settings.slack_command_script) {
+    log.debug(`Updating slack command script...`);
+    await wmill.editSlackCommand({
+      workspace,
+      requestBody: {
+        slack_command_script: localSettings.slack_command_script,
+      },
+    });
+  }
+
+  // Workspace-level Slack OAuth override. YAML is canonical (same rule as
+  // every other setting): both present → upsert; anything else → delete.
+  // Pull always emits both fields as null when remote is NULL.
+  if (
+    localSettings.slack_oauth_client_id != settings.slack_oauth_client_id ||
+    localSettings.slack_oauth_client_secret != settings.slack_oauth_client_secret
+  ) {
+    log.debug(`Updating slack oauth config...`);
+    if (
+      localSettings.slack_oauth_client_id &&
+      localSettings.slack_oauth_client_secret
+    ) {
+      await wmill.setWorkspaceSlackOauthConfig({
+        workspace,
+        requestBody: {
+          slack_oauth_client_id: localSettings.slack_oauth_client_id,
+          slack_oauth_client_secret: localSettings.slack_oauth_client_secret,
+        },
+      });
+    } else {
+      await wmill.deleteWorkspaceSlackOauthConfig({ workspace });
+    }
+  }
+}
+
+export interface PushWorkspaceKeyOptions {
+  // True when no prompt may be shown (e.g. `--yes` was passed or stdin is not a
+  // TTY). In that case the re-encryption decision is taken from `skipReencrypt`
+  // / the WMILL_NO_REENCRYPT_ON_KEY_CHANGE env var instead of an interactive
+  // confirmation.
+  noninteractive?: boolean;
+  // Explicit re-encryption decision from `--skip-reencrypt-on-key-change`.
+  // When set it takes precedence over the prompt and the env var.
+  skipReencrypt?: boolean;
 }
 
 export async function pushWorkspaceKey(
   workspace: string,
   _path: string,
   key: string | undefined,
-  localKey: string
+  localKey: string,
+  opts?: PushWorkspaceKeyOptions
 ) {
   try {
     key = await wmill
@@ -379,17 +455,46 @@ export async function pushWorkspaceKey(
     throw new Error(`Failed to get workspace encryption key: ${err}`);
   }
   if (localKey && key !== localKey) {
-    const confirm = await Confirm.prompt({
-      message:
-        "The local workspace encryption key does not match the remote. Do you want to reencrypt all your secrets on the remote with the new key?\nSay 'no' if your local secrets are already encrypted with the new key (e.g. workspace/instance migration)\nOtherwise, say 'yes' and pull the secrets after the reencryption.\n",
-      default: true,
-    });
+    // Changing the key on the remote means the existing ciphertexts (encrypted
+    // with the old key) become unreadable unless they are re-encrypted. By
+    // default we ask the backend to re-encrypt every secret variable with the
+    // new key, which preserves their plaintext values. The only reason to skip
+    // re-encryption is when the stored ciphertexts are *already* encrypted with
+    // the new key (e.g. a workspace/instance migration).
+    let reencrypt: boolean;
+    // Explicit choice via `--skip-reencrypt-on-key-change` or the env var wins
+    // over everything, regardless of interactivity.
+    const explicitSkip =
+      opts?.skipReencrypt ||
+      (process.env.WMILL_NO_REENCRYPT_ON_KEY_CHANGE ?? "").toLowerCase() ===
+        "true";
+    if (explicitSkip) {
+      reencrypt = false;
+      log.info(
+        "Workspace encryption key changed; leaving remote ciphertexts untouched (skip re-encryption requested)."
+      );
+    } else if (opts?.noninteractive) {
+      // No TTY (or --yes) and no explicit skip: we can't prompt, so default to
+      // re-encrypting (matches the interactive default) to preserve secret
+      // values. Pass --skip-reencrypt-on-key-change (or set
+      // WMILL_NO_REENCRYPT_ON_KEY_CHANGE=true) to opt out.
+      reencrypt = true;
+      log.info(
+        "Workspace encryption key changed; re-encrypting all remote secrets with the new key (non-interactive)."
+      );
+    } else {
+      reencrypt = await Confirm.prompt({
+        message:
+          "The local workspace encryption key does not match the remote. Do you want to reencrypt all your secrets on the remote with the new key?\nSay 'no' if your local secrets are already encrypted with the new key (e.g. workspace/instance migration)\nOtherwise, say 'yes' and pull the secrets after the reencryption.\n",
+        default: true,
+      });
+    }
     log.debug(`Updating workspace encryption key...`);
     await wmill.setWorkspaceEncryptionKey({
       workspace,
       requestBody: {
         new_key: localKey,
-        skip_reencrypt: !confirm,
+        skip_reencrypt: !reencrypt,
       },
     });
   } else {
@@ -493,9 +598,10 @@ export async function pullInstanceSettings(
       remoteSettings,
       "encode"
     );
-    await Deno.writeTextFile(
+    await writeFile(
       instanceSettingsPath,
-      yamlStringify(processedSettings)
+      yamlStringify(processedSettings),
+      "utf-8"
     );
 
     log.info(colors.green(`Settings written to ${instanceSettingsPath}`));
@@ -583,12 +689,7 @@ export async function pullInstanceConfigs(
   opts: InstanceSyncOptions,
   preview = false
 ) {
-  const remoteConfigs = (await wmill.listConfigs()).map((x) => {
-    return {
-      ...x,
-      name: removeWorkerPrefix(x.name),
-    };
-  });
+  const remoteConfigs = await wmill.listWorkerGroups();
 
   if (preview) {
     const localConfigs: Config[] = await readLocalConfigs(opts);
@@ -602,9 +703,10 @@ export async function pullInstanceConfigs(
   } else {
     log.info("Pulling configs from instance");
 
-    await Deno.writeTextFile(
+    await writeFile(
       instanceConfigsPath,
-      yamlStringify(remoteConfigs as any)
+      yamlStringify(remoteConfigs as any),
+      "utf-8"
     );
 
     log.info(colors.green(`Configs written to ${instanceConfigsPath}`));
@@ -615,12 +717,7 @@ export async function pushInstanceConfigs(
   opts: InstanceSyncOptions,
   preview: boolean = false
 ) {
-  const remoteConfigs = (await wmill.listConfigs()).map((x) => {
-    return {
-      ...x,
-      name: removeWorkerPrefix(x.name),
-    };
-  });
+  const remoteConfigs = await wmill.listWorkerGroups();
   const localConfigs = await readLocalConfigs(opts);
 
   if (preview) {
@@ -639,9 +736,7 @@ export async function pushInstanceConfigs(
       }
       try {
         await wmill.updateConfig({
-          name: config.name.startsWith("worker__")
-            ? config.name
-            : `worker__${config.name}`,
+          name: `worker__${config.name}`,
           requestBody: config.config,
         });
       } catch (err) {
@@ -655,7 +750,7 @@ export async function pushInstanceConfigs(
       if (!localMatch) {
         try {
           await wmill.deleteConfig({
-            name: removeConfig.name,
+            name: `worker__${removeConfig.name}`,
           });
         } catch (err) {
           log.error(`Failed to delete config ${removeConfig.name}: ${err}`);

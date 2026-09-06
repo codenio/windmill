@@ -8,11 +8,18 @@
  * - Backend code compiled or ready to compile
  *
  * Usage:
- *   DATABASE_URL=postgres://postgres:changeme@localhost:5432 deno test --allow-all test/my_test.ts
+ *   DATABASE_URL=postgres://postgres:changeme@localhost:5432 bun test test/my_test.ts
  */
 
-import { ensureDir } from "https://deno.land/std@0.224.0/fs/mod.ts";
-import { fromFileUrl, resolve, dirname } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { resolve, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { statSync } from "node:fs";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { createServer } from "node:net";
+import { Subprocess } from "bun";
+
+const IS_LINUX = process.platform === "linux";
 
 export interface CargoBackendConfig {
   /** PostgreSQL connection string (without database name) */
@@ -43,7 +50,7 @@ export interface CargoBackendConfig {
 
 export class CargoBackend {
   private config: Required<CargoBackendConfig>;
-  private process: Deno.ChildProcess | null = null;
+  private process: Subprocess | null = null;
   private dbName: string;
   private isRunning = false;
   private actualPort: number;
@@ -58,19 +65,21 @@ export class CargoBackend {
 
     // Determine default features based on environment
     // CI mode: minimal features (zip only)
-    // Local mode: full features (zip, private, enterprise)
-    const isCI = Deno.env.get("CI_MINIMAL_FEATURES") === "true";
-    const defaultFeatures = isCI ? ["zip"] : ["zip", "private", "enterprise"];
+    // Local mode with license key: full features (zip, private, enterprise, license, python)
+    // Local mode without license key: zip only (EE features reject API calls without valid license)
+    const isCI = process.env["CI_MINIMAL_FEATURES"] === "true";
+    const hasLicenseKey = !!process.env["EE_LICENSE_KEY"];
+    const defaultFeatures = isCI ? ["zip"] : (hasLicenseKey ? ["zip", "private", "enterprise", "license", "python"] : ["zip", "python"]);
 
     // Parse additional features from environment variable
-    const envFeatures = Deno.env.get("TEST_FEATURES")?.split(",").filter(f => f.trim()) || [];
+    const envFeatures = process.env["TEST_FEATURES"]?.split(",").filter(f => f.trim()) || [];
     const allFeatures = [...new Set([...defaultFeatures, ...envFeatures, ...(config.features || [])])];
 
     this.config = {
-      postgresUrl: config.postgresUrl || Deno.env.get("DATABASE_URL") || "postgres://postgres:changeme@localhost:5432",
+      postgresUrl: config.postgresUrl || process.env["DATABASE_URL"] || "postgres://postgres:changeme@localhost:5432",
       port: config.port || 0,
       backendDir,
-      binaryPath: config.binaryPath || Deno.env.get("WINDMILL_BINARY") || "",
+      binaryPath: config.binaryPath || process.env["WINDMILL_BINARY"] || "",
       features: allFeatures,
       release: config.release ?? false,
       workspace: config.workspace || "test",
@@ -84,8 +93,7 @@ export class CargoBackend {
 
   private findBackendDir(): string {
     // Try to find backend directory relative to CLI
-    // Use fromFileUrl to properly handle Windows paths (e.g., file:///D:/...)
-    const cliTestDir = fromFileUrl(new URL(".", import.meta.url));
+    const cliTestDir = dirname(fileURLToPath(import.meta.url));
     // Use resolve() for proper cross-platform path resolution
     const candidates = [
       resolve(cliTestDir, "..", "..", "backend"),
@@ -97,8 +105,8 @@ export class CargoBackend {
     for (const candidate of candidates) {
       try {
         const cargoPath = resolve(candidate, "Cargo.toml");
-        const stat = Deno.statSync(cargoPath);
-        if (stat.isFile) {
+        const stat = statSync(cargoPath);
+        if (stat.isFile()) {
           return candidate;
         }
       } catch {
@@ -129,19 +137,19 @@ export class CargoBackend {
       return;
     }
 
-    console.log("🚀 Starting Cargo-based Windmill backend...");
+    console.log("Starting Cargo-based Windmill backend...");
 
     // Create test config directory
     if (!this.config.testConfigDir) {
-      this.config.testConfigDir = await Deno.makeTempDir({ prefix: "wmill_test_config_" });
-      console.log(`📁 Created test config directory: ${this.config.testConfigDir}`);
+      this.config.testConfigDir = await mkdtemp(join(tmpdir(), "wmill_test_config_"));
+      console.log(`Created test config directory: ${this.config.testConfigDir}`);
     }
 
     // Find a free port if not specified
     if (this.actualPort === 0) {
       this.actualPort = await this.findFreePort();
     }
-    console.log(`📡 Using port: ${this.actualPort}`);
+    console.log(`Using port: ${this.actualPort}`);
 
     // Create the test database
     await this.createDatabase();
@@ -156,7 +164,7 @@ export class CargoBackend {
     await this.initializeAndAuthenticate();
 
     this.isRunning = true;
-    console.log("✅ Cargo backend is ready!");
+    console.log("Cargo backend is ready!");
     console.log(`   Server: ${this.baseUrl}`);
     console.log(`   Database: ${this.dbName}`);
     console.log(`   Workspace: ${this.config.workspace}`);
@@ -170,15 +178,15 @@ export class CargoBackend {
       return;
     }
 
-    console.log("🛑 Stopping Cargo backend...");
+    console.log("Stopping Cargo backend...");
 
     // Kill the backend process
     if (this.process) {
       try {
-        this.process.kill("SIGTERM");
+        this.process.kill();
         // Wait a bit for graceful shutdown
         await Promise.race([
-          this.process.status,
+          this.process.exited,
           new Promise(resolve => setTimeout(resolve, 5000)),
         ]);
       } catch {
@@ -187,31 +195,39 @@ export class CargoBackend {
       this.process = null;
     }
 
+    // Kill any child processes (e.g. the windmill binary spawned by cargo)
+    // by matching our unique database name in their environment
+    await this.killProcessesByDbName();
+
     // Drop the test database
     await this.dropDatabase();
 
     // Cleanup test config directory
     if (this.config.testConfigDir?.includes("wmill_test_config_")) {
       try {
-        await Deno.remove(this.config.testConfigDir, { recursive: true });
-        console.log(`🗑️  Cleaned up test config directory`);
+        await rm(this.config.testConfigDir, { recursive: true, force: true });
+        console.log(`Cleaned up test config directory`);
       } catch {
         // Ignore cleanup errors
       }
     }
 
     this.isRunning = false;
-    console.log("✅ Backend stopped");
+    console.log("Backend stopped");
   }
 
   /**
    * Find a free port
    */
   private async findFreePort(): Promise<number> {
-    const listener = Deno.listen({ port: 0 });
-    const port = (listener.addr as Deno.NetAddr).port;
-    listener.close();
-    return port;
+    return new Promise((resolve, reject) => {
+      const server = createServer();
+      server.listen(0, () => {
+        const port = (server.address() as any).port;
+        server.close(() => resolve(port));
+      });
+      server.on('error', reject);
+    });
   }
 
   /**
@@ -222,8 +238,9 @@ export class CargoBackend {
    */
   private getBasePostgresUrl(): string {
     const url = new URL(this.config.postgresUrl);
-    // Remove any existing database path
+    // Remove any existing database path and query params (e.g. ?sslmode=disable)
     url.pathname = "";
+    url.search = "";
     return url.toString().replace(/\/$/, ""); // Remove trailing slash
   }
 
@@ -231,67 +248,75 @@ export class CargoBackend {
    * Create the test database
    */
   private async createDatabase(): Promise<void> {
-    console.log(`📦 Creating test database: ${this.dbName}`);
+    console.log(`Creating test database: ${this.dbName}`);
 
     const baseUrl = this.getBasePostgresUrl();
 
-    const cmd = new Deno.Command("psql", {
-      args: [
-        `${baseUrl}/postgres`,
-        "-c",
-        `CREATE DATABASE "${this.dbName}";`,
-      ],
-      stdout: "piped",
-      stderr: "piped",
+    const proc = Bun.spawn(["psql", `${baseUrl}/postgres`, "-c", `CREATE DATABASE "${this.dbName}";`], {
+      stdout: "pipe",
+      stderr: "pipe",
     });
 
-    const result = await cmd.output();
-    if (result.code !== 0) {
-      const stderr = new TextDecoder().decode(result.stderr);
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+
+    if (exitCode !== 0) {
       throw new Error(`Failed to create database: ${stderr}`);
     }
 
-    console.log("✅ Test database created");
+    console.log("Test database created");
   }
 
   /**
    * Drop the test database
    */
   private async dropDatabase(): Promise<void> {
-    console.log(`🗑️  Dropping test database: ${this.dbName}`);
+    console.log(`Dropping test database: ${this.dbName}`);
 
     const baseUrl = this.getBasePostgresUrl();
 
     // Terminate existing connections
-    const terminateCmd = new Deno.Command("psql", {
-      args: [
-        `${baseUrl}/postgres`,
-        "-c",
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${this.dbName}' AND pid <> pg_backend_pid();`,
-      ],
-      stdout: "piped",
-      stderr: "piped",
+    const terminateProc = Bun.spawn(["psql", `${baseUrl}/postgres`, "-c",
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${this.dbName}' AND pid <> pg_backend_pid();`], {
+      stdout: "pipe",
+      stderr: "pipe",
     });
-    await terminateCmd.output();
+    await Promise.all([
+      new Response(terminateProc.stdout).text(),
+      new Response(terminateProc.stderr).text(),
+    ]);
+    await terminateProc.exited;
 
     // Drop the database
-    const dropCmd = new Deno.Command("psql", {
-      args: [
-        `${baseUrl}/postgres`,
-        "-c",
-        `DROP DATABASE IF EXISTS "${this.dbName}";`,
-      ],
-      stdout: "piped",
-      stderr: "piped",
+    const dropProc = Bun.spawn(["psql", `${baseUrl}/postgres`, "-c",
+      `DROP DATABASE IF EXISTS "${this.dbName}";`], {
+      stdout: "pipe",
+      stderr: "pipe",
     });
 
-    const result = await dropCmd.output();
-    if (result.code !== 0) {
-      const stderr = new TextDecoder().decode(result.stderr);
+    const [, stderr] = await Promise.all([
+      new Response(dropProc.stdout).text(),
+      new Response(dropProc.stderr).text(),
+    ]);
+    const exitCode = await dropProc.exited;
+
+    if (exitCode !== 0) {
       console.warn(`Warning: Failed to drop database: ${stderr}`);
     } else {
-      console.log("✅ Test database dropped");
+      console.log("Test database dropped");
     }
+  }
+
+  /**
+   * Kill any processes whose environment contains our unique database name.
+   * This catches child processes (e.g. the windmill binary spawned by cargo run)
+   * that survive after the direct child is killed.
+   */
+  private async killProcessesByDbName(): Promise<void> {
+    await killWindmillProcessesByEnvMatch(this.dbName);
   }
 
   /**
@@ -305,7 +330,7 @@ export class CargoBackend {
     const databaseUrl = `${baseUrl}/${this.dbName}?sslmode=disable`;
 
     const env: Record<string, string> = {
-      ...Deno.env.toObject(),
+      ...process.env as Record<string, string>,
       DATABASE_URL: databaseUrl,
       PORT: String(this.actualPort),
       MODE: "standalone", // Run server + worker in one process
@@ -318,30 +343,36 @@ export class CargoBackend {
       SQLX_OFFLINE: "true",
       // Disable embedding to speed up startup
       DISABLE_EMBEDDING: "true",
+      // Skip worker version check for workspace deps (workers need time to report version)
+      WMDEBUG_FORCE_V0_WORKSPACE_DEPENDENCIES: "1",
       // Create default admin user
       CREATE_SUPERADMIN_IF_NOT_EXISTS: "1",
       SUPERADMIN_EMAIL: this.config.username,
       SUPERADMIN_PASSWORD: this.config.password,
     };
 
+    // On Windows, ensure BUN_PATH and NODE_BIN_PATH are set for the worker.
+    // The Rust defaults (/usr/bin/bun, /usr/bin/node) don't exist on Windows.
+    if (process.platform === "win32") {
+      env.BUN_PATH = env.BUN_PATH || Bun.which("bun") || process.execPath;
+      env.NODE_BIN_PATH = env.NODE_BIN_PATH || Bun.which("node") || "node";
+    }
+
     // Add license key if available
-    const licenseKey = Deno.env.get("EE_LICENSE_KEY");
+    const licenseKey = process.env["EE_LICENSE_KEY"];
     if (licenseKey) {
       env.LICENSE_KEY = licenseKey;
     }
 
-    let cmd: Deno.Command;
-
     if (this.config.binaryPath) {
       // Use pre-built binary if explicitly specified
-      console.log(`🔧 Starting backend using binary: ${this.config.binaryPath}`);
+      console.log(`Starting backend using binary: ${this.config.binaryPath}`);
       console.log(`   DATABASE_URL: ${databaseUrl}`);
 
-      cmd = new Deno.Command(this.config.binaryPath, {
-        args: [],
+      this.process = Bun.spawn([this.config.binaryPath], {
         env,
-        stdout: "piped",
-        stderr: "piped",
+        stdout: "pipe",
+        stderr: "pipe",
       });
     } else {
       // Use cargo run with features
@@ -353,27 +384,25 @@ export class CargoBackend {
         cargoArgs.push("--features", this.config.features.join(","));
       }
 
-      console.log(`🔧 Starting backend via: cargo ${cargoArgs.join(" ")}`);
+      console.log(`Starting backend via: cargo ${cargoArgs.join(" ")}`);
       console.log(`   DATABASE_URL: ${databaseUrl}`);
       console.log(`   Backend dir: ${this.config.backendDir}`);
 
-      cmd = new Deno.Command("cargo", {
-        args: cargoArgs,
+      this.process = Bun.spawn(["cargo", ...cargoArgs], {
         cwd: this.config.backendDir,
         env,
-        stdout: "piped",
-        stderr: "piped",
+        stdout: "pipe",
+        stderr: "pipe",
       });
     }
 
-    this.process = cmd.spawn();
     this.stderrChunks = [];
     this.stdoutChunks = [];
 
     // Capture output in background
     this.captureProcessOutput();
 
-    console.log(`⏳ Backend process started (PID: ${this.process.pid})`);
+    console.log(`Backend process started (PID: ${this.process.pid})`);
   }
 
   /**
@@ -395,7 +424,7 @@ export class CargoBackend {
             if (value) {
               this.stdoutChunks.push(value);
               if (this.config.verbose) {
-                Deno.stdout.writeSync(value);
+                process.stdout.write(value);
               }
             }
           }
@@ -415,7 +444,7 @@ export class CargoBackend {
             if (value) {
               this.stderrChunks.push(value);
               if (this.config.verbose) {
-                Deno.stderr.writeSync(value);
+                process.stderr.write(value);
               }
             }
           }
@@ -458,7 +487,7 @@ export class CargoBackend {
    * Wait for the API to be responsive
    */
   private async waitForAPI(): Promise<void> {
-    console.log("⏳ Waiting for API to be responsive (this may take a few minutes if compiling)...");
+    console.log("Waiting for API to be responsive (this may take a few minutes if compiling)...");
 
     // Allow up to 10 minutes for cargo build + startup
     const maxAttempts = 300; // 10 minutes with 2-second intervals
@@ -473,7 +502,7 @@ export class CargoBackend {
 
         if (response.ok) {
           const version = await response.text();
-          console.log(`📡 API ready (version: ${version.trim()})`);
+          console.log(`API ready (version: ${version.trim()})`);
           return;
         }
         await response.text(); // Consume response
@@ -485,7 +514,7 @@ export class CargoBackend {
       if (this.process) {
         try {
           const status = await Promise.race([
-            this.process.status,
+            this.process.exited,
             new Promise<null>(resolve => setTimeout(() => resolve(null), 100)),
           ]);
           if (status !== null) {
@@ -493,14 +522,14 @@ export class CargoBackend {
             await new Promise(resolve => setTimeout(resolve, 500));
             const stderr = this.getStderr();
             const stdout = this.getStdout();
-            console.error("\n❌ Backend process crashed!");
+            console.error("\nBackend process crashed!");
             if (stdout) {
               console.error("=== STDOUT ===\n" + stdout.slice(-2000));
             }
             if (stderr) {
               console.error("=== STDERR ===\n" + stderr.slice(-2000));
             }
-            throw new Error(`Backend process exited with code ${status.code}`);
+            throw new Error(`Backend process exited with code ${status}`);
           }
         } catch (e) {
           if (e instanceof Error && e.message.includes("exited")) {
@@ -529,7 +558,7 @@ export class CargoBackend {
    * Initialize test data and authenticate
    */
   private async initializeAndAuthenticate(): Promise<void> {
-    console.log("🔧 Initializing test workspace...");
+    console.log("Initializing test workspace...");
 
     // Create test workspace via API
     await this.createWorkspace();
@@ -537,7 +566,7 @@ export class CargoBackend {
     // Login to get token
     await this.authenticate();
 
-    console.log("✅ Test workspace initialized");
+    console.log("Test workspace initialized");
   }
 
   /**
@@ -581,7 +610,7 @@ export class CargoBackend {
       }
     } else {
       await createWsResponse.text();
-      console.log(`  ✅ Created workspace: ${this.config.workspace}`);
+      console.log(`  Created workspace: ${this.config.workspace}`);
     }
   }
 
@@ -589,7 +618,7 @@ export class CargoBackend {
    * Authenticate and get token
    */
   private async authenticate(): Promise<void> {
-    console.log("🔑 Authenticating...");
+    console.log("Authenticating...");
 
     const loginResponse = await fetch(`${this.baseUrl}/api/auth/login`, {
       method: "POST",
@@ -605,7 +634,7 @@ export class CargoBackend {
     }
 
     this.token = await loginResponse.text();
-    console.log("✅ Authentication successful");
+    console.log("Authentication successful");
   }
 
   /**
@@ -618,48 +647,57 @@ export class CargoBackend {
   /**
    * Create CLI command with proper authentication
    */
-  createCLICommand(args: string[], workingDir: string, workspaceName?: string): Deno.Command {
-    const workspace = workspaceName || this.config.workspace;
+  createCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }): { command: string, args: string[], cwd: string, env: Record<string, string> } {
+    const workspace = opts?.workspace || this.config.workspace;
+    const cliDir = join(dirname(fileURLToPath(import.meta.url)), "..");
     const fullArgs = [
       "--base-url", this.baseUrl,
       "--workspace", workspace,
-      "--token", this.token,
+      "--token", opts?.token || this.token,
       "--config-dir", this.config.testConfigDir,
       ...args,
     ];
 
-    const denoPath = Deno.execPath();
-    const cliMainPath = fromFileUrl(new URL("../src/main.ts", import.meta.url));
+    const useNode = process.env["TEST_CLI_RUNTIME"] === "node";
+    const runtime = useNode ? "node" : "bun";
+    const entrypoint = useNode
+      ? join(cliDir, "npm", "esm", "main.js")
+      : join(cliDir, "src", "main.ts");
+    const runtimeArgs = useNode ? [entrypoint] : ["run", entrypoint];
 
-    console.log("🔧 CLI Command:", [denoPath, "run", "-A", cliMainPath, ...fullArgs].join(" "));
+    console.log("CLI Command:", [runtime, ...runtimeArgs, ...fullArgs].join(" "));
 
-    return new Deno.Command(denoPath, {
-      args: ["run", "-A", cliMainPath, ...fullArgs],
+    return {
+      command: runtime,
+      args: [...runtimeArgs, ...fullArgs],
       cwd: workingDir,
-      stdout: "piped",
-      stderr: "piped",
-      env: {
-        SKIP_DENO_DEPRECATION_WARNING: "true",
-      },
-    });
+      env: { ...process.env as Record<string, string> },
+    };
   }
 
   /**
    * Run CLI command and return result
    */
-  async runCLICommand(args: string[], workingDir: string, workspaceName?: string): Promise<{
+  async runCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }): Promise<{
     stdout: string;
     stderr: string;
     code: number;
   }> {
-    const cmd = this.createCLICommand(args, workingDir, workspaceName);
-    const result = await cmd.output();
+    const cmd = this.createCLICommand(args, workingDir, opts);
+    const proc = Bun.spawn([cmd.command, ...cmd.args], {
+      cwd: cmd.cwd,
+      env: cmd.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
-    return {
-      stdout: new TextDecoder().decode(result.stdout),
-      stderr: new TextDecoder().decode(result.stderr),
-      code: result.code,
-    };
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const code = await proc.exited;
+
+    return { stdout, stderr, code };
   }
 
   /**
@@ -677,7 +715,7 @@ export class CargoBackend {
    * Reset workspace to clean state
    */
   async reset(): Promise<void> {
-    console.log("🔄 Resetting workspace...");
+    console.log("Resetting workspace...");
 
     // Delete all content via API
     await Promise.all([
@@ -687,9 +725,10 @@ export class CargoBackend {
       this.deleteAll("resources"),
       this.deleteAll("variables"),
       this.deleteAll("folders"),
+      this.deleteAllWorkspaceDeps(),
     ]);
 
-    console.log("✅ Workspace reset complete");
+    console.log("Workspace reset complete");
   }
 
   private async deleteAll(resourceType: string): Promise<void> {
@@ -714,6 +753,112 @@ export class CargoBackend {
       // Ignore listing failures
     }
   }
+
+  private async deleteAllWorkspaceDeps(): Promise<void> {
+    try {
+      const listResponse = await this.apiRequest(`/api/w/${this.config.workspace}/workspace_dependencies/list`);
+      if (!listResponse.ok) return;
+
+      const items = await listResponse.json() as { language: string; name?: string }[];
+      for (const item of items) {
+        try {
+          const nameParam = item.name ? `?name=${encodeURIComponent(item.name)}` : "";
+          await this.apiRequest(
+            `/api/w/${this.config.workspace}/workspace_dependencies/delete/${item.language}${nameParam}`,
+            { method: "POST" }
+          );
+        } catch {
+          // Ignore individual deletion failures
+        }
+      }
+    } catch {
+      // Ignore failures
+    }
+  }
+}
+
+/**
+ * Kill windmill processes whose /proc/pid/environ contains the given pattern.
+ * Used by both per-test cleanup (match specific DB name) and stale cleanup (match any test DB).
+ */
+async function killWindmillProcessesByEnvMatch(pattern: string): Promise<void> {
+  if (!IS_LINUX) return;
+  try {
+    const pgrepProc = Bun.spawn(["pgrep", "-f", "target/(debug|release)/windmill"], {
+      stdout: "pipe", stderr: "pipe",
+    });
+    const output = await new Response(pgrepProc.stdout).text();
+    await new Response(pgrepProc.stderr).text();
+    await pgrepProc.exited;
+
+    for (const pidStr of output.trim().split("\n").filter(Boolean)) {
+      const pid = Number(pidStr);
+      if (isNaN(pid)) continue;
+      try {
+        const environ = await readFile(`/proc/${pid}/environ`, "utf-8");
+        if (environ.includes(pattern)) {
+          console.log(`Killing orphaned test backend process: ${pid}`);
+          process.kill(pid, "SIGKILL");
+        }
+      } catch {
+        // Process exited or we lack permissions
+      }
+    }
+  } catch {
+    // pgrep not available or no matches
+  }
+}
+
+/**
+ * Clean up stale test databases and orphaned backend processes from previous
+ * test runs that crashed or were killed without proper cleanup.
+ *
+ * Should be called before starting a new test backend.
+ */
+export async function cleanupStaleTestResources(postgresUrl?: string): Promise<void> {
+  const baseUrl = postgresUrl || process.env["DATABASE_URL"] || "postgres://postgres:changeme@localhost:5432";
+  const url = new URL(baseUrl);
+  url.pathname = "";
+  url.search = "";
+  const cleanBaseUrl = url.toString().replace(/\/$/, "");
+
+  // 1. Find and drop stale windmill_test_* databases
+  try {
+    const listProc = Bun.spawn(["psql", `${cleanBaseUrl}/postgres`, "-t", "-c",
+      `SELECT datname FROM pg_database WHERE datname LIKE 'windmill_test_%';`
+    ], { stdout: "pipe", stderr: "pipe" });
+    const output = await new Response(listProc.stdout).text();
+    await new Response(listProc.stderr).text();
+    await listProc.exited;
+
+    const staleDBs = output.trim().split("\n").map(s => s.trim()).filter(Boolean);
+    for (const db of staleDBs) {
+      // Only touch databases matching the expected naming pattern
+      if (!/^windmill_test_[a-z0-9_]+$/.test(db)) continue;
+      console.log(`Cleaning up stale test database: ${db}`);
+      const termProc = Bun.spawn(["psql", `${cleanBaseUrl}/postgres`, "-c",
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${db}' AND pid <> pg_backend_pid();`
+      ], { stdout: "pipe", stderr: "pipe" });
+      await new Response(termProc.stdout).text();
+      await new Response(termProc.stderr).text();
+      await termProc.exited;
+
+      const dropProc = Bun.spawn(["psql", `${cleanBaseUrl}/postgres`, "-c",
+        `DROP DATABASE IF EXISTS "${db}";`
+      ], { stdout: "pipe", stderr: "pipe" });
+      await new Response(dropProc.stdout).text();
+      await new Response(dropProc.stderr).text();
+      await dropProc.exited;
+    }
+    if (staleDBs.length > 0) {
+      console.log(`Cleaned up ${staleDBs.length} stale test database(s)`);
+    }
+  } catch (err) {
+    console.warn(`Warning: Failed to clean up stale databases: ${err}`);
+  }
+
+  // 2. Find and kill orphaned windmill processes from test runs
+  await killWindmillProcessesByEnvMatch("windmill_test_");
 }
 
 // Global backend instance
@@ -731,13 +876,13 @@ export async function withCargoBackend<T>(
     await globalCargoBackend.start();
   }
 
-  const tempDir = await Deno.makeTempDir({ prefix: "windmill_cli_test_" });
+  const tempDir = await mkdtemp(join(tmpdir(), "windmill_cli_test_"));
 
   try {
     await globalCargoBackend.reset();
     return await testFn(globalCargoBackend, tempDir);
   } finally {
-    await Deno.remove(tempDir, { recursive: true });
+    await rm(tempDir, { recursive: true, force: true });
   }
 }
 
@@ -752,15 +897,15 @@ export async function cleanupCargoBackend(): Promise<void> {
 }
 
 /**
- * Check if running in CI minimal mode (skip EE-dependent tests)
+ * Check if EE-dependent tests should be skipped
  *
- * When CI_MINIMAL_FEATURES=true:
- * - Backend runs with only "zip" feature (no private/enterprise)
- * - Tests requiring EE features should be skipped
+ * Returns true when:
+ * - CI_MINIMAL_FEATURES=true (CI mode with zip-only features)
+ * - EE_LICENSE_KEY is not set (EE features reject API calls without valid license)
  *
  * Use this in test definitions:
- *   ignore: shouldSkipOnCI()
+ *   test.skipIf(shouldSkipOnCI())("my EE test", ...)
  */
 export function shouldSkipOnCI(): boolean {
-  return Deno.env.get("CI_MINIMAL_FEATURES") === "true";
+  return process.env["CI_MINIMAL_FEATURES"] === "true" || !process.env["EE_LICENSE_KEY"];
 }

@@ -1,7 +1,6 @@
 <script lang="ts">
 	import 'chartjs-adapter-date-fns'
 	import zoomPlugin from 'chartjs-plugin-zoom'
-	import Tooltip2 from '$lib/components/Tooltip.svelte'
 	import {
 		Chart as ChartJS,
 		Title,
@@ -17,8 +16,8 @@
 	} from 'chart.js'
 	import type { CompletedJob } from '$lib/gen'
 	import { getDbClockNow } from '$lib/forLater'
-	import Button from './common/button/Button.svelte'
 	import { Scatter } from '$lib/components/chartjs-wrappers/chartJs'
+	import { timeTicksWithDate } from '$lib/components/chartjs-wrappers/timeTicks'
 	import DarkModeObserver from './DarkModeObserver.svelte'
 
 	interface Props {
@@ -28,10 +27,7 @@
 		maxTimeSet?: string | null
 		selectedIds?: string[]
 		canSelect?: boolean
-		lastFetchWentToEnd?: boolean
-		totalRowsFetched: number
 		onPointClicked: (ids: string[]) => void
-		onLoadExtra: () => void
 		onZoom: (zoom: { min: Date; max: Date }) => void
 	}
 
@@ -42,10 +38,7 @@
 		maxTimeSet = null,
 		selectedIds = $bindable([]),
 		canSelect = true,
-		lastFetchWentToEnd = false,
-		totalRowsFetched,
 		onPointClicked,
-		onLoadExtra,
 		onZoom
 	}: Props = $props()
 
@@ -277,7 +270,7 @@
 				},
 				min: minMaxTime.minTime.getTime(),
 				max: minMaxTime.maxTime.getTime(),
-				ticks: { maxRotation: 0, minRotation: 0 }
+				ticks: timeTicksWithDate(minMaxTime.minTime, minMaxTime.maxTime)
 			},
 			y: {
 				grid: {
@@ -299,23 +292,6 @@
 
 <DarkModeObserver bind:darkMode />
 
-<!-- {JSON.stringify(minTime)}
-{JSON.stringify(maxTime)}
-
-{JSON.stringify(jobs?.map((x) => x.started_at))} -->
-<!-- {minTime}
-{maxTime} -->
-<!-- {JSON.stringify(jobs?.map((x) => x.started_at))} -->
-<div class="relative max-h-40">
-	{#if !lastFetchWentToEnd}
-		<div class="absolute top-[-28px] left-[220px]">
-			<Button size="xs" color="transparent" variant="contained" on:click={() => onLoadExtra()}>
-				Load more
-				<Tooltip2>
-					There are more jobs to load but only the first {totalRowsFetched} were fetched
-				</Tooltip2>
-			</Button>
-		</div>
-	{/if}
+<div class="relative h-44">
 	<Scatter {data} options={scatterOptions} />
 </div>

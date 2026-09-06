@@ -9,13 +9,14 @@ use windmill_common::{
 };
 
 use crate::{
-    generate_webhook_service_url,
+    generate_webhook_service_url, http_error_status,
     nextcloud::{
         routes, NextCloud, NextCloudOAuthData, NextCloudTriggerData, NextcloudServiceConfig,
         OcsResponse,
     },
     External, NativeTriggerData, ServiceName,
 };
+use http::StatusCode;
 
 lazy_static::lazy_static! {
     pub static ref TOKEN_NEEDED: Box<serde_json::value::RawValue> = to_raw_value(&serde_json::json!({
@@ -40,7 +41,7 @@ impl FullNextcloudPayload {
         webhook_token: &str,
         data: &NativeTriggerData<NextcloudServiceConfig>,
     ) -> FullNextcloudPayload {
-        let base_url = &*BASE_URL.read().await;
+        let base_url = &**BASE_URL.load();
         let uri = generate_webhook_service_url(
             base_url,
             w_id,
@@ -102,6 +103,7 @@ impl External for NextCloud {
     const SUPPORT_WEBHOOK: bool = true;
     const TOKEN_ENDPOINT: &'static str = "/apps/oauth2/api/v1/token";
     const REFRESH_ENDPOINT: &'static str = "/apps/oauth2/api/v1/token";
+    const AUTH_ENDPOINT: &'static str = "/oauth/authorize";
 
     async fn create(
         &self,
@@ -110,7 +112,7 @@ impl External for NextCloud {
         webhook_token: &str,
         data: &NativeTriggerData<Self::ServiceConfig>,
         db: &DB,
-        tx: &mut PgConnection,
+        _tx: &mut PgConnection,
     ) -> Result<Self::CreateResponse> {
         // During create, we don't have external_id yet (it comes from NextCloud's response)
         let full_nextcloud_payload =
@@ -129,7 +131,6 @@ impl External for NextCloud {
                 &url,
                 Method::POST,
                 w_id,
-                tx,
                 db,
                 Some(headers),
                 Some(&full_nextcloud_payload),
@@ -148,7 +149,7 @@ impl External for NextCloud {
         data: &NativeTriggerData<Self::ServiceConfig>,
         db: &DB,
         tx: &mut PgConnection,
-    ) -> Result<()> {
+    ) -> Result<serde_json::Value> {
         // During update, we have the external_id so include it in the webhook URL
         let full_nextcloud_payload =
             FullNextcloudPayload::new(w_id, Some(external_id), webhook_token, data).await;
@@ -166,14 +167,34 @@ impl External for NextCloud {
                 &url,
                 Method::POST,
                 w_id,
-                tx,
                 db,
                 Some(headers),
                 Some(&full_nextcloud_payload),
             )
             .await?;
 
-        Ok(())
+        // The webhook is already updated at this point, so the read-back is an enrichment (it
+        // picks up whatever Nextcloud resolved server-side), not a second chance to fail. Failing
+        // here would report a webhook that is in fact installed as un-installed, and callers would
+        // then unwind a token the service is already using.
+        let read_back = match self.get(w_id, oauth_data, external_id, db, tx).await {
+            Ok(Some(trigger_data)) => serde_json::to_value(&trigger_data).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "Nextcloud webhook {external_id} was updated but could not be read back, \
+                     storing the requested config: {e:#}"
+                );
+                None
+            }
+        };
+
+        match read_back {
+            Some(config) => Ok(config),
+            None => serde_json::to_value(&data.service_config).map_err(|e| {
+                Error::internal_err(format!("Failed to convert trigger data to JSON: {}", e))
+            }),
+        }
     }
 
     async fn get(
@@ -182,8 +203,8 @@ impl External for NextCloud {
         oauth_data: &Self::OAuthData,
         external_id: &str,
         db: &DB,
-        tx: &mut PgConnection,
-    ) -> Result<Self::TriggerData> {
+        _tx: &mut PgConnection,
+    ) -> Result<Option<Self::TriggerData>> {
         let url = format!(
             "{}/ocs/v2.php/apps/webhook_listeners/api/v1/webhooks/{}",
             oauth_data.base_url, external_id
@@ -193,10 +214,10 @@ impl External for NextCloud {
         headers.insert("OCS-APIRequest".to_string(), "true".to_string());
 
         let ocs_response: OcsResponse<NextCloudTriggerData> = self
-            .http_client_request::<_, ()>(&url, Method::GET, w_id, tx, db, Some(headers), None)
+            .http_client_request::<_, ()>(&url, Method::GET, w_id, db, Some(headers), None)
             .await?;
 
-        Ok(ocs_response.ocs.data)
+        Ok(Some(ocs_response.ocs.data))
     }
 
     async fn delete(
@@ -205,7 +226,7 @@ impl External for NextCloud {
         oauth_data: &Self::OAuthData,
         external_id: &str,
         db: &DB,
-        tx: &mut PgConnection,
+        _tx: &mut PgConnection,
     ) -> Result<()> {
         let url = format!(
             "{}/ocs/v2.php/apps/webhook_listeners/api/v1/webhooks/{}",
@@ -215,55 +236,110 @@ impl External for NextCloud {
         let mut headers = HashMap::new();
         headers.insert("OCS-APIRequest".to_string(), "true".to_string());
 
+        // A webhook already removed in Nextcloud is the outcome this call wants, so only 404 is
+        // swallowed; anything else would leave a live webhook behind while Windmill forgets it.
         let _: serde_json::Value = self
-            .http_client_request::<_, ()>(&url, Method::DELETE, w_id, tx, db, Some(headers), None)
+            .http_client_request::<_, ()>(&url, Method::DELETE, w_id, db, Some(headers), None)
             .await
-            .or_else(|e| match &e {
-                Error::InternalErr(msg) if msg.contains("404") => Ok(serde_json::Value::Null),
+            .or_else(|e| match http_error_status(&e) {
+                Some(StatusCode::NOT_FOUND) => Ok(serde_json::Value::Null),
                 _ => Err(e),
             })?;
 
         Ok(())
     }
 
-    async fn exists(
+    async fn maintain_triggers(
         &self,
-        w_id: &str,
-        oauth_data: &Self::OAuthData,
-        external_id: &str,
         db: &DB,
-        tx: &mut PgConnection,
-    ) -> Result<bool> {
-        let url = format!(
-            "{}/ocs/v2.php/apps/webhook_listeners/api/v1/webhooks/{}",
-            oauth_data.base_url, external_id
-        );
+        workspace_id: &str,
+        triggers: &[crate::NativeTrigger],
+        oauth_data: &Self::OAuthData,
+        synced: &mut Vec<crate::sync::TriggerSyncInfo>,
+        errors: &mut Vec<crate::sync::SyncError>,
+    ) {
+        let external_triggers = match self.list_all(workspace_id, oauth_data, db).await {
+            Ok(triggers) => triggers,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to fetch external triggers for {}: {}",
+                    workspace_id,
+                    e
+                );
+                errors.push(crate::sync::SyncError {
+                    resource_path: format!("workspace:{}", workspace_id),
+                    error_message: format!(
+                        "Failed to fetch external triggers: {}",
+                        crate::external_error_message(&e)
+                    ),
+                    error_type: "external_service_error".to_string(),
+                });
+                return;
+            }
+        };
 
-        let mut headers = HashMap::new();
-        headers.insert("OCS-APIRequest".to_string(), "true".to_string());
+        // Convert to (external_id, config_json) pairs for reconciliation
+        let external_pairs: Vec<(String, serde_json::Value)> = external_triggers
+            .iter()
+            .filter_map(|data| {
+                let config = serde_json::to_value(data).ok()?;
+                Some((data.id.to_string(), config))
+            })
+            .collect();
 
-        let _ = self
-            .http_client_request::<serde_json::Value, ()>(
-                &url,
-                Method::GET,
-                w_id,
-                tx,
-                db,
-                Some(headers),
-                None,
-            )
-            .await?;
-
-        Ok(true)
+        crate::sync::reconcile_with_external_state(
+            db,
+            workspace_id,
+            ServiceName::Nextcloud,
+            triggers,
+            &external_pairs,
+            synced,
+            errors,
+        )
+        .await;
     }
 
+    fn external_id_and_metadata_from_response(
+        &self,
+        resp: &Self::CreateResponse,
+    ) -> (String, Option<serde_json::Value>) {
+        (resp.id.to_string(), None)
+    }
+
+    fn additional_routes(&self) -> axum::Router {
+        routes::nextcloud_routes(self.clone())
+    }
+
+    fn describe_error_body(&self, body: &str) -> Option<String> {
+        let ocs: OcsResponse<serde_json::Value> = serde_json::from_str(body).ok()?;
+        Some(ocs.ocs.meta.message).filter(|m| !m.is_empty())
+    }
+
+    /// Appended to every failed call of this service, so a hint may not assert what the caller
+    /// was doing — only name the requirement that most often explains the status.
+    fn error_hint(&self, status: StatusCode) -> Option<&'static str> {
+        match status {
+            StatusCode::UNAUTHORIZED => {
+                Some("reconnect the Nextcloud integration from Workspace settings > Integrations.")
+            }
+            StatusCode::FORBIDDEN => Some(
+                "Nextcloud grants webhook management to administrators only, and a Windmill \
+                 admin is a different thing. If the connected Nextcloud account is not an admin \
+                 there and holds no delegated admin rights for the Webhooks setting, reconnect \
+                 the integration from Workspace settings > Integrations with one that does.",
+            ),
+            _ => None,
+        }
+    }
+}
+
+impl NextCloud {
     async fn list_all(
         &self,
         w_id: &str,
-        oauth_data: &Self::OAuthData,
+        oauth_data: &NextCloudOAuthData,
         db: &DB,
-        tx: &mut PgConnection,
-    ) -> Result<Vec<Self::TriggerData>> {
+    ) -> Result<Vec<NextCloudTriggerData>> {
         let url = format!(
             "{}/ocs/v2.php/apps/webhook_listeners/api/v1/webhooks",
             oauth_data.base_url
@@ -277,7 +353,6 @@ impl External for NextCloud {
                 &url,
                 Method::GET,
                 w_id,
-                tx,
                 db,
                 Some(headers),
                 None,
@@ -285,20 +360,5 @@ impl External for NextCloud {
             .await?;
 
         Ok(ocs_response.ocs.data)
-    }
-
-    fn external_id_and_metadata_from_response(
-        &self,
-        resp: &Self::CreateResponse,
-    ) -> (String, Option<serde_json::Value>) {
-        (resp.id.to_string(), None)
-    }
-
-    fn get_external_id_from_trigger_data(&self, data: &Self::TriggerData) -> String {
-        data.id.to_string()
-    }
-
-    fn additional_routes(&self) -> axum::Router {
-        routes::nextcloud_routes(self.clone())
     }
 }

@@ -21,13 +21,13 @@ RUN set -eux; \
     url=; \
     case "$arch" in \
     'amd64') \
-    targz='go1.25.0.linux-amd64.tar.gz'; \
+    targz='go1.26.0.linux-amd64.tar.gz'; \
     ;; \
     'arm64') \
-    targz='go1.25.0.linux-arm64.tar.gz'; \
+    targz='go1.26.0.linux-arm64.tar.gz'; \
     ;; \
     'armhf') \
-    targz='go1.25.0.linux-armv6l.tar.gz'; \
+    targz='go1.26.0.linux-armv6l.tar.gz'; \
     ;; \
     *) echo >&2 "error: unsupported architecture '$arch' (likely packaging update needed)"; exit 1 ;; \
     esac; \
@@ -37,7 +37,7 @@ ENV PATH="${PATH}:/usr/local/go/bin"
 ENV GOBIN=/usr/local/go/bin
 RUN /usr/local/go/bin/go install -v golang.org/x/tools/gopls@latest
 
-RUN pip3 install tornado python-lsp-jsonrpc ruff
+RUN pip3 install tornado python-lsp-jsonrpc ruff==0.16.0
 
 COPY --from=denoland/deno:2.2.1 --chmod=755 /usr/bin/deno /usr/bin/deno
 

@@ -19,6 +19,7 @@
 	import { computeGlobalContext, eval_like } from './eval'
 	import { deepEqual } from 'fast-equals'
 	import { deepMergeWithPriority, isCodeInjection, readFieldsRecursively } from '$lib/utils'
+	import { escapeTemplateBackticks } from '$lib/utils/templateLiteral'
 	import sum from 'hash-sum'
 	import { createDispatcherIfMounted } from '$lib/createDispatcherIfMounted'
 
@@ -63,7 +64,7 @@
 	const dispatch = createEventDispatcher()
 	const dispatchIfMounted = createDispatcherIfMounted(dispatch)
 
-	if (input == undefined) {
+	if (untrack(() => input) == undefined) {
 		// How did this ever do anything at the top level in svelte 4 if
 		// events were not being picked up before the component fully mounted?
 		dispatch('done')
@@ -271,7 +272,7 @@
 		if ((input.type === 'template' || input.type == 'templatev2') && isCodeInjection(input.eval)) {
 			try {
 				const r = await eval_like(
-					'`' + input.eval.replaceAll('`', '\\`') + '`',
+					'`' + escapeTemplateBackticks(input.eval) + '`',
 					computeGlobalContext($worldStore, id, fullContext),
 					$stateStore,
 					$mode == 'dnd',
@@ -367,13 +368,13 @@
 			untrack(() => debounce(debounceTemplate))
 	})
 
-	if (input?.type == 'eval') {
+	if (untrack(() => input)?.type == 'eval') {
 		$worldStore?.stateId.subscribe((x) => {
 			debounce2(debounceEval)
 		})
 	}
 
-	if (input?.type == 'template') {
+	if (untrack(() => input)?.type == 'template') {
 		$worldStore?.stateId.subscribe((x) => {
 			debounce2(debounceTemplate)
 		})

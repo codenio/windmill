@@ -1,5 +1,8 @@
 {
   "permissions": {
+    "additionalDirectories": [
+      "../windmill-ee-private"
+    ],
     "allow": [
       "Bash(ls:*)",
       "Bash(grep:*)",
@@ -25,73 +28,88 @@
       "Bash(git show:*)",
       "Bash(git blame:*)",
       "Bash(cargo check:*)",
+      "Bash(cargo build --release:*)",
+      "Bash(sh wm-ts-nav/nav:*)",
+      "Bash(wm-ts-nav/nav:*)",
+      "Bash(./wm-ts-nav/nav:*)",
+      "Bash(wm-ts-nav/target/release/wm-ts-nav:*)",
+      "Bash(./wm-ts-nav/target/release/wm-ts-nav:*)",
       "mcp__ide__getDiagnostics",
       "Bash(npm run generate-backend-client:*)",
-      "Bash(npm run check:*)"
-    ],
-    "deny": [
-      "Read(.env)",
-      "Read(.env.*)",
-      "Read(**/.env)",
-      "Read(**/.env.*)",
-      "Read(**/secrets/**)",
-      "Read(**/*.pem)",
-      "Read(**/*.key)",
-      "Read(**/credentials.json)",
-      "Read(**/*secret*)",
-      "Edit(.env)",
-      "Edit(.env.*)",
-      "Edit(**/.env)",
-      "Edit(**/.env.*)"
-    ],
-    "ask": [
-      "Bash(rm:*)",
-      "Bash(rmdir:*)",
-      "Bash(mv:*)",
-      "Bash(chmod:*)",
-      "Bash(chown:*)",
-      "Bash(truncate:*)",
-      "Bash(shred:*)",
-      "Bash(unlink:*)",
+      "Bash(npm run check:*)",
       "Bash(git push:*)",
       "Bash(git reset:*)",
       "Bash(git revert:*)",
       "Bash(git checkout:*)",
       "Bash(git merge:*)",
-      "Bash(git rebase:*)"
+      "Bash(git rebase:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Read(/tmp/**)",
+      "Write(/tmp/**)",
+      "Edit(/tmp/**)",
+      "mcp__claude_ai_Gmail__search_threads",
+      "mcp__claude_ai_Gmail__get_thread",
+      "mcp__claude_ai_Gmail__get_message",
+      "mcp__claude_ai_Gmail__list_labels",
+      "mcp__claude_ai_Gmail__list_drafts"
+    ],
+    "deny": [
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Edit(**/.env)",
+      "Edit(**/.env.*)",
+      "Edit(**/secrets/**)",
+      "Edit(**/*.pem)",
+      "Edit(**/*.key)",
+      "Edit(**/credentials.json)",
+      "Edit(**/.secret*)",
+      "Edit(**/.secrets*)",
+      "Edit(**/*.secret)",
+      "Edit(**/*.secrets)"
+    ],
+    "ask": [
+      "Bash(rmdir:*)",
+      "Bash(chown:*)",
+      "Bash(truncate:*)",
+      "Bash(shred:*)",
+      "Bash(unlink:*)",
+      "mcp__claude_ai_Stripe",
+      "mcp__claude_ai_Gmail__create_draft",
+      "mcp__claude_ai_Gmail__update_draft",
+      "mcp__claude_ai_Gmail__create_label",
+      "mcp__claude_ai_Gmail__label_message",
+      "mcp__claude_ai_Gmail__label_thread",
+      "mcp__claude_ai_Gmail__unlabel_message",
+      "mcp__claude_ai_Gmail__unlabel_thread",
+      "mcp__claude_ai_Gmail__apply_sensitive_message_label",
+      "mcp__claude_ai_Gmail__apply_sensitive_thread_label",
+      "mcp__claude_ai_Google_Calendar",
+      "mcp__claude_ai_Google_Drive",
+      "mcp__claude_ai_Slack",
+      "mcp__claude_ai_Linear"
     ]
   },
   "enableAllProjectMcpServers": true,
   "hooks": {
-    "UserPromptSubmit": [
+    "PreToolUse": [
       {
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/resolve-symlinks.sh",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-main-branch.sh",
+            "timeout": 5
+          },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/restore-symlinks.sh",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-rm-outside-tmp.sh",
+            "timeout": 5
+          },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/restore-symlinks.sh",
-            "timeout": 30
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/allow-fileops-in-tmp.sh",
+            "timeout": 5
           }
         ]
       }
@@ -126,7 +144,6 @@
     ]
   },
   "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
     "code-review@claude-plugins-official": true
   }

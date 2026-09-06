@@ -5,16 +5,18 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
-use http::{header::CONTENT_TYPE, StatusCode};
+use http::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sqlx::types::JsonRawValue;
 use windmill_common::{
     error::Error,
+    jobs::WM_TRACEPARENT,
     triggers::{RunnableFormat, RunnableFormatVersion, TriggerKind},
     worker::to_raw_value,
-    DB,
+    DB, OTEL_TRACING_ENABLED,
 };
 use windmill_queue::PushArgsOwned;
 
@@ -31,6 +33,7 @@ pub enum RawBody {
     Xml(String),
     UrlEncoded(Bytes),
     Multipart(Multipart),
+    RawBytes(Bytes),
     Empty,
 }
 
@@ -67,6 +70,47 @@ pub struct WebhookArgs {
 // capture
 //
 
+/// One multipart part's value, kept in body order so that repeated field names
+/// can be grouped without dropping any of them.
+#[cfg(any(feature = "parquet", test))]
+enum MultipartValue {
+    Text(String),
+    File(serde_json::Value),
+}
+
+/// Collapse multipart parts into one value per field name: a name sent once
+/// stays a scalar, a name sent several times becomes an array of its values in
+/// body order. A name that carried a file is always an array, even for a single
+/// file, since that is the shape scripts have been typed against since #5002.
+#[cfg(any(feature = "parquet", test))]
+fn collapse_multipart_fields(
+    parts: Vec<(String, MultipartValue)>,
+) -> HashMap<String, Box<RawValue>> {
+    let mut grouped: HashMap<String, (Vec<serde_json::Value>, bool)> = HashMap::new();
+
+    for (name, value) in parts {
+        let (values, has_file) = grouped.entry(name).or_insert_with(|| (vec![], false));
+        match value {
+            MultipartValue::Text(text) => values.push(serde_json::Value::String(text)),
+            MultipartValue::File(file) => {
+                values.push(file);
+                *has_file = true;
+            }
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(name, (mut values, has_file))| {
+            let value = match (has_file, values.len()) {
+                (false, 1) => values.remove(0),
+                _ => serde_json::Value::Array(values),
+            };
+            (name, to_raw_value(&value))
+        })
+        .collect()
+}
+
 impl RawWebhookArgs {
     #[cfg(not(feature = "parquet"))]
     pub async fn process_multipart(
@@ -87,39 +131,46 @@ impl RawWebhookArgs {
         db: &DB,
         w_id: &str,
     ) -> Result<HashMap<String, Box<RawValue>>, Error> {
+        #[cfg(not(feature = "enterprise"))]
+        use crate::job_helpers_oss::{
+            bump_storage_usage, ce_storage_quota_remaining, spawn_storage_usage_recount_floored,
+        };
         use crate::job_helpers_oss::{
             get_random_file_name, get_workspace_s3_resource, upload_file_internal,
         };
         use futures::TryStreamExt;
-        use object_store::{Attribute, Attributes};
-        use windmill_common::s3_helpers::build_object_store_client;
+        use windmill_object_store::build_object_store_client;
+        use windmill_object_store::object_store_reexports::{Attribute, Attributes};
 
         let (_, s3_resource) = get_workspace_s3_resource(authed, db, None, w_id, None).await?;
 
         if let Some(s3_resource) = s3_resource {
             let s3_client = build_object_store_client(&s3_resource).await?;
 
-            let mut body = HashMap::new();
-            let mut files = HashMap::new();
+            let mut parts: Vec<(String, MultipartValue)> = Vec::new();
 
             while let Some(field) = multipart.next_field().await.map_err(|e| {
                 Error::BadRequest(format!("Error reading multipart field: {}", e.body_text()))
             })? {
                 if let Some(name) = field.name().map(|x| x.to_string()) {
-                    if let Some(content_type) = field.content_type() {
+                    if field.file_name().is_some() {
+                        let content_type = field
+                            .content_type()
+                            .unwrap_or("application/octet-stream")
+                            .to_string();
                         let ext = field
                             .file_name()
-                            .map(|x| x.split('.').last())
-                            .flatten()
+                            .and_then(|x| x.split('.').last())
                             .map(|x| x.to_string());
+                        let filename = field.file_name().map(|x| x.to_string());
 
                         let file_key = get_random_file_name(ext);
 
                         let options = Attributes::from_iter(vec![
-                            (Attribute::ContentType, content_type.to_string()),
+                            (Attribute::ContentType, content_type),
                             (
                                 Attribute::ContentDisposition,
-                                if let Some(filename) = field.file_name() {
+                                if let Some(filename) = filename {
                                     format!("inline; filename=\"{}\"", filename)
                                 } else {
                                     "inline".to_string()
@@ -132,23 +183,54 @@ impl RawWebhookArgs {
                             .into_stream()
                             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
 
-                        upload_file_internal(s3_client.clone(), &file_key, bytes_stream, options)
-                            .await?;
+                        // file_key is always freshly random here, so this never
+                        // overwrites an existing object; the full size is the delta.
+                        #[cfg(not(feature = "enterprise"))]
+                        let max_size =
+                            Some(ce_storage_quota_remaining(db, w_id, None).await? as usize);
+                        #[cfg(feature = "enterprise")]
+                        let max_size: Option<usize> = None;
 
-                        files.entry(name).or_insert(vec![]).push(serde_json::json!({
-                            "s3": &file_key
-                        }));
+                        match upload_file_internal(
+                            s3_client.clone(),
+                            &file_key,
+                            bytes_stream,
+                            options,
+                            max_size,
+                        )
+                        .await
+                        {
+                            Ok((_, _size)) => {
+                                #[cfg(not(feature = "enterprise"))]
+                                bump_storage_usage(
+                                    db,
+                                    w_id,
+                                    windmill_object_store::DEFAULT_STORAGE,
+                                    _size as i64,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                #[cfg(not(feature = "enterprise"))]
+                                spawn_storage_usage_recount_floored(db, w_id);
+                                return Err(e);
+                            }
+                        }
+
+                        parts.push((
+                            name,
+                            MultipartValue::File(serde_json::json!({ "s3": &file_key })),
+                        ));
                     } else {
-                        body.insert(name, to_raw_value(&field.text().await.unwrap_or_default()));
+                        parts.push((
+                            name,
+                            MultipartValue::Text(field.text().await.unwrap_or_default()),
+                        ));
                     }
                 }
             }
 
-            for (k, v) in files {
-                body.insert(k, to_raw_value(&v));
-            }
-
-            Ok(body)
+            Ok(collapse_multipart_fields(parts))
         } else {
             Err(Error::BadRequest(format!(
                 "You need to connect your workspace to an S3 bucket to use multipart/form-data"
@@ -181,6 +263,16 @@ impl RawWebhookArgs {
                 body: Body::HashMap(HashMap::new()),
                 metadata: WebhookArgsMetadata { raw_string: Some(s), ..self.metadata },
             }),
+            RawBody::RawBytes(bytes) => {
+                let s = match String::from_utf8(bytes.to_vec()) {
+                    Ok(s) => s,
+                    Err(e) => BASE64_STANDARD.encode(e.into_bytes()),
+                };
+                Ok(WebhookArgs {
+                    body: Body::HashMap(HashMap::new()),
+                    metadata: WebhookArgsMetadata { raw_string: Some(s), ..self.metadata },
+                })
+            }
             RawBody::UrlEncoded(bytes) => {
                 let mut metadata = self.metadata;
                 if use_raw {
@@ -264,6 +356,13 @@ impl WebhookArgs {
         self,
         runnable_format: RunnableFormat,
     ) -> Result<PushArgsOwned, Error> {
+        // Capture the inbound W3C `traceparent` before `self.metadata` is
+        // consumed below. Read back at root-job completion to link the job's
+        // OTLP span to the originating distributed trace. Deliberately bypasses
+        // the header whitelist, and is gated to OTel-enabled instances so others
+        // don't get a stray `_wm_traceparent` arg key.
+        let trace_context = inbound_traceparent(&self.metadata.headers);
+
         let headers = build_headers(
             &self.metadata.headers,
             self.metadata.query_include_header,
@@ -276,7 +375,7 @@ impl WebhookArgs {
             runnable_format.has_preprocessor,
         );
 
-        match runnable_format {
+        let mut push_args = match runnable_format {
             RunnableFormat { has_preprocessor: true, version: RunnableFormatVersion::V2 } => {
                 let mut args = HashMap::new();
 
@@ -291,7 +390,7 @@ impl WebhookArgs {
                     }),
                 );
 
-                Ok(PushArgsOwned { args, extra: None })
+                PushArgsOwned { args, extra: None }
             }
             RunnableFormat { has_preprocessor, .. } => {
                 let mut extra = HashMap::new();
@@ -327,16 +426,40 @@ impl WebhookArgs {
                         if query_wrap_body {
                             body = HashMap::from([("body".to_string(), to_raw_value(&body))]);
                         }
-                        Ok(PushArgsOwned { args: body, extra })
+                        PushArgsOwned { args: body, extra }
                     }
                     Body::NoHashMap(args) => {
                         let mut hm = HashMap::new();
                         hm.insert("body".to_string(), args);
-                        Ok(PushArgsOwned { args: hm, extra })
+                        PushArgsOwned { args: hm, extra }
                     }
                 }
             }
+        };
+
+        // `_wm_traceparent` is Windmill-controlled: strip any caller-supplied
+        // value (e.g. smuggled through the request body) so only the header we
+        // captured above can become the job's inbound trace context. Then stash
+        // the captured value as a reserved arg key — it rides the `args` jsonb
+        // like `_ENTRYPOINT_OVERRIDE`; normal scripts never see it (args are
+        // bound by declared parameter name).
+        push_args.args.remove(WM_TRACEPARENT);
+        if let Some(ref mut extra) = push_args.extra {
+            extra.remove(WM_TRACEPARENT);
         }
+        if let Some(trace_context) = trace_context {
+            let raw = to_raw_value(&trace_context);
+            match push_args.extra {
+                Some(ref mut extra) => {
+                    extra.insert(WM_TRACEPARENT.to_string(), raw);
+                }
+                None => {
+                    push_args.args.insert(WM_TRACEPARENT.to_string(), raw);
+                }
+            }
+        }
+
+        Ok(push_args)
     }
 }
 
@@ -397,7 +520,10 @@ where
         let bytes = Bytes::from_request(request, _state)
             .await
             .map_err(IntoResponse::into_response)?;
-        if no_content_type && bytes.is_empty() {
+        // A request carries a body only when it signals one with Content-Length or
+        // Transfer-Encoding (RFC 9112 §6), yet it may advertise a Content-Type
+        // regardless. An empty body is therefore no args, not a malformed document.
+        if bytes.is_empty() {
             Ok(RawWebhookArgs { body: RawBody::Empty, metadata })
         } else {
             let str = String::from_utf8(bytes.to_vec())
@@ -443,12 +569,14 @@ where
 
         Ok(RawWebhookArgs { body: RawBody::Multipart(multipart), metadata })
     } else {
-        Err(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response())
+        let bytes = Bytes::from_request(request, _state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(RawWebhookArgs { body: RawBody::RawBytes(bytes), metadata })
     }
 }
 
-#[axum::async_trait]
-impl<S> FromRequest<S, axum::body::Body> for RawWebhookArgs
+impl<S> FromRequest<S> for RawWebhookArgs
 where
     S: Send + Sync,
 {
@@ -467,6 +595,23 @@ lazy_static::lazy_static! {
         .split(',')
         .map(|s| s.to_string())
         .collect()).unwrap_or_default();
+}
+
+/// Extract the inbound W3C `traceparent` header so the enqueued job can be
+/// linked back to the originating distributed trace. Returns `None` when OTel
+/// tracing is disabled (so non-tracing instances don't accumulate a stray
+/// reserved arg key) or when no `traceparent` header is present. The W3C format
+/// is not validated here — it is checked later at use time
+/// (`valid_w3c_traceparent` for the env, EE `span_cx_from_traceparent` for the
+/// span).
+fn inbound_traceparent(headers: &HeaderMap) -> Option<String> {
+    if !OTEL_TRACING_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 pub fn build_headers(
@@ -611,6 +756,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn test_bodyless_request_with_json_content_type() {
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/api/r/customer/test")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let args = try_from_request_body(request, &(), true)
+            .await
+            .unwrap_or_else(|_| panic!("bodyless GET should be accepted"));
+
+        assert!(
+            matches!(args.body, RawBody::Empty),
+            "bodyless GET should carry no args, got {:?}",
+            args.body
+        );
+    }
+
+    #[tokio::test]
     async fn test_cloudevents_json_payload() {
         let r1 = r#"
         {
@@ -674,5 +839,36 @@ mod tests {
             }
             _ => panic!("Expected a HashMap"),
         }
+    }
+
+    #[test]
+    fn test_collapse_multipart_fields() {
+        let file = |key: &str| MultipartValue::File(serde_json::json!({ "s3": key }));
+        let body = collapse_multipart_fields(vec![
+            ("single".to_string(), MultipartValue::Text("a".to_string())),
+            (
+                "repeated".to_string(),
+                MultipartValue::Text("a".to_string()),
+            ),
+            (
+                "repeated".to_string(),
+                MultipartValue::Text("b".to_string()),
+            ),
+            ("one_file".to_string(), file("k1")),
+            ("many_files".to_string(), file("k2")),
+            ("many_files".to_string(), file("k3")),
+            ("mixed".to_string(), MultipartValue::Text("a".to_string())),
+            ("mixed".to_string(), file("k4")),
+        ]);
+
+        let get = |k: &str| body.get(k).expect(k).get().to_string();
+
+        assert_eq!(get("single"), r#""a""#);
+        assert_eq!(get("repeated"), r#"["a","b"]"#);
+        // A lone file stays wrapped in an array: scripts are typed against it.
+        assert_eq!(get("one_file"), r#"[{"s3":"k1"}]"#);
+        assert_eq!(get("many_files"), r#"[{"s3":"k2"},{"s3":"k3"}]"#);
+        // A name used by both a text and a file part keeps both, in body order.
+        assert_eq!(get("mixed"), r#"["a",{"s3":"k4"}]"#);
     }
 }

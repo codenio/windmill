@@ -2,24 +2,28 @@
 	import { createBubbler, preventDefault } from 'svelte/legacy'
 
 	const bubble = createBubbler()
-	import { IndexSearchService, ServiceLogsService } from '$lib/gen'
+	import { IndexSearchService, ServiceLogsService, type LogSearchHit } from '$lib/gen'
 
-	import ManuelDatePicker from './runs/ManuelDatePicker.svelte'
+	import TimeframeSelect, {
+		serviceLogsTimeframes,
+		useUrlSyncedTimeframe
+	} from './runs/TimeframeSelect.svelte'
 	import CalendarPicker from './common/calendarPicker/CalendarPicker.svelte'
 	import LogViewer from './LogViewer.svelte'
 	import Toggle from './Toggle.svelte'
 	import { sendUserToast } from '$lib/toast'
-	import { onDestroy, tick, untrack } from 'svelte'
+	import { onDestroy, tick } from 'svelte'
 	import { Loader2 } from 'lucide-svelte'
 	import { copyToClipboard, scroll_into_view_if_needed_polyfill, truncateRev } from '$lib/utils'
 	import LogSnippetViewer from './LogSnippetViewer.svelte'
-	import { Button, Drawer, DrawerContent } from './common'
+	import { Alert, Button, Drawer, DrawerContent } from './common'
 	import ClipboardCopy from 'lucide-svelte/icons/clipboard-copy'
 	import { AnsiUp } from 'ansi_up'
 	import SplitPanesOrColumnOnMobile from './splitPanes/SplitPanesOrColumnOnMobile.svelte'
 	import Select from './select/Select.svelte'
 	import { goto } from '$lib/navigation'
-	import { page } from '$app/stores'
+	import { page } from '$app/state'
+	import { watch } from 'runed'
 
 	interface Props {
 		searchTerm: string
@@ -31,9 +35,6 @@
 
 	let minTs: undefined | string = $state(undefined)
 	let maxTs: undefined | string = $state(undefined)
-
-	let minTsManual: undefined | string = $state($page.url.searchParams.get('minTs') ?? undefined)
-	let maxTsManual: undefined | string = $state($page.url.searchParams.get('maxTs') ?? undefined)
 
 	let max_lines: undefined | number = $state(undefined)
 
@@ -58,14 +59,16 @@
 	let timeout: number | undefined = $state(undefined)
 
 	let allLogs: ByMode | undefined = $state(undefined)
-	let manualPicker: ManuelDatePicker | undefined = $state(undefined)
+
+	let _timeframe = useUrlSyncedTimeframe(serviceLogsTimeframes)
+	let timeframe = $derived(_timeframe.timeframe)
+
+	let [minTsManual, maxTsManual] = $derived(
+		timeframe.type === 'manual' ? [timeframe.minTs ?? undefined, timeframe.maxTs ?? undefined] : []
+	)
 
 	let upTo: undefined | string = $state(undefined)
 	let upToIsLatest = $state(true)
-
-	function onManualChanges() {
-		getAllLogs(minTsManual ?? maxTs, maxTsManual)
-	}
 
 	function getAllLogs(queryMinTs: string | undefined, queryMaxTs: string | undefined) {
 		timeout && clearTimeout(timeout)
@@ -151,11 +154,6 @@
 				if (autoRefresh && searchTerm === '' && !maxTsManual) {
 					timeout = setTimeout(() => {
 						if (searchTerm !== '') return
-						let minMax = manualPicker?.computeMinMax()
-						if (minMax) {
-							maxTsManual = minMax?.maxTs ?? undefined
-							minTsManual = minMax?.minTs ?? undefined
-						}
 						let maxTsPlus1 = maxTs ? new Date(new Date(maxTs).getTime() + 1000) : undefined
 						getAllLogs(maxTsPlus1?.toISOString(), undefined)
 					}, 5000)
@@ -171,13 +169,13 @@
 
 	type Selected = { mode: string; workerGroup: string; hostname: string }
 	let initialSelected =
-		$page.url.searchParams.get('mode') &&
-		$page.url.searchParams.get('workerGroup') &&
-		$page.url.searchParams.get('hostname')
+		page.url.searchParams.get('mode') &&
+		page.url.searchParams.get('workerGroup') &&
+		page.url.searchParams.get('hostname')
 			? {
-					mode: $page.url.searchParams.get('mode')!,
-					workerGroup: $page.url.searchParams.get('workerGroup')!,
-					hostname: $page.url.searchParams.get('hostname')!
+					mode: page.url.searchParams.get('mode')!,
+					workerGroup: page.url.searchParams.get('workerGroup')!,
+					hostname: page.url.searchParams.get('hostname')!
 				}
 			: undefined
 	let selected: Selected | undefined = $state(initialSelected)
@@ -255,38 +253,49 @@
 		try {
 			let res = ''
 			log.split('\n').forEach((line) => {
+				// A file can hold both formats: the ones written before the layer
+				// switched to JSON, and panics or subprocess output that was never
+				// JSON to begin with. Those lines pass through as they are rather
+				// than being dropped, which would render the file blank.
+				let obj: any = undefined
 				if (line.startsWith('{') && line.endsWith('}')) {
-					let obj = JSON.parse(line)
-					if (typeof obj == 'object') {
-						let nl = ''
-						if (obj['timestamp']) {
-							nl += obj['timestamp'] + ' '
-						}
-						if (obj['level']) {
-							let lvl = obj['level']
-							if (lvl == 'ERROR') {
-								nl += '\x1b[31mERROR\x1b[0m '
-							} else if (lvl == 'INFO') {
-								nl += '\x1b[32mINFO\x1b[0m '
-							} else {
-								nl += obj['level'] + ' '
-							}
-						}
-						if (obj['message']) {
-							nl += obj['message'] + ' '
-						}
-						delete obj['timestamp']
-						delete obj['level']
-						delete obj['message']
-						Object.keys(obj).forEach((key) => {
-							nl +=
-								key +
-								'=' +
-								(typeof obj[key] == 'object' ? JSON.stringify(obj[key]) : obj[key]) +
-								' '
-						})
-						res += nl + '\n'
+					try {
+						obj = JSON.parse(line)
+					} catch {
+						obj = undefined
 					}
+				}
+				if (obj === null || typeof obj !== 'object') {
+					res += line + '\n'
+				} else {
+					let nl = ''
+					if (obj['timestamp']) {
+						nl += obj['timestamp'] + ' '
+					}
+					if (obj['level']) {
+						let lvl = obj['level']
+						if (lvl == 'ERROR') {
+							nl += '\x1b[31mERROR\x1b[0m '
+						} else if (lvl == 'INFO') {
+							nl += '\x1b[32mINFO\x1b[0m '
+						} else {
+							nl += obj['level'] + ' '
+						}
+					}
+					if (obj['message']) {
+						nl += obj['message'] + ' '
+					}
+					delete obj['timestamp']
+					delete obj['level']
+					delete obj['message']
+					Object.keys(obj).forEach((key) => {
+						nl +=
+							key +
+							'=' +
+							(typeof obj[key] == 'object' ? JSON.stringify(obj[key]) : obj[key]) +
+							' '
+					})
+					res += nl + '\n'
 				}
 			})
 
@@ -294,6 +303,23 @@
 		} catch (e) {
 			return log
 		}
+	}
+
+	// A hit is one log line with its fields already separated, so rendering it is
+	// formatting rather than parsing — there is no JSON to prettify and no
+	// snippet to highlight.
+	function renderHit(hit: LogSearchHit): string {
+		const level =
+			hit.level === 'ERROR'
+				? '\x1b[31mERROR\x1b[0m'
+				: hit.level === 'WARN'
+					? '\x1b[33mWARN\x1b[0m'
+					: hit.level === 'INFO'
+						? '\x1b[32mINFO\x1b[0m'
+						: hit.level
+		return [hit.ts, level, hit.message, hit.target ? `target=${hit.target}` : '']
+			.filter(Boolean)
+			.join(' ')
 	}
 
 	let logs: any = $state()
@@ -305,6 +331,7 @@
 
 	let countsPerHost: any = $state()
 	let sumOtherDocCount: number = $state(0)
+	let searchError: string | undefined = $state(undefined)
 
 	async function searchLogs(
 		searchTerm: string,
@@ -315,8 +342,6 @@
 	) {
 		const params = new URLSearchParams()
 		if (searchTerm) params.set('searchTerm', searchTerm)
-		if (minTs) params.set('minTs', minTs)
-		if (maxTs) params.set('maxTs', maxTs)
 		if (selected?.mode) params.set('mode', selected.mode)
 		if (selected?.workerGroup) params.set('workerGroup', selected.workerGroup)
 		if (selected?.hostname) params.set('hostname', selected.hostname)
@@ -328,6 +353,7 @@
 			sumOtherDocCount = 0
 			loadingLogs = false
 			loadingLogCounts = false
+			searchError = undefined
 			return
 		}
 		timeout && clearTimeout(timeout)
@@ -336,39 +362,52 @@
 		loadingLogs = true
 		debounceTimeout && clearTimeout(debounceTimeout)
 		debounceTimeout = setTimeout(async () => {
-			if (allLogs) {
-				const countLogsResponse = await IndexSearchService.countSearchLogsIndex({
-					searchQuery: searchTerm,
-					minTs,
-					maxTs
-				})
-				const res = (countLogsResponse.count_per_host as any)['count_per_host']
-				const buckets = res['buckets']
-				sumOtherDocCount = res['sum_other_doc_count']
-				countsPerHost = new Map(buckets.map(({ key, doc_count }) => [key, doc_count]))
-				countsPerHost = buckets.reduce(
-					(acc: any, { key, doc_count }) => {
-						acc[key] = { doc_count }
-						return acc
-					},
-					{} as Record<string, number>
-				)
-				queryParseErrors = countLogsResponse.query_parse_errors ?? []
+			searchError = undefined
+			try {
+				if (allLogs) {
+					const countLogsResponse = await IndexSearchService.countSearchLogsIndex({
+						searchQuery: searchTerm,
+						minTs,
+						maxTs
+					})
+					const res = (countLogsResponse.count_per_host as any)['count_per_host']
+					const buckets = res['buckets']
+					sumOtherDocCount = res['sum_other_doc_count']
+					countsPerHost = new Map(buckets.map(({ key, doc_count }) => [key, doc_count]))
+					countsPerHost = buckets.reduce(
+						(acc: any, { key, doc_count }) => {
+							acc[key] = { doc_count }
+							return acc
+						},
+						{} as Record<string, number>
+					)
+					queryParseErrors = countLogsResponse.query_parse_errors ?? []
+				}
+
+				if (selected) {
+					logs = await IndexSearchService.searchLogsIndex({
+						searchQuery: searchTerm,
+						mode: selected.mode,
+						workerGroup: selected.workerGroup != '' ? selected.workerGroup : undefined,
+						hostname: selected.hostname,
+						minTs,
+						maxTs
+					})
+				}
+			} catch (e) {
+				const message = e?.body ?? e?.message ?? 'Unknown error'
+				searchError = message
+				// Drop any results from a previous successful search so the error
+				// isn't shown alongside stale matches/counts for the old query.
+				logs = undefined
+				countsPerHost = undefined
+				sumOtherDocCount = 0
+				sendUserToast('Service logs search failed: ' + message, true)
+				console.error(e)
+			} finally {
+				loadingLogs = false
 				loadingLogCounts = false
 			}
-
-			if (selected) {
-				logs = await IndexSearchService.searchLogsIndex({
-					searchQuery: searchTerm,
-					mode: selected.mode,
-					workerGroup: selected.workerGroup != '' ? selected.workerGroup : undefined,
-					hostname: selected.hostname,
-					minTs,
-					maxTs
-				})
-			}
-
-			loadingLogs = false
 		}, debouncePeriod)
 	}
 
@@ -388,7 +427,9 @@
 	) {
 		const res = await ServiceLogsService.getLogFile({ path: `${hostname}/${path}` })
 
-		content = processLogWithJsonFmt(ansi_up.ansi_to_html(res), jsonFmt)
+		// Prettify first: it emits its own ANSI for the level, which converting
+		// beforehand would leave in the output as literal escapes.
+		content = ansi_up.ansi_to_html(processLogWithJsonFmt(res, jsonFmt))
 		hitLineNumber = lineNumber
 		logDrawerOpen = true
 
@@ -435,13 +476,22 @@
 		)
 	}
 
-	$effect(() => {
-		minTsManual || maxTsManual || untrack(() => onManualChanges())
-	})
-	$effect(() => {
-		;[searchTerm, selected, minTsManual, maxTsManual, allLogs]
-		untrack(() => searchLogs(searchTerm, selected, minTsManual, maxTsManual, allLogs))
-	})
+	watch(
+		() => timeframe,
+		() => {
+			const ts = timeframe.computeMinMax()
+			minTs = undefined
+			maxTs = undefined
+			allLogs = undefined
+			getAllLogs(ts.minTs ?? undefined, ts.maxTs ?? undefined)
+		}
+	)
+	watch(
+		() => [searchTerm, selected, timeframe, allLogs],
+		() => {
+			searchLogs(searchTerm, selected, minTsManual, maxTsManual, allLogs)
+		}
+	)
 </script>
 
 <Drawer bind:this={logDrawer} bind:open={logDrawerOpen} size="1400px">
@@ -477,71 +527,19 @@
 				class="flex flex-col lg:flex-row gap-y-1 justify-between w-full relative pb-4 gap-x-0.5"
 				id="service-logs-date-pickers"
 			>
-				<div class="flex relative">
-					<input
-						type="text"
-						value={minTsManual
-							? new Date(minTsManual).toLocaleTimeString([], {
-									day: '2-digit',
-									month: '2-digit',
-									hour: '2-digit',
-									minute: '2-digit'
-								})
-							: 'min datetime'}
-						disabled
-					/>
-					<CalendarPicker
-						label="min datetime"
-						date={minTsManual}
-						on:change={({ detail }) => {
-							minTs = undefined
-							maxTs = undefined
-							allLogs = undefined
-							minTsManual = detail
-							getAllLogs(minTsManual, maxTsManual)
-						}}
-						placement="top-start"
-					/>
-				</div>
-				<ManuelDatePicker
-					bind:minTs={() => minTsManual ?? null, (v) => (minTsManual = v ?? undefined)}
-					bind:maxTs={() => maxTsManual ?? null, (v) => (maxTsManual = v ?? undefined)}
-					bind:this={manualPicker}
+				<TimeframeSelect
+					items={serviceLogsTimeframes}
+					bind:value={timeframe}
 					{loading}
-					on:loadJobs={() => {
+					wrapperClasses="w-full"
+					onClick={() => {
 						minTs = undefined
 						maxTs = undefined
 						allLogs = undefined
-						getAllLogs(minTsManual, maxTsManual)
+						const ts = timeframe.computeMinMax()
+						getAllLogs(ts.minTs ?? undefined, ts.maxTs ?? undefined)
 					}}
-					serviceLogsChoices
-					loadText={searchTerm === '' ? 'Last 1000 logfiles' : 'All time'}
 				/>
-				<div class="flex relative">
-					<input
-						type="text"
-						value={maxTsManual
-							? new Date(maxTsManual).toLocaleTimeString([], {
-									day: '2-digit',
-									month: '2-digit',
-									hour: '2-digit',
-									minute: '2-digit'
-								})
-							: 'max datetime'}
-						disabled
-					/>
-					<CalendarPicker
-						label="max datetime"
-						date={maxTsManual}
-						on:change={({ detail }) => {
-							minTs = undefined
-							maxTs = undefined
-							allLogs = undefined
-							maxTsManual = detail
-							getAllLogs(minTsManual, maxTsManual)
-						}}
-					/>
-				</div>
 			</div>
 			<div class="flex w-full flex-row-reverse pb-4 -mt-2 gap-2"
 				><Toggle
@@ -567,10 +565,23 @@
 					options={{ right: 'auto-refresh' }}
 				/></div
 			>
+			{#if searchError}
+				<div class="pb-4">
+					<Alert type="warning" title="Service logs search unavailable" size="xs">
+						{searchError}
+					</Alert>
+				</div>
+			{/if}
 			{#if allLogs == undefined}
 				<div class="text-center pb-2"><Loader2 class="animate-spin" /></div>
 			{:else if Object.keys(allLogs).length == 0}
-				<div class="flex justify-center items-center h-full">No logs</div>
+				<div class="flex flex-col justify-center items-center h-full gap-2">
+					<span>No logs</span>
+					<span class="text-2xs text-tertiary"
+						>Search only covers a recent time window, configurable in instance settings under
+						Indexer.</span
+					>
+				</div>
 			{:else if minTs && maxTs}
 				{@const minTsN = new Date(minTs).getTime()}
 				{@const maxTsN = new Date(maxTs).getTime()}
@@ -706,23 +717,19 @@
 						</div>
 					{:else if logs != undefined}
 						<div class="flex flex-col min-w-full w-fit">
-							{#each logs.hits as { snippet_fragment, snippet_highlighted, document }}
+							<!-- Keyed: LogSnippetViewer renders its html once at creation, so an
+										 index-reused instance would keep the previous search's line. -->
+							{#each logs.hits ?? [] as hit, i (`${i}:${hit.file_path}:${hit.line_no}`)}
 								<LogSnippetViewer
-									content={snippet_fragment || document.logs[0]}
-									highlighted={snippet_highlighted}
-									on:click={() => {
-										let logLineNumber = document.line_number[0]
-										let logFile = document.file_name[0]
-										let host = document.host[0]
-										let jsonFmt = document.json_fmt[0]
-										seeLogContext(logLineNumber, logFile, host, jsonFmt)
-									}}
+									content={renderHit(hit)}
+									highlighted={[]}
+									onClick={() => seeLogContext(hit.line_no, hit.file_path, hit.host, true)}
 								/>
 							{/each}
-							{#if logs.hits.length === 0}
+							{#if (logs.hits ?? []).length === 0}
 								<div class="text-center py-20 text-bold text-xl text-primary"> No logs </div>
 							{/if}
-							{#if logs.hits.length === 1000}
+							{#if (logs.hits ?? []).length === 1000}
 								<div class="pl-6 py-6 text-sm text-secondary">
 									Older matches were truncated from this search, try refining your filters to get
 									more precise results.

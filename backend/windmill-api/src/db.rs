@@ -15,8 +15,12 @@ use sqlx::{
 
 use tokio::task::JoinHandle;
 pub use windmill_common::db::DB;
-use windmill_common::{error::Error, utils::generate_lock_id};
+use windmill_common::{
+    error::Error,
+    utils::{generate_lock_id, GIT_VERSION},
+};
 
+#[allow(unused_imports)]
 pub use windmill_api_auth::{ApiAuthed, OptJobAuthed};
 
 async fn current_database(conn: &mut PgConnection) -> Result<String, MigrateError> {
@@ -67,18 +71,56 @@ lazy_static::lazy_static! {
                     ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
                     (20260207000002, include_str!(
                         "../../migrations/20260207000002_concurrent_indexes_v2_job_completed.up.sql"
-                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY").replace("DROP INDEX CONCURRENTLY IF EXISTS labeled_jobs_on_jobs;", "")),
                     (20260207000003, include_str!(
                         "../../migrations/20260207000003_concurrent_indexes_v2_job_queue.up.sql"
                     ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
                     (20260207000004, include_str!(
                         "../../migrations/20260207000004_concurrent_indexes_other.up.sql"
                     ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
+                    (20260225100000, include_str!(
+                        "../../migrations/20260225100000_asset_covering_index.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
+                    (20260228000000, include_str!(
+                        "../../migrations/20260228000000_v2_job_completed_failure_index.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY")),
+                    (20260610151334, include_str!(
+                        "../../migrations/20260610151334_folder_labels.up.sql"
+                    ).replace("SET search_path = public", "SET search_path FROM CURRENT").to_string()),
+                    (20260614075900, include_str!(
+                        "../../migrations/20260614075900_dedup_folder_labels.up.sql"
+                    ).replace("SET search_path = public", "SET search_path FROM CURRENT").to_string()),
+                    (20260710073406, include_str!(
+                        "../../migrations/20260710073406_index_v2_job_parent_job.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY")),
+                    (20260724094737, include_str!(
+                        "../../migrations/20260724094737_runnables_sort_indexes.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY")),
+                    (20260727093955, include_str!(
+                        "../../migrations/20260727093955_runnable_owner_prefix_indexes.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY")),
+                    (20260727151319, include_str!(
+                        "../../migrations/20260727151319_draft_only_listing_indexes.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY")),
+                    (20260826202939, include_str!(
+                        "../../migrations/20260826202939_queue_suspended_resume_at_index.up.sql"
+                    ).replace("CREATE INDEX", "CREATE INDEX CONCURRENTLY").replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
+                    (20260826214706, include_str!(
+                        "../../migrations/20260826214706_queue_suspended_drop_legacy_index.up.sql"
+                    ).replace("DROP INDEX", "DROP INDEX CONCURRENTLY")),
                     ].into_iter().collect();
 }
 
 pub struct CustomMigrator {
     inner: PoolConnection<Postgres>,
+}
+impl CustomMigrator {
+    /// The connection the migrator already holds (with the migration advisory lock).
+    /// Migration housekeeping runs on it instead of re-acquiring: a second connection
+    /// while this one is held deadlocks a single-connection backend (e.g. embedded pglite).
+    pub fn connection(&mut self) -> &mut PgConnection {
+        &mut *self.inner
+    }
 }
 impl Migrate for CustomMigrator {
     fn ensure_migrations_table(
@@ -192,6 +234,8 @@ impl Migrate for CustomMigrator {
                     // CONCURRENTLY operations cannot run inside a transaction block
                     // or a multi-statement query (PostgreSQL requires top-level execution).
                     // Split into individual statements and execute each separately.
+                    // The split is naive, so a `;` anywhere in an overridden migration —
+                    // inside a comment or a string literal included — splits mid-statement.
                     for stmt in migration_sql.split(';') {
                         let stmt = stmt.trim();
                         if !stmt.is_empty()
@@ -254,13 +298,52 @@ pub async fn migrate(
     if let Err(err) = sqlx::query!(
         "DELETE FROM _sqlx_migrations WHERE
         version=20250131115248 OR version=20250902085503 OR version=20250201145630 OR
-        version=20250201145631 OR version=20250201145632 OR version=20251006143821 OR
-        version=20260207000001 OR version=20260207000002 OR version=20260207000003 OR version=20260207000004"
+        version=20250201145631 OR version=20250201145632 OR version=20251006143821"
     )
-    .execute(db)
+    .execute(custom_migrator.connection())
     .await
     {
         tracing::info!("Could not remove sqlx migrations: {err:#}");
+    }
+
+    // For migrations that were replaced (same version, new content), only delete if
+    // the stored checksum doesn't match the current file — i.e., it's a stale record
+    // from the old broken version. Once the new migration is applied, the checksum
+    // matches and the record is kept, avoiding expensive re-application on every start.
+    let migrator = sqlx::migrate!("../migrations");
+    let potentially_stale: &[i64] = &[
+        20260207000001,
+        20260207000002,
+        20260207000003,
+        20260207000004,
+        // Squashed pre-release pipeline migrations: the per-column ALTERs on
+        // script_trigger and the dispatch_event subscriber index were folded
+        // back into these two CREATEs, changing their checksum. Both are
+        // idempotent, so re-applying on an already-migrated DB is a no-op.
+        20260423050000,
+        20260523055641,
+        // Reworked to stop reading pg_authid (via pg_has_role) from an elevated
+        // context, which managed providers (e.g. Cloud SQL) forbid — the original
+        // aborted startup. The new file is idempotent (CREATE OR REPLACE + an
+        // epoch-guarded UPDATE that no-ops once anchored), so re-applying on an
+        // already-migrated DB is safe.
+        20260626132251,
+    ];
+    for m in migrator.migrations.iter() {
+        if m.migration_type.is_down_migration() {
+            continue;
+        }
+        if potentially_stale.contains(&m.version) {
+            if let Err(err) =
+                sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1 AND checksum != $2")
+                    .bind(m.version)
+                    .bind(&*m.checksum)
+                    .execute(custom_migrator.connection())
+                    .await
+            {
+                tracing::info!("Could not clean up stale migration {}: {err:#}", m.version);
+            }
+        }
     }
 
     tokio::select! {
@@ -285,6 +368,68 @@ pub async fn migrate(
         }
     }
 
-    crate::live_migrations::custom_migrations(&mut custom_migrator, db).await?;
+    crate::live_migrations::custom_migrations(&mut custom_migrator).await?;
     Ok(None)
+}
+
+pub async fn wait_for_migrations(
+    db: &DB,
+    mut killpill_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), Error> {
+    let migrator = sqlx::migrate!("../migrations");
+    let latest_version = migrator
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("No migrations found") as i64;
+
+    tracing::info!(
+        "This worker is on Windmill version {GIT_VERSION} (migration version {latest_version}). Only servers run migrations. Waiting for a server with version >= {GIT_VERSION} to apply the migration..."
+    );
+
+    let mut attempts = 0;
+
+    loop {
+        let is_applied: Result<Option<bool>, sqlx::Error> =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = $1)")
+                .bind(latest_version)
+                .fetch_one(db)
+                .await;
+
+        match is_applied {
+            Ok(Some(true)) => {
+                tracing::info!(
+                    "All migrations applied (version {latest_version}), continuing worker startup"
+                );
+                return Ok(());
+            }
+            Ok(_) => {
+                tracing::info!(
+                    "Database not up to date yet. This worker (Windmill {GIT_VERSION}, migration version {latest_version}) is waiting for a server with version >= {GIT_VERSION} to run the migration. Rechecking in 3s..."
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    "Could not check migration status (migrations table may not exist yet): {e:#}. Rechecking in 3s..."
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = killpill_rx.recv() => {
+                tracing::info!("Killpill received, stopping migration wait");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+        }
+
+        attempts += 1;
+        if attempts >= 10 {
+            tracing::error!(
+                "Timed out after 10 attempts waiting for migration version {latest_version}. Exiting."
+            );
+            std::process::exit(1);
+        }
+    }
 }

@@ -1,14 +1,17 @@
 <script lang="ts">
 	import { twMerge } from 'tailwind-merge'
 	import EditableSchemaForm from '../EditableSchemaForm.svelte'
-	import Toggle from '../Toggle.svelte'
 	import { emptySchema, validateFileExtension } from '$lib/utils'
 	import { Alert } from '../common'
 	import AddPropertyV2 from '$lib/components/schema/AddPropertyV2.svelte'
 	import { Plus } from 'lucide-svelte'
 	import Select from '../select/Select.svelte'
 	import { safeSelectItems } from '../select/utils.svelte'
+	import ToggleButtonGroup from '$lib/components/common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from '$lib/components/common/toggleButton-v2/ToggleButton.svelte'
 	import type { EditableSchemaWrapperProps } from './editable_schema_wrapper'
+
+	type ResourceMode = 'schema' | 'file' | 'fileset'
 
 	let {
 		schema = $bindable(),
@@ -16,16 +19,23 @@
 		noPreview = false,
 		fullHeight = true,
 		formatExtension = $bindable(undefined),
+		isFileset = $bindable(undefined),
+		showSensitiveToggle = false,
 		customUi
 	}: EditableSchemaWrapperProps = $props()
 
-	let resourceIsTextFile: boolean = $state(false)
+	let resourceMode: ResourceMode = $state('schema')
 	let addPropertyComponent: AddPropertyV2 | undefined = $state(undefined)
 	let editableSchemaForm: EditableSchemaForm | undefined = $state(undefined)
 
 	$effect(() => {
-		if (!resourceIsTextFile && formatExtension !== undefined) {
-			formatExtension = undefined
+		if (resourceMode === 'schema') {
+			if (formatExtension !== undefined) {
+				formatExtension = undefined
+			}
+			if (isFileset) {
+				isFileset = undefined
+			}
 		}
 	})
 
@@ -35,12 +45,15 @@
 			: false
 	)
 
-	function switchResourceIsFile() {
-		if (!resourceIsTextFile) {
+	function switchResourceMode(mode: ResourceMode) {
+		resourceMode = mode
+		if (mode === 'schema') {
 			schema = emptySchema()
 			formatExtension = undefined
-		} else {
+			isFileset = undefined
+		} else if (mode === 'file') {
 			formatExtension = ''
+			isFileset = undefined
 			schema = emptySchema()
 			schema.order = ['content']
 			schema.properties = {
@@ -49,6 +62,10 @@
 					description: 'Text contents of the file'
 				}
 			}
+		} else if (mode === 'fileset') {
+			formatExtension = undefined
+			isFileset = true
+			schema = emptySchema()
 		}
 	}
 
@@ -66,7 +83,7 @@
 	])
 </script>
 
-{#if !resourceIsTextFile}
+{#if resourceMode === 'schema'}
 	<div
 		class={twMerge(
 			fullHeight ? 'h-full' : 'h-80',
@@ -97,6 +114,7 @@
 			bind:this={editableSchemaForm}
 			bind:schema
 			isFlowInput
+			{showSensitiveToggle}
 			on:delete={(e) => {
 				addPropertyComponent?.handleDeleteArgument([e.detail])
 			}}
@@ -124,7 +142,7 @@
 		</EditableSchemaForm>
 	</div>
 {/if}
-{#if resourceIsTextFile}
+{#if resourceMode === 'file'}
 	<label
 		for="format-extension"
 		class="text-xs font-semibold text-emphasis whitespace-nowrap flex items-center gap-4"
@@ -153,12 +171,16 @@
 		<div></div>
 	{/if}
 {/if}
-<Toggle
-	bind:checked={resourceIsTextFile}
-	options={{
-		right: 'This resource type represents a plain text file (clears current schema)',
-		rightTooltip:
-			'A text file such as a config file, template, or any other file format that contains plain text'
-	}}
-	on:change={() => switchResourceIsFile()}
-/>
+{#if resourceMode === 'fileset'}
+	<Alert title="Fileset resource type" type="info">
+		This resource type represents a collection of files. Each file is identified by its relative
+		path and contains text content. In the CLI, filesets are stored as directories.
+	</Alert>
+{/if}
+<ToggleButtonGroup selected={resourceMode} onSelected={(mode) => switchResourceMode(mode)}>
+	{#snippet children({ item })}
+		<ToggleButton value="schema" label="JSON" {item} size="sm" />
+		<ToggleButton value="file" label="File" {item} size="sm" />
+		<ToggleButton value="fileset" label="Fileset" {item} size="sm" />
+	{/snippet}
+</ToggleButtonGroup>

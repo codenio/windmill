@@ -10,13 +10,19 @@ if [ -z "$FILE_PATH" ]; then
     exit 0
 fi
 
-# Check if the file is in the frontend directory
-if [[ "$FILE_PATH" == *"/frontend/"* ]]; then
+# Only the frontend app itself, i.e. a "frontend" directory sitting at a repo root.
+# A bare */frontend/* substring also matches ai_evals/adapters/frontend and the
+# ai_evals app fixtures, which no prettier config governs — prettier then falls back
+# to its defaults and rewrites the whole file. Anchoring to $CLAUDE_PROJECT_DIR
+# instead would skip worktrees edited from a session rooted elsewhere.
+if [[ "$FILE_PATH" == *"/frontend/"* ]] && [[ -e "${FILE_PATH%%/frontend/*}/.git" ]]; then
     # Check if it's a formattable file type
     if [[ "$FILE_PATH" =~ \.(ts|js|svelte|json|css|html|md)$ ]]; then
         cd "$CLAUDE_PROJECT_DIR/frontend" || exit 0
-        # Run prettier silently, don't fail the hook if prettier fails
-        npx prettier --write "$FILE_PATH" 2>/dev/null || true
+        # Run prettier, surface errors as context but don't block Claude
+        if ./node_modules/.bin/prettier --plugin prettier-plugin-svelte --write "$FILE_PATH" 2>&1; then
+            echo "Formatted $(basename "$FILE_PATH")"
+        fi
     fi
 fi
 

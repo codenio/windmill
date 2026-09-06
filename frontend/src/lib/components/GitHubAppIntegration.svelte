@@ -55,6 +55,19 @@
 			)
 	)
 
+	// Org names that appear on more than one installation, so the dropdown can
+	// tell those entries apart.
+	let duplicatedAccountIds = $derived(
+		new Set(
+			githubState.workspaceGithubInstallations
+				.filter(
+					(installation, _, array) =>
+						array.filter((other) => other.account_id === installation.account_id).length > 1
+				)
+				.map((installation) => installation.account_id)
+		)
+	)
+
 	let showGitHubApp = $derived(
 		resourceType === 'git_repository' &&
 			$workspaceStore &&
@@ -205,29 +218,47 @@
 								<div class="flex flex-row gap-2 w-full">
 									<div class="flex flex-col gap-1 flex-1">
 										<p class="text-sm font-semibold text-secondary">GitHub Account ID</p>
-										<select bind:value={githubState.selectedGHAppAccountId}>
-											<option value="" disabled>Select GitHub Account ID</option>
+										<select
+											bind:value={githubState.selectedGHAppInstallationId}
+											onchange={() => (githubState.selectedGHAppRepository = undefined)}
+										>
+											<option value={undefined} disabled>Select GitHub Account ID</option>
 											{#each githubState.workspaceGithubInstallations as installation (`select-${installation.installation_id}-${installation.workspace_id}`)}
-												<option value={installation.account_id} disabled={!!installation.error}>
-													{installation.account_id}{installation.error ? ' (token error)' : ''}
+												{@const details = [
+													duplicatedAccountIds.has(installation.account_id)
+														? `${installation.installation_id}`
+														: undefined,
+													installation.error ? 'token error' : undefined
+												].filter(Boolean)}
+												<option
+													value={installation.installation_id}
+													disabled={!!installation.error}
+												>
+													{installation.account_id}{details.length
+														? ` (${details.join(', ')})`
+														: ''}
 												</option>
 											{/each}
 										</select>
 									</div>
-									{#if githubState.selectedGHAppAccountId}
+									{#if githubState.selectedGHAppInstallationId !== undefined}
 										{@const selectedInstallation = githubState.workspaceGithubInstallations.find(
-											(inst) => inst.account_id === githubState.selectedGHAppAccountId
+											(inst) => inst.installation_id === githubState.selectedGHAppInstallationId
 										)}
 										{#if selectedInstallation}
 											<div class="flex flex-col gap-1 flex-1">
 												<p class="text-sm font-semibold text-secondary">Repository</p>
-												<RepositorySelector
-													bind:selectedRepository={githubState.selectedGHAppRepository}
-													accountId={githubState.selectedGHAppAccountId}
-													initialRepositories={selectedInstallation.repositories}
-													totalCount={selectedInstallation.total_count}
-													perPage={selectedInstallation.per_page}
-												/>
+												<!-- RepositorySelector snapshots its repositories and page cursor at
+												     mount, so switching installation has to remount it. -->
+												{#key selectedInstallation.installation_id}
+													<RepositorySelector
+														bind:selectedRepository={githubState.selectedGHAppRepository}
+														installationId={selectedInstallation.installation_id}
+														initialRepositories={selectedInstallation.repositories}
+														totalCount={selectedInstallation.total_count}
+														perPage={selectedInstallation.per_page}
+													/>
+												{/key}
 											</div>
 										{/if}
 									{/if}
@@ -295,13 +326,21 @@
 													{#each githubState.workspaceGithubInstallations as installation (`current-${installation.installation_id}-${installation.workspace_id}`)}
 														<tr class="border-t border-gray-200 dark:border-gray-700">
 															<td class="py-2">
-																<div class="flex items-center gap-1">
+																<div class="flex items-center gap-1 flex-wrap">
 																	{#if installation.error}
 																		<span title={installation.error}>
 																			<AlertTriangle class="w-4 h-4 text-yellow-500" />
 																		</span>
 																	{/if}
 																	{installation.account_id}
+																	{#if installation.provisioned_by_admin}
+																		<span
+																			class="text-2xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
+																			title="Assigned by the instance super-admin from instance settings. Only the super-admin can remove it."
+																		>
+																			Provisioned by admin
+																		</span>
+																	{/if}
 																</div>
 															</td>
 															<td class="py-2">
@@ -310,34 +349,41 @@
 															</td>
 															<td class="py-2 text-primary">
 																{#if installation.error}
-																	<span class="text-yellow-600 dark:text-yellow-400 text-xs" title={installation.error}>Token error</span>
+																	<span
+																		class="text-yellow-600 dark:text-yellow-400 text-xs"
+																		title={installation.error}>Token error</span
+																	>
 																{:else}
 																	{installation.repositories.length} repos
 																{/if}
 															</td>
 															<td class="py-2 text-right">
 																<div class="flex justify-end gap-1">
-																	<Button
-																		size="xs2"
-																		variant="accent"
-																		title="Export installation to other instance"
-																		startIcon={{ icon: Download }}
-																		on:click={() =>
-																			handleExportInstallation(installation.installation_id)}
-																	>
-																		Export
-																	</Button>
-																	<Button
-																		size="xs2"
-																		variant="default"
-																		destructive
-																		title="Remove installation from workspace"
-																		startIcon={{ icon: Minus }}
-																		on:click={() =>
-																			handleDeleteInstallation(installation.installation_id)}
-																	>
-																		Remove
-																	</Button>
+																	{#if !installation.github_base_url}
+																		<Button
+																			size="xs2"
+																			variant="accent"
+																			title="Export installation to other instance"
+																			startIcon={{ icon: Download }}
+																			on:click={() =>
+																				handleExportInstallation(installation.installation_id)}
+																		>
+																			Export
+																		</Button>
+																	{/if}
+																	{#if !installation.provisioned_by_admin}
+																		<Button
+																			size="xs2"
+																			variant="default"
+																			destructive
+																			title="Remove installation from workspace"
+																			startIcon={{ icon: Minus }}
+																			on:click={() =>
+																				handleDeleteInstallation(installation.installation_id)}
+																		>
+																			Remove
+																		</Button>
+																	{/if}
 																</div>
 															</td>
 														</tr>
@@ -381,7 +427,10 @@
 															</td>
 															<td class="py-2 text-primary">
 																{#if installation.error}
-																	<span class="text-yellow-600 dark:text-yellow-400 text-xs" title={installation.error}>Token error</span>
+																	<span
+																		class="text-yellow-600 dark:text-yellow-400 text-xs"
+																		title={installation.error}>Token error</span
+																	>
 																{:else}
 																	{installation.repositories.length} repos
 																{/if}
@@ -414,26 +463,28 @@
 							</div>
 						</div>
 
-						<div class="mt-4 flex flex-col gap-2">
-							<p class="text-sm font-semibold text-secondary"
-								>Import installation from other instance:</p
-							>
-							<div class="flex gap-2">
-								<input
-									type="text"
-									placeholder="Paste JWT token here"
-									bind:value={githubState.importJwt}
-									class="flex-1"
-								/>
-								<Button
-									variant="accent"
-									on:click={handleImportInstallation}
-									disabled={!githubState.importJwt}
+						{#if !githubState.isGhesSelfManaged}
+							<div class="mt-4 flex flex-col gap-2">
+								<p class="text-sm font-semibold text-secondary"
+									>Import installation from other instance:</p
 								>
-									Import
-								</Button>
+								<div class="flex gap-2">
+									<input
+										type="text"
+										placeholder="Paste JWT token here"
+										bind:value={githubState.importJwt}
+										class="flex-1"
+									/>
+									<Button
+										variant="accent"
+										on:click={handleImportInstallation}
+										disabled={!githubState.importJwt}
+									>
+										Import
+									</Button>
+								</div>
 							</div>
-						</div>
+						{/if}
 					</div>
 				</div>
 			{/snippet}

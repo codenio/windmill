@@ -20,7 +20,6 @@
 	import ObjectResourceInput from './ObjectResourceInput.svelte'
 	import Range from './Range.svelte'
 	import ResourcePicker from './ResourcePicker.svelte'
-	import type SimpleEditor from './SimpleEditor.svelte'
 	import Toggle from './Toggle.svelte'
 	import type VariableEditor from './VariableEditor.svelte'
 	import { twMerge } from 'tailwind-merge'
@@ -47,7 +46,7 @@
 	import AIProviderPicker from './AIProviderPicker.svelte'
 	import TextInput from './text_input/TextInput.svelte'
 	import FileInput from './common/fileInput/FileInput.svelte'
-	import { randomUUID } from './flows/conversations/FlowChatManager.svelte'
+	import { randomUUID } from '$lib/utils/uuid'
 
 	interface Props {
 		label?: string
@@ -97,7 +96,7 @@
 		title?: string | undefined
 		placeholder?: string | undefined
 		order?: string[] | undefined
-		editor?: SimpleEditor | undefined
+		editor?: any | undefined
 		orderEditable?: boolean
 		shouldDispatchChanges?: boolean
 		noDefaultOnSelectFirst?: boolean
@@ -258,7 +257,11 @@
 			nvalue = structuredClone($state.snapshot(defaultValue))
 			if (defaultValue === undefined || defaultValue === null) {
 				if (inputCat === 'string') {
-					nvalue = nullable ? null : format === 'uuid' && extra?.['x-auto-generate'] ? randomUUID() : ''
+					nvalue = nullable
+						? null
+						: format === 'uuid' && extra?.['x-auto-generate']
+							? randomUUID()
+							: ''
 				} else if (inputCat == 'enum' && required) {
 					let firstV = enum_?.[0]
 					if (typeof firstV === 'string') {
@@ -403,6 +406,15 @@
 		if (nullable && emptyString(v)) {
 			error = ''
 			valid && (valid = true)
+		} else if (
+			typeof v === 'string' &&
+			(v.startsWith('$var:') || v.startsWith('$res:') || v.startsWith('$jsonvar:'))
+		) {
+			// $var/$res/$jsonvar are placeholders resolved at runtime; the literal
+			// string won't match format constraints (email/ipv4/uuid/custom pattern),
+			// so format-checking it produces a false-positive "invalid format" error.
+			error = ''
+			!valid && (valid = true)
 		} else if (required && (v == undefined || v == null || v === '') && inputCat != 'object') {
 			error = 'Required'
 			valid && (valid = false)
@@ -492,6 +504,8 @@
 
 	let { debounced, clearDebounce } = debounce(() => compareValues(value), 50)
 	let inputCat = $derived(computeInputCat(type, format, itemsType?.type, enum_, contentEncoding))
+	let isNonStringSecret = $derived((password || extra?.['password'] == true) && type === 'object')
+
 	let displayJsonToggleHeader = $derived(
 		displayHeader &&
 			inputCat === 'list' &&
@@ -554,6 +568,12 @@
 				Linked to variable <button
 					class="text-accent underline font-normal"
 					onclick={() => variableEditor?.editVariable?.(value.slice(5))}>{value.slice(5)}</button
+				>
+			{:else if value && typeof value == 'string' && value?.startsWith('$jsonvar:')}
+				Linked to variable <button
+					class="text-accent underline font-normal"
+					onclick={() => variableEditor?.editVariable?.(value.slice('$jsonvar:'.length))}
+					>{value.slice('$jsonvar:'.length)}</button
 				>
 			{/if}
 		</div>
@@ -663,10 +683,17 @@
 
 	<div class="flex space-x-1">
 		{#if inputCat == 'number'}
-			{#if extra['min'] != undefined && extra['max'] != undefined}
+			{#if extra['seconds'] !== undefined}
+				<div class="w-full">
+					<SecondsInput
+						bind:seconds={value}
+						onfocus={bubble('focus')}
+						{defaultValue}
+						clearable={extra['clearable'] !== false}
+					/>
+				</div>
+			{:else if extra['min'] != undefined && extra['max'] != undefined}
 				<Range bind:value min={extra['min']} max={extra['max']} {defaultValue} />
-			{:else if extra['seconds'] !== undefined}
-				<SecondsInput bind:seconds={value} on:focus />
 			{:else if extra?.currency}
 				<CurrencyInput
 					inputClasses={{
@@ -692,7 +719,8 @@
 							onkeydown: () => (ignoreValueUndefined = true),
 							placeholder: placeholder ?? defaultValue ?? '',
 							min: extra['min'],
-							max: extra['max']
+							max: extra['max'],
+							step: extra['step']
 						}}
 						{error}
 						bind:value
@@ -748,6 +776,8 @@
 				{appPath}
 				{computeS3ForceViewerPolicies}
 				bottom={innerBottomSnippet}
+				hideCatalogPicker={extra?.['hideCatalogPicker'] ?? false}
+				hideRawInput={extra?.['hideRawInput'] ?? false}
 			/>
 		{:else if inputCat == 'object' && format == 'json-schema'}
 			{#await import('$lib/components/EditableSchemaForm.svelte')}
@@ -811,6 +841,7 @@
 							{disablePortal}
 							{disabled}
 							{prettifyHeader}
+							{workspace}
 							{schema}
 							bind:args={value}
 						/>
@@ -953,6 +984,7 @@
 															{disablePortal}
 															{disabled}
 															{prettifyHeader}
+															{workspace}
 															schema={getSchemaFromProperties(itemsType?.properties)}
 															bind:args={value[i]}
 														/>
@@ -1041,13 +1073,22 @@
 				{/if}
 			</div>
 		{:else if inputCat == 'dynamic'}
-			<DynamicInput name={label} {otherArgs} {helperScript} bind:value format={format ?? ''} />
+			<DynamicInput
+				name={label}
+				{otherArgs}
+				{helperScript}
+				{workspace}
+				bind:value
+				format={format ?? ''}
+			/>
 		{:else if inputCat == 'resource-object' && resourceTypes == undefined}
 			<span class="text-2xs text-primary">Loading resource types...</span>
 		{:else if inputCat == 'resource-object' && (resourceTypes == undefined || (format && format?.split('-').length > 1 && resourceTypes.includes(format?.substring('resource-'.length))))}
 			<!-- {JSON.stringify(value)} -->
 			<ObjectResourceInput
+				datatableAsPgResource={label === 'database'}
 				{disabled}
+				{workspace}
 				{defaultValue}
 				selectFirst={!noDefaultOnSelectFirst && required}
 				{disablePortal}
@@ -1111,6 +1152,7 @@
 											{disablePortal}
 											{disabled}
 											{prettifyHeader}
+											{workspace}
 											bind:schema={
 												() => ({
 													properties: obj.properties ?? {},
@@ -1147,6 +1189,7 @@
 											{disabled}
 											{prettifyHeader}
 											{chatInputEnabled}
+											{workspace}
 											hiddenArgs={['label', 'kind']}
 											schema={{
 												properties: obj.properties,
@@ -1177,7 +1220,6 @@
 										titleClass="text-2xs"
 									/>
 								{/if}
-	
 							{:else if disabled}
 								<textarea disabled></textarea>
 							{:else}
@@ -1232,6 +1274,7 @@
 							{disablePortal}
 							{disabled}
 							{prettifyHeader}
+							{workspace}
 							schema={{
 								properties,
 								$schema: '',
@@ -1263,6 +1306,7 @@
 							{disablePortal}
 							{disabled}
 							{prettifyHeader}
+							{workspace}
 							schema={{
 								properties,
 								order,
@@ -1394,6 +1438,7 @@
 			<ResourcePicker
 				selectFirst={noDefaultOnSelectFirst}
 				{disablePortal}
+				{workspace}
 				bind:value
 				initialValue={defaultValue}
 				resourceType={format && format.split('-').length > 1
@@ -1402,7 +1447,7 @@
 				{showSchemaExplorer}
 			/>
 		{:else if inputCat == 'ai-provider'}
-			<AIProviderPicker bind:value {disabled} {actions} />
+			<AIProviderPicker bind:value {disabled} {actions} {workspace} />
 		{:else if inputCat == 'email'}
 			<input
 				{autofocus}
@@ -1426,12 +1471,13 @@
 							{:else}
 								<Password
 									{disabled}
+									minRows={extra?.['minRows']}
 									bind:password={value}
 									placeholder={placeholder ?? defaultValue ?? ''}
 								/>
 							{/if}
 						{:else}
-							<PasswordArgInput {disabled} bind:value />
+							<PasswordArgInput {disabled} minRows={extra?.['minRows']} {workspace} bind:value />
 						{/if}
 					{:else}
 						{#key extra?.['minRows']}
@@ -1476,6 +1522,18 @@
 		{/if}
 		{@render actions?.()}
 	</div>
+
+	{#if isNonStringSecret}
+		{#if typeof value === 'string' && value.startsWith('$jsonvar:')}
+			<div class="text-2xs text-tertiary">
+				Sensitive — stored as secret: <code class="text-2xs">{value.slice('$jsonvar:'.length)}</code
+				>
+			</div>
+		{:else}
+			<div class="text-2xs text-tertiary italic">Sensitive — will be stored as secret on submit</div
+			>
+		{/if}
+	{/if}
 
 	{#if !compact || (error && error != '')}
 		<div class="text-right text-xs leading-3 text-red-600 dark:text-red-400 mb-2">

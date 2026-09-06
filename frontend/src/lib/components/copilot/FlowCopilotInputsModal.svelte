@@ -3,15 +3,21 @@
 	import { Button, Badge } from '../common'
 	import Modal from '../common/modal/Modal.svelte'
 	import Portal from '../Portal.svelte'
+	import { overlayPortalTarget } from '$lib/components/common/overlayHost.svelte'
 
-	export let open = false
+	interface Props {
+		open?: boolean
+		inputs?: string[]
+	}
 
-	export let inputs: string[] = []
+	let { open = $bindable(false), inputs = [] }: Props = $props()
 
 	const dispatch = createEventDispatcher()
+
+	const portalTarget = overlayPortalTarget('body')
 </script>
 
-<Portal>
+<Portal target={portalTarget()}>
 	<Modal
 		bind:open
 		on:confirmed={() => {
@@ -27,16 +33,17 @@
 			{/each}
 		</ul>
 
-		<Button
-			slot="actions"
-			on:click={() => {
-				open = false
-				dispatch('confirmed')
-			}}
-			color="light"
-			size="sm"
-		>
-			<span class="inline-flex gap-2">Add <Badge color="dark-green">Enter</Badge></span>
-		</Button>
+		{#snippet actions()}
+			<Button
+				on:click={() => {
+					open = false
+					dispatch('confirmed')
+				}}
+				color="light"
+				size="sm"
+			>
+				<span class="inline-flex gap-2">Add <Badge color="dark-green">Enter</Badge></span>
+			</Button>
+		{/snippet}
 	</Modal>
 </Portal>

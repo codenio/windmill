@@ -2,6 +2,7 @@
 
 <script lang="ts">
 	import { getOS } from '$lib/utils'
+	import { editorFontSize } from '$lib/editorFontSize.svelte'
 	import { MONACO_Y_PADDING } from './vscode'
 
 	type Props = {
@@ -21,8 +22,10 @@
 		lineNumbersOffset = 0,
 		class: className = '',
 		showNumbers = true,
-		fontSize = 13.5
+		fontSize: fontSizeProp
 	}: Props = $props()
+
+	let fontSize = $derived(fontSizeProp ?? editorFontSize.regular)
 
 	let yPadding = MONACO_Y_PADDING
 
@@ -45,7 +48,7 @@
 
 	const charWidth = 9 // try to match as closely as possible to monaco editor
 
-	const lineHeight = fontSize * GOLDEN_LINE_HEIGHT_RATIO
+	let lineHeight = $derived(fontSize * GOLDEN_LINE_HEIGHT_RATIO)
 
 	let [clientWidth, clientHeight] = $state([0, 0])
 	let showHorizontalScrollbar = $derived(

@@ -23,7 +23,7 @@ export async function loadSchedule(path: string, workspace: string): Promise<Sch
 	})
 
 	return {
-		summary: schedule.summary,
+		summary: schedule.summary ?? undefined,
 		enabled: schedule.enabled,
 		cron: schedule.schedule,
 		timezone: schedule.timezone,
@@ -65,7 +65,7 @@ export async function loadSchedules(
 		} else {
 			remotePrimarySchedule = primary
 				? {
-						summary: primary.summary,
+						summary: primary.summary ?? undefined,
 						args: primary.args ?? {},
 						cron: primary.schedule,
 						timezone: primary.timezone,
@@ -170,7 +170,10 @@ export async function saveScheduleFromCfg(
 		tag: scheduleCfg.tag,
 		paused_until: scheduleCfg.paused_until,
 		cron_version: scheduleCfg.cron_version,
-		dynamic_skip: scheduleCfg.dynamic_skip
+		dynamic_skip: scheduleCfg.dynamic_skip,
+		permissioned_as: scheduleCfg.permissioned_as,
+		preserve_permissioned_as: scheduleCfg.preserve_permissioned_as,
+		labels: scheduleCfg.labels
 	}
 	try {
 		if (edit) {

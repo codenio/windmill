@@ -1,16 +1,17 @@
-import {
-  Command,
-  Confirm,
-  path,
-  Select,
-  setClient,
-  Table,
-  yamlParseFile,
-  yamlStringify,
-} from "../../../deps.ts";
+import { writeFile, readdir, mkdir, rm, stat } from "node:fs/promises";
+import { appendFile } from "node:fs/promises";
+import { colors } from "@cliffy/ansi/colors";
+import { Command } from "@cliffy/command";
+import { Confirm } from "@cliffy/prompt/confirm";
+import { Input } from "@cliffy/prompt/input";
+import { Select } from "@cliffy/prompt/select";
+import { Table } from "@cliffy/table";
+import * as log from "../../core/log.ts";
+import * as path from "node:path";
+import { stringify as yamlStringify } from "yaml";
+import { setClient } from "../../core/client.ts";
+import { yamlParseFile } from "../../utils/yaml.ts";
 import * as wmill from "../../../gen/services.gen.ts";
-
-import { colors, Input, log } from "../../../deps.ts";
 import { loginInteractive } from "../../core/login.ts";
 import {
   getActiveInstanceFilePath,
@@ -25,6 +26,7 @@ import {
   pushInstanceGroups,
   pushInstanceUsers,
 } from "../user/user.ts";
+import { connectSlackInstance } from "./slack.ts";
 import {
   add as workspaceSetup,
   addWorkspace,
@@ -38,7 +40,7 @@ import {
   pushInstanceSettings,
   type SimplifiedSettings,
 } from "../../core/settings.ts";
-import { deepEqual } from "../../utils/utils.ts";
+import { deepEqual, readTextFile } from "../../utils/utils.ts";
 import { getActiveWorkspace } from "../workspace/workspace.ts";
 
 export interface Instance {
@@ -51,7 +53,7 @@ export interface Instance {
 export async function allInstances(): Promise<Instance[]> {
   try {
     const file = await getInstancesConfigFilePath();
-    const txt = await Deno.readTextFile(file);
+    const txt = await readTextFile(file);
     return txt
       .split("\n")
       .map((line) => {
@@ -118,26 +120,19 @@ export async function addInstance(
 async function appendInstance(instance: Instance) {
   instance.remote = new URL(instance.remote).toString(); // add trailing slash in all cases!
   await removeInstance(instance.name);
-  const file = await Deno.open(await getInstancesConfigFilePath(), {
-    append: true,
-    write: true,
-    read: true,
-    create: true,
-  });
-  await file.write(new TextEncoder().encode(JSON.stringify(instance) + "\n"));
-
-  file.close();
+  const filePath = await getInstancesConfigFilePath();
+  await appendFile(filePath, JSON.stringify(instance) + "\n", "utf-8");
 }
 
 async function removeInstance(name: string) {
   const orgWorkspaces = await allInstances();
 
-  await Deno.writeTextFile(
+  await writeFile(
     await getInstancesConfigFilePath(),
     orgWorkspaces
       .filter((x) => x.name !== name)
       .map((x) => JSON.stringify(x))
-      .join("\n") + "\n",
+      .join("\n") + "\n", "utf-8",
   );
 }
 
@@ -225,6 +220,22 @@ export async function pickInstance(
       prefix: opts.prefix ?? "custom",
     };
   }
+  // Try to use the active workspace profile's remote as a fallback
+  if (instances.length < 1) {
+    try {
+      const ws = await getActiveWorkspace({});
+      if (ws?.remote && ws?.token) {
+        const remote = ws.remote.endsWith("/") ? ws.remote.slice(0, -1) : ws.remote;
+        setClient(ws.token, remote);
+        return {
+          name: ws.name,
+          remote: ws.remote,
+          token: ws.token,
+          prefix: ws.name,
+        };
+      }
+    } catch { /* ignore */ }
+  }
   if (!allowNew && instances.length < 1) {
     throw new Error("No instance found, please add one first");
   }
@@ -289,7 +300,7 @@ async function instancePull(opts: InstanceSyncOptions) {
 
   const totalChanges = uChanges + sChanges + cChanges + gChanges;
 
-  const rootDir = Deno.cwd();
+  const rootDir = process.cwd();
 
   if (totalChanges > 0) {
     let confirm = true;
@@ -308,7 +319,7 @@ async function instancePull(opts: InstanceSyncOptions) {
     if (confirm) {
       if (uChanges > 0) {
         if (opts.folderPerInstance && opts.prefixSettings) {
-          await Deno.mkdir(path.join(rootDir, opts.prefix), {
+          await mkdir(path.join(rootDir, opts.prefix), {
             recursive: true,
           });
         }
@@ -348,10 +359,10 @@ async function instancePull(opts: InstanceSyncOptions) {
       const workspaceName = opts?.folderPerInstance
         ? instance.prefix + "/" + remoteWorkspace.id
         : instance.prefix + "_" + remoteWorkspace.id;
-      await Deno.mkdir(path.join(rootDir, workspaceName), {
+      await mkdir(path.join(rootDir, workspaceName), {
         recursive: true,
       });
-      await Deno.chdir(path.join(rootDir, workspaceName));
+      process.chdir(path.join(rootDir, workspaceName));
       await addWorkspace(
         {
           remote: instance.remote,
@@ -397,7 +408,7 @@ async function instancePull(opts: InstanceSyncOptions) {
       if (confirmDelete) {
         for (const workspace of localWorkspacesToDelete) {
           await removeWorkspace(workspace.id, false, {});
-          await Deno.remove(path.join(rootDir, workspace.dir), {
+          await rm(path.join(rootDir, workspace.dir), {
             recursive: true,
           });
         }
@@ -467,7 +478,7 @@ async function instancePush(opts: InstanceSyncOptions) {
 
   if (opts.includeWorkspaces) {
     instances = await allInstances();
-    const rootDir = Deno.cwd();
+    const rootDir = process.cwd();
 
     let localPrefix;
     if (opts.prefix) {
@@ -506,7 +517,7 @@ async function instancePush(opts: InstanceSyncOptions) {
     for (const localWorkspace of localWorkspaces) {
       log.info("\nPushing workspace " + localWorkspace.id);
       try {
-        await Deno.chdir(path.join(rootDir, localWorkspace.dir));
+        process.chdir(path.join(rootDir, localWorkspace.dir));
       } catch (_) {
         throw new Error(
           "Workspace folder not found, are you in the right directory?",
@@ -515,7 +526,7 @@ async function instancePush(opts: InstanceSyncOptions) {
 
       try {
         const workspaceSettings = (await yamlParseFile(
-          path.join(Deno.cwd(), "settings.yaml"),
+          path.join(process.cwd(), "settings.yaml"),
         )) as SimplifiedSettings;
         await workspaceSetup(
           {
@@ -586,12 +597,13 @@ async function getLocalWorkspaces(
 ) {
   const localWorkspaces: { dir: string; id: string }[] = [];
 
-  if (!(await Deno.stat(localPrefix).catch(() => null))) {
-    await Deno.mkdir(localPrefix);
+  if (!(await stat(localPrefix).catch(() => null))) {
+    await mkdir(localPrefix);
   }
   if (folderPerInstance) {
-    for await (const dir of Deno.readDir(rootDir + "/" + localPrefix)) {
-      if (dir.isDirectory) {
+    const prefixEntries = await readdir(rootDir + "/" + localPrefix, { withFileTypes: true });
+    for (const dir of prefixEntries) {
+      if (dir.isDirectory()) {
         const dirName = dir.name;
         localWorkspaces.push({
           dir: localPrefix + "/" + dirName,
@@ -600,7 +612,8 @@ async function getLocalWorkspaces(
       }
     }
   } else {
-    for await (const dir of Deno.readDir(rootDir)) {
+    const rootEntries = await readdir(rootDir, { withFileTypes: true });
+    for (const dir of rootEntries) {
       const dirName = dir.name;
       if (dirName.startsWith(localPrefix + "_")) {
         localWorkspaces.push({
@@ -631,9 +644,9 @@ async function switchI(opts: {}, instanceName: string) {
     return;
   }
 
-  await Deno.writeTextFile(
+  await writeFile(
     await getActiveInstanceFilePath(),
-    instanceName,
+    instanceName, "utf-8",
   );
 
   log.info(colors.green.underline(`Switched to instance ${instanceName}`));
@@ -646,9 +659,39 @@ export async function getActiveInstance(opts: {
     return opts.instance;
   }
   try {
-    return await Deno.readTextFile(await getActiveInstanceFilePath());
+    return await readTextFile(await getActiveInstanceFilePath());
   } catch {
     return undefined;
+  }
+}
+
+async function getConfig(opts: InstanceSyncOptions & { outputFile?: string; showSecrets?: boolean }) {
+  await pickInstance(opts, false);
+  const config = await wmill.getInstanceConfig() as any;
+
+  // In interactive mode, mask secrets by default and prompt
+  const hasSecrets = config?.global_settings?.license_key || config?.global_settings?.jwt_secret;
+  let showSecrets = opts.showSecrets ?? false;
+  if (!showSecrets && hasSecrets && process.stdout.isTTY && !opts.outputFile) {
+    log.warn("Config contains sensitive fields (license_key, jwt_secret). They are masked by default.");
+    log.warn("Use --show-secrets to include them, or press Y to show them now.");
+    showSecrets = await Confirm.prompt({ message: "Show secrets?", default: false });
+  } else if (!process.stdout.isTTY || opts.outputFile) {
+    // Non-interactive or writing to file: always include secrets
+    showSecrets = true;
+  }
+
+  if (!showSecrets && config?.global_settings) {
+    if (config.global_settings.license_key) config.global_settings.license_key = "***";
+    if (config.global_settings.jwt_secret) config.global_settings.jwt_secret = "***";
+  }
+
+  const yaml = yamlStringify(config as Record<string, unknown>);
+  if (opts.outputFile) {
+    await writeFile(opts.outputFile, yaml, "utf-8");
+    log.info(colors.green(`Instance config written to ${opts.outputFile}`));
+  } else {
+    console.log(yaml);
   }
 }
 
@@ -730,7 +773,7 @@ const command = new Command()
   .option("--dry-run", "Perform a dry run without making changes")
   .option("--skip-users", "Skip pulling users")
   .option("--skip-settings", "Skip pulling settings")
-  .option("--skip-configs", "Skip pulling configs (worker groups and SMTP)")
+  .option("--skip-configs", "Skip pulling configs (worker groups)")
   .option("--skip-groups", "Skip pulling instance groups")
   .option("--include-workspaces", "Also pull workspaces")
   .option("--folder-per-instance", "Create a folder per instance")
@@ -755,7 +798,7 @@ const command = new Command()
   .option("--dry-run", "Perform a dry run without making changes")
   .option("--skip-users", "Skip pushing users")
   .option("--skip-settings", "Skip pushing settings")
-  .option("--skip-configs", "Skip pushing configs (worker groups and SMTP)")
+  .option("--skip-configs", "Skip pushing configs (worker groups)")
   .option("--skip-groups", "Skip pushing instance groups")
   .option("--include-workspaces", "Also push workspaces")
   .option("--folder-per-instance", "Create a folder per instance")
@@ -774,6 +817,27 @@ const command = new Command()
   .action(instancePush as any)
   .command("whoami")
   .description("Display information about the currently logged-in user")
-  .action(whoami as any);
+  .action(whoami as any)
+  .command("get-config")
+  .description("Dump the current instance config (global settings + worker configs) as YAML")
+  .option("-o, --output-file <file:string>", "Write YAML to a file instead of stdout")
+  .option("--show-secrets", "Include sensitive fields (license key, JWT secret) without prompting")
+  .option(
+    "--instance <instance:string>",
+    "Name of the instance, override the active instance",
+  )
+  .action(getConfig as any)
+  .command("connect-slack")
+  .description(
+    "Non-interactively connect Slack at the instance level using a pre-minted bot token (xoxb-...). Produces the same artifacts as the UI OAuth flow: global_settings 'slack' row + encrypted f/slack_bot/global_bot_token variable and resource in the admins workspace."
+  )
+  .option("--bot-token <bot_token:string>", "Slack bot token (xoxb-...)", { required: true })
+  .option("--team-id <team_id:string>", "Slack team id", { required: true })
+  .option("--team-name <team_name:string>", "Slack team name", { required: true })
+  .option(
+    "--instance <instance:string>",
+    "Instance profile to connect against (defaults to the active instance)"
+  )
+  .action((opts: any) => connectSlackInstance(opts));
 
 export default command;

@@ -8,13 +8,13 @@
 	interface Props {
 		disabled?: boolean
 		label: string
-		lang?: SupportedLanguage | 'docker' | 'javascript' | undefined
+		lang?: SupportedLanguage | 'docker' | 'javascript' | 'claudesandbox' | undefined
 		id?: string | undefined
 	}
 
 	let { disabled = false, label, lang = undefined, id = undefined }: Props = $props()
 
-	const enterpriseLangs = ['bigquery', 'snowflake', 'mssql', 'oracledb']
+	const enterpriseLangs = ['mssql', 'oracledb']
 </script>
 
 <Popover disablePopup={!enterpriseLangs.includes(lang || '') || !!$enterpriseLicense}>

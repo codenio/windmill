@@ -10,6 +10,10 @@
 		toSchemaItems
 	} from './datatableUtils.svelte'
 	import { Button } from '../common'
+	import { getRawAppOperatingWorkspace } from './rawAppWorkspace'
+
+	const getOpWs = getRawAppOperatingWorkspace()
+	let opWs = $derived(getOpWs?.() ?? $workspaceStore)
 
 	interface Props {
 		/** Currently selected datatable */
@@ -30,8 +34,11 @@
 	}: Props = $props()
 
 	// Load available datatables and schemas using shared utilities
-	const datatables = createDatatablesResource(() => $workspaceStore)
-	const schemas = createSchemasResource(() => datatable)
+	const datatables = createDatatablesResource(() => opWs)
+	const schemas = createSchemasResource(
+		() => datatable,
+		() => opWs
+	)
 
 	const datatableItems = $derived(toDatatableItems(datatables.current))
 	const schemaItems = $derived(toSchemaItems(schemas.current))
@@ -48,7 +55,7 @@
 </script>
 
 <Popover>
-	<svelte:fragment slot="trigger">
+	{#snippet trigger()}
 		<Button
 			title="Configure default datatable & schema"
 			unifiedSize="xs"
@@ -58,8 +65,8 @@
 		>
 			<Settings size={12} />
 		</Button>
-	</svelte:fragment>
-	<svelte:fragment slot="content">
+	{/snippet}
+	{#snippet content()}
 		<div class="flex flex-col gap-3 p-4 min-w-64 max-w-80">
 			<div class="text-xs font-medium text-primary">Default Datatable & Schema</div>
 
@@ -87,5 +94,5 @@
 				/>
 			</div>
 		</div>
-	</svelte:fragment>
+	{/snippet}
 </Popover>

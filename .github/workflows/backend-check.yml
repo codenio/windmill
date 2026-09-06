@@ -17,10 +17,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install mold and clang
+        run: sudo apt-get update && sudo apt-get install -y mold clang
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          cache-workspaces: backend
-          toolchain: 1.90.0
+          cache: false
+          toolchain: 1.97.0
       - name: cargo check
         working-directory: ./backend
         timeout-minutes: 16
@@ -36,12 +39,12 @@ jobs:
       - name: install xmlsec1 and gssapi
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-dev libxmlsec1-dev libkrb5-dev libsasl2-dev
+          sudo apt-get install -y libxml2-dev libxmlsec1-dev libkrb5-dev libsasl2-dev libcurl4-openssl-dev mold clang
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          cache-workspaces: backend
-          toolchain: 1.90.0
+          cache: false
+          toolchain: 1.97.0
       - name: cargo check
         working-directory: ./backend
         timeout-minutes: 16
@@ -72,10 +75,13 @@ jobs:
         run: |
           ./backend/substitute_ee_code.sh --copy --dir ./windmill-ee-private
 
+      - name: Install mold and clang
+        run: sudo apt-get update && sudo apt-get install -y mold clang
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          cache-workspaces: backend
-          toolchain: 1.90.0
+          cache: false
+          toolchain: 1.97.0
       - name: cargo check
         working-directory: ./backend
         timeout-minutes: 16
@@ -103,7 +109,7 @@ jobs:
       - name: install xmlsec1 and gssapi
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-dev libxmlsec1-dev libkrb5-dev libsasl2-dev
+          sudo apt-get install -y libxml2-dev libxmlsec1-dev libkrb5-dev libsasl2-dev libcurl4-openssl-dev mold clang
 
       - name: Substitute EE code (EE logic is behind feature flag)
         run: |
@@ -112,7 +118,19 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: backend
-          toolchain: 1.90.0
+          toolchain: 1.97.0
+      - name: Fix stale v8 build cache
+        working-directory: ./backend
+        run: |
+          # Cargo cache may preserve v8 build fingerprints without the actual
+          # librusty_v8.a library. Since fingerprints look valid, cargo skips
+          # build.rs re-run, causing "could not find native static library rusty_v8".
+          for profile in debug release; do
+            if [ -d "target/$profile/.fingerprint" ] && [ ! -f "target/$profile/gn_out/obj/librusty_v8.a" ]; then
+              echo "Cleaning stale v8 build artifacts in target/$profile"
+              rm -rf "target/$profile/build/v8-"* "target/$profile/.fingerprint/v8-"*
+            fi
+          done
       - name: cargo check
         timeout-minutes: 16
         working-directory: ./backend

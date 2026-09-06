@@ -14,7 +14,7 @@
 	} from './lib'
 	import { untrack } from 'svelte'
 	import { ResourceService, WorkspaceService } from '$lib/gen'
-	import { globalDbManagerDrawer, workspaceStore } from '$lib/stores'
+	import { workspaceStore } from '$lib/stores'
 	import Tooltip from '../meltComponents/Tooltip.svelte'
 	import Tooltip2 from '../Tooltip.svelte'
 	import ResourceEditorDrawer from '../ResourceEditorDrawer.svelte'
@@ -48,7 +48,6 @@
 	let blueBgDiv: HTMLDivElement | undefined = $state()
 
 	let s3FilePicker: S3FilePicker | undefined = $state()
-	let dbManagerDrawer = $derived(globalDbManagerDrawer.val)
 	let resourceEditorDrawer: ResourceEditorDrawer | undefined = $state()
 	let isOpen = $state(false)
 	let resourceDataCache: Record<string, string | undefined> = $state({})
@@ -62,7 +61,9 @@
 	})
 
 	let datatables = resource([], () =>
-		WorkspaceService.listDataTables({ workspace: $workspaceStore ?? '' })
+		WorkspaceService.listDataTables({ workspace: $workspaceStore ?? '' }).then((d) =>
+			d.map((d) => d.name)
+		)
 	)
 	let ducklakes = resource([], () =>
 		WorkspaceService.listDucklakes({ workspace: $workspaceStore ?? '' })
@@ -103,7 +104,7 @@
 	bind:isOpen
 	escapeBehavior="ignore"
 >
-	<svelte:fragment slot="trigger">
+	{#snippet trigger()}
 		<div
 			class={twMerge(
 				size === '3xs' ? 'h-[1.6rem]' : 'py-1.5',
@@ -124,8 +125,8 @@
 				{noBtnText ? assets.length : pluralize(assets.length, 'asset')}
 			</span>
 		</div>
-	</svelte:fragment>
-	<svelte:fragment slot="content">
+	{/snippet}
+	{#snippet content()}
 		<ul class="divide-y rounded-md">
 			{#each assets as asset}
 				{@const ducklakeNotFound =
@@ -145,7 +146,7 @@
 						contentClasses="py-2 px-4 flex flex-col gap-2"
 						disablePopup={!!asset.access_type}
 					>
-						<svelte:fragment slot="trigger">
+						{#snippet trigger()}
 							<div
 								class={twMerge(
 									'text-xs font-normal border text-primary w-10 p-1 text-center rounded-md',
@@ -155,8 +156,8 @@
 							>
 								{formatAssetAccessType(getAccessType(asset)) ?? '?'}
 							</div>
-						</svelte:fragment>
-						<svelte:fragment slot="content">
+						{/snippet}
+						{#snippet content()}
 							{#if !asset.access_type}
 								<span class="text-sm text-primary leading-4">
 									Could not infer automatically <br />
@@ -181,14 +182,14 @@
 									</Tooltip2>
 								</div>
 							{/if}
-						</svelte:fragment>
+						{/snippet}
 					</Popover>
 					<div class="flex flex-col flex-1">
 						<Tooltip class="select-none w-48 truncate" disablePopup={disableLiTooltip}>
 							{asset.path}
-							<svelte:fragment slot="text">
+							{#snippet text()}
 								{asset.path}
-							</svelte:fragment>
+							{/snippet}
 						</Tooltip>
 						<span class="text-xs text-primary select-none">
 							{liSubtitle?.(asset) ??
@@ -209,7 +210,6 @@
 						onClick={() => (isOpen = false)}
 						{asset}
 						{resourceDataCache}
-						{dbManagerDrawer}
 						{resourceEditorDrawer}
 						{s3FilePicker}
 						{ducklakeNotFound}
@@ -218,7 +218,7 @@
 				</li>
 			{/each}
 		</ul>
-	</svelte:fragment>
+	{/snippet}
 </Popover>
 <S3FilePicker bind:this={s3FilePicker} readOnlyMode />
 <ResourceEditorDrawer bind:this={resourceEditorDrawer} />

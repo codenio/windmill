@@ -1,22 +1,25 @@
 <script lang="ts">
 	import InsertModulePopover from '$lib/components/flows/map/InsertModulePopover.svelte'
 	import { getBezierPath, BaseEdge, type EdgeProps, EdgeLabel } from '@xyflow/svelte'
-	import { ClipboardCopy, Hourglass } from 'lucide-svelte'
+	import { CircleDot, Hourglass } from 'lucide-svelte'
 	import type { GraphEventHandlers } from '../../graphBuilder.svelte'
 	import { getStraightLinePath } from '../utils'
 	import { twMerge } from 'tailwind-merge'
 	import { NODE_WITH_WRITE_ASSET_Y_OFFSET } from '../nodes/AssetNode.svelte'
-	import { workspaceStore } from '$lib/stores'
 	import FlowStatusWaitingForEvents from '$lib/components/FlowStatusWaitingForEvents.svelte'
 	import type { Job } from '$lib/gen'
-	import type { GraphModuleState } from '../../model'
 	import InsertModuleButton from '$lib/components/flows/map/InsertModuleButton.svelte'
 	import { getGraphContext } from '../../graphContext'
+	import { getFlowRunStatusContext } from '../../flowRunStatus.svelte'
+	import { GROUP_TOP_PADDING } from '$lib/components/graph/compoundLayout'
 
-	const { useDataflow, showAssets } = getGraphContext()
+	const { useDataflow, showAssets, moveManager } = getGraphContext()
+	const flowRunStatus = getFlowRunStatusContext()
 
 	let {
-		// id,
+		id,
+		source,
+		target,
 		sourceX,
 		sourceY,
 		sourcePosition,
@@ -32,19 +35,22 @@
 			sourceId: string
 			branch: { rootId: string; branch: number } | undefined
 			targetId: string
-			moving: string | undefined
 			eventHandlers: GraphEventHandlers
 			index: number
 			enableTrigger: boolean
 			disableAi: boolean
 			disableMoveIds: string[]
-			flowModuleStates: Record<string, GraphModuleState> | undefined
 			isOwner: boolean
-			flowJob: Job | undefined
-			suspendStatus?: Record<string, { job: Job; nb: number }>
 			shouldOffsetInsertBtnDueToAssetNode?: boolean
 		}
 	} = $props()
+
+	// Derive group boundary from source/target node IDs
+	let groupBoundary: 'top' | 'bottom' | undefined = $derived.by(() => {
+		if (source.startsWith('group:') && !source.endsWith('-end')) return 'top'
+		if (target.startsWith('group:') && target.endsWith('-end')) return 'bottom'
+		return undefined
+	})
 
 	let [edgePath] = $derived(
 		getBezierPath({
@@ -67,24 +73,65 @@
 	// TODO: this is a hack to show the waiting for events indicator on the edge a proper way would be to have a edge state
 	// and handle the edge state in the graph builder
 	let waitingForEvents = $derived(
-		data?.flowModuleStates?.[data.targetId]?.type === 'WaitingForEvents' ||
-			data?.flowModuleStates?.[`${data.sourceId}-v`]?.type === 'WaitingForEvents'
+		flowRunStatus?.getModuleState(data.targetId)?.type === 'WaitingForEvents' ||
+			flowRunStatus?.getModuleState(`${data.sourceId}-v`)?.type === 'WaitingForEvents'
 	)
 
+	let flowJob: Job | undefined = $derived(flowRunStatus?.flowJob)
 	let suspendStatus: Record<string, { job: Job; nb: number }> | undefined = $derived(
-		data?.suspendStatus
+		flowRunStatus?.suspendStatus
 	)
+
+	let centerY = $derived(
+		groupBoundary === 'bottom'
+			? targetY
+			: groupBoundary === 'top'
+				? sourceY + GROUP_TOP_PADDING / 2
+				: sourceY +
+					32 +
+					(data.shouldOffsetInsertBtnDueToAssetNode && $showAssets
+						? NODE_WITH_WRITE_ASSET_Y_OFFSET
+						: 0)
+	)
+
+	let isDragging = $derived(!!moveManager?.dragging)
+	let draggedId = $derived(moveManager?.dragging?.moduleId)
+	let isValidDropTarget = $derived(
+		isDragging &&
+			data?.insertable &&
+			draggedId !== undefined &&
+			!data.disableMoveIds?.includes(draggedId) &&
+			source !== draggedId &&
+			target !== draggedId
+	)
+	let isNearestDrop = $derived(
+		isValidDropTarget && moveManager?.nearestDropZone?.edgeId === id ? true : false
+	)
+	let isAdjacentToDragged = $derived(isDragging && (source === draggedId || target === draggedId))
+
+	// Register this edge's drop zone position with the drag manager so proximity
+	// detection uses the actual xyflow-computed position rather than re-deriving it.
+	$effect(() => {
+		if (!data?.insertable || !moveManager) return
+
+		const centerX = sourceX
+
+		moveManager.registerDropZone(id, {
+			sourceId: data.sourceId,
+			targetId: data.targetId,
+			branch: data.branch,
+			index: data.index,
+			disableMoveIds: data.disableMoveIds ?? [],
+			centerX,
+			centerY
+		})
+
+		return () => moveManager.unregisterDropZone(id)
+	})
 </script>
 
-<EdgeLabel
-	x={sourceX}
-	y={sourceY +
-		32 +
-		(data.shouldOffsetInsertBtnDueToAssetNode && $showAssets ? NODE_WITH_WRITE_ASSET_Y_OFFSET : 0)}
-	class="base-edge"
-	style=""
->
-	{#if waitingForEvents && data.flowJob && data.flowJob.type === 'QueuedJob'}
+<EdgeLabel x={sourceX} y={centerY} class="base-edge" style="">
+	{#if waitingForEvents && flowJob && flowJob.type === 'QueuedJob'}
 		<div
 			class="px-2 py-0.5 rounded-md bg-surface shadow-md text-violet-700 dark:text-violet-400 text-xs flex items-center gap-1"
 		>
@@ -98,10 +145,10 @@
 		<div
 			class={'fixed top-1/2 -translate-y-1/2 left-[170px] h-fit w-fit rounded-md bg-surface flex items-center justify-center p-2 ml-2 shadow-md'}
 		>
-			{#if data?.flowJob && data.flowJob.flow_status?.modules?.[data.flowJob.flow_status?.step]?.type === 'WaitingForEvents'}
+			{#if flowJob && flowJob.flow_status?.modules?.[flowJob.flow_status?.step]?.type === 'WaitingForEvents'}
 				<FlowStatusWaitingForEvents
-					job={data.flowJob}
-					workspaceId={$workspaceStore!}
+					job={flowJob}
+					workspaceId={flowJob.workspace_id}
 					isOwner={data.isOwner}
 					light
 				/>
@@ -110,7 +157,7 @@
 					{#each Object.values(suspendStatus) as suspendCount (suspendCount.job.id)}
 						<FlowStatusWaitingForEvents
 							job={suspendCount.job}
-							workspaceId={$workspaceStore!}
+							workspaceId={suspendCount.job.workspace_id}
 							isOwner={data.isOwner}
 							light
 						/>
@@ -118,7 +165,17 @@
 				</div>
 			{/if}
 		</div>
-	{:else if data?.insertable && !$useDataflow && !data?.moving}
+	{:else if isDragging && isValidDropTarget}
+		<div class="edgeButtonContainer nodrag nopan" style:transform="translate(-50%, -50%)">
+			<div class="relative flex items-center justify-center" style="width: 275px; height: 20px;">
+				{#if isNearestDrop}
+					<div class="absolute inset-0 rounded-md bg-accent/5 transition-opacity duration-150"
+					></div>
+				{/if}
+				{@render dropTargetIndicator(isNearestDrop)}
+			</div>
+		</div>
+	{:else if data?.insertable && !groupBoundary && !$useDataflow && !moveManager?.movingModuleId && !isDragging}
 		<div
 			class={twMerge('edgeButtonContainer nodrag nopan top-0')}
 			style:transform="translate(-50%, -50%)"
@@ -135,7 +192,8 @@
 						branch: data.branch,
 						index: data.index,
 						kind: e.detail.kind,
-						inlineScript: e.detail.inlineScript
+						inlineScript: e.detail.inlineScript,
+						agentPath: e.detail.agentPath
 					})
 				}}
 				on:pickScript={(e) => {
@@ -168,9 +226,9 @@
 		</div>
 	{/if}
 
-	{#if data?.moving}
+	{#if moveManager?.movingModuleId && data?.insertable}
 		<div class="edgeButtonContainer nodrag nopan" style:transform="translate(-50%, -50%)">
-			{#if data.moving && !data.disableMoveIds?.includes(data.moving)}
+			{#if !(moveManager.movingIds ?? [moveManager.movingModuleId]).some( (id) => data.disableMoveIds?.includes(id) )}
 				<button
 					title="Paste module"
 					onclick={() => {
@@ -182,24 +240,34 @@
 						})
 					}}
 					type="button"
-					class={twMerge(
-						'w-6 h-6 flex items-center justify-center',
-						'border border-gray-300 dark:border-gray-500',
-						'text-primary text-sm',
-						'bg-surface focus:outline-none hover:bg-surface-hover focus:ring-4 focus:ring-surface-selected rounded-full '
-					)}
+					class="group relative flex items-center justify-center"
+					style="width: 275px; height: 20px;"
 				>
-					<ClipboardCopy size={14} />
+					<div
+						class="absolute inset-0 rounded-md bg-accent/5 opacity-0 group-hover:opacity-100 transition-opacity duration-150"
+					></div>
+					{@render dropTargetIndicator(false)}
 				</button>
 			{/if}
 		</div>
 	{/if}
 </EdgeLabel>
 
+{#snippet dropTargetIndicator(highlighted: boolean)}
+	<div
+		class={twMerge(
+			'w-[20px] h-[20px] flex items-center justify-center rounded-md bg-surface-secondary transition-all duration-150 group-hover:text-accent',
+			highlighted ? 'text-accent' : 'text-primary'
+		)}
+	>
+		<CircleDot size={12} />
+	</div>
+{/snippet}
+
 <BaseEdge
 	path={completeEdge}
 	{markerEnd}
-	class={$useDataflow ? 'hidden' : ''}
+	class={$useDataflow || groupBoundary ? 'hidden' : isAdjacentToDragged ? 'opacity-30' : ''}
 	interactionWidth={0}
 	style={undefined}
 	label={undefined}

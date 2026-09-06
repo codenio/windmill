@@ -86,7 +86,10 @@
 	}
 
 	const resolvedConfig = $state(
-		initConfig(components['dbexplorercomponent'].initialData.configuration, configuration)
+		initConfig(
+			components['dbexplorercomponent'].initialData.configuration,
+			untrack(() => configuration)
+		)
 	)
 
 	let timeoutInput: number | undefined = undefined
@@ -128,24 +131,33 @@
 	let buttonContainerHeight: number | undefined = $state(undefined)
 
 	let dbPath = $derived(
-		resolvedConfig.type.selected !== 'ducklake'
-			? resolvedConfig.type.configuration?.[resolvedConfig.type.selected]?.resource
-			: resolvedConfig.type.configuration?.[resolvedConfig.type.selected]?.ducklake
+		resolvedConfig.type.selected === 'ducklake'
+			? resolvedConfig.type.configuration?.[resolvedConfig.type.selected]?.ducklake
+			: resolvedConfig.type.selected === 'datatable'
+				? resolvedConfig.type.configuration?.[resolvedConfig.type.selected]?.datatable
+				: resolvedConfig.type.configuration?.[resolvedConfig.type.selected]?.resource
 	)
 	let dbInput: DbInput = $derived(
 		resolvedConfig.type.selected === 'ducklake'
 			? {
 					type: 'ducklake',
-					ducklake: dbPath.split('ducklake://')[1]
+					ducklake: dbPath?.split('ducklake://')[1]
 				}
 			: {
 					type: 'database',
-					resourcePath: dbPath.split('$res:')[1],
-					resourceType: resolvedConfig.type.selected as DbType
+					resourcePath: dbPath?.split('$res:')[1] ?? dbPath,
+					resourceType:
+						resolvedConfig.type.selected === 'datatable'
+							? 'postgresql'
+							: (resolvedConfig.type.selected as DbType)
 				}
 	)
 	let dbtype = $derived(
-		resolvedConfig.type.selected === 'ducklake' ? ('duckdb' as const) : resolvedConfig.type.selected
+		resolvedConfig.type.selected === 'ducklake'
+			? ('duckdb' as const)
+			: resolvedConfig.type.selected === 'datatable'
+				? 'postgresql'
+				: resolvedConfig.type.selected
 	)
 
 	function onUpdate(
@@ -171,17 +183,22 @@
 		)
 	}
 
-	let outputs = initOutput($worldStore, id, {
-		selectedRowIndex: 0,
-		selectedRow: {},
-		selectedRows: [] as any[],
-		result: [] as any[],
-		inputs: {},
-		loading: false,
-		page: 0,
-		newChange: { row: 0, column: '', value: undefined },
-		ready: undefined as boolean | undefined
-	})
+	let outputs = initOutput(
+		$worldStore,
+		untrack(() => id),
+		{
+			selectedRowIndex: 0,
+			selectedRow: {},
+			selectedRows: [] as any[],
+			result: [] as any[],
+			inputs: {},
+			loading: false,
+			page: 0,
+			newChange: { row: 0, column: '', value: undefined },
+			ready: undefined as boolean | undefined,
+			openedModalRow: {}
+		}
+	)
 
 	let lastResource: string | undefined = undefined
 
@@ -230,12 +247,14 @@
 			if (resolvedConfig?.type?.selected === 'ducklake') {
 				dbSchemas[dbPath] = await getDucklakeSchema({
 					workspace: $workspaceStore!,
-					ducklake: dbPath.split('ducklake://')[1]
+					ducklake: dbPath?.split('ducklake://')[1]
 				})
 			} else {
-				const resourcePath = dbPath.split('$res:')[1]
+				const resourcePath = dbPath?.split('$res:')[1] ?? dbPath
 				dbSchemas[resourcePath] = await getDbSchemas(
-					resolvedConfig?.type?.selected,
+					resolvedConfig?.type?.selected === 'datatable'
+						? 'postgresql'
+						: resolvedConfig?.type?.selected,
 					resourcePath,
 					$workspaceStore,
 					() => {},
@@ -248,9 +267,7 @@
 				resolvedConfig.type,
 				{
 					table: {
-						selectOptions: dbSchemas
-							? await getTablesByResource(dbSchemas, dbtype, dbPath, $workspaceStore!)
-							: [],
+						selectOptions: dbSchemas ? await getTablesByResource(dbSchemas, dbtype) : [],
 						loading: false
 					}
 				}
@@ -371,18 +388,24 @@
 			resolvedConfig.type.selected === 'ducklake'
 				? {
 						type: 'ducklake',
-						ducklake: dbPath.split('ducklake://')[1]
+						ducklake: dbPath?.split('ducklake://')[1]
 					}
 				: {
 						type: 'database',
-						resourcePath: dbPath.split('$res:')[1],
+						resourcePath: dbPath?.split('$res:')[1] ?? dbPath,
 						resourceType: dbtype
 					},
 			$workspaceStore,
 			resolvedConfig.type.configuration[selected].table
 		)
 
-		if (!tableMetadata) return
+		if (!tableMetadata) {
+			//@ts-ignore
+			gridItem.data.configuration.columnDefs.loading = false
+			gridItem.data = gridItem.data
+			$app = $app
+			return
+		}
 
 		let old: TableMetadata = (columnDefs?.value as TableMetadata) ?? []
 		if (!Array.isArray(old)) {
@@ -507,7 +530,6 @@
 	async function insert(args: object) {
 		try {
 			const selected = resolvedConfig.type.selected
-
 			await insertRowRunnable?.insertRow(
 				dbInput,
 				$workspaceStore,

@@ -1,5 +1,10 @@
-use std::{collections::HashMap, path::PathBuf, process::Stdio};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
+use crate::global_cache::save_cache;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use itertools::Itertools;
@@ -13,7 +18,7 @@ use uuid::Uuid;
 use windmill_common::{
     error::{self, Error},
     utils::calculate_hash,
-    worker::{copy_dir_recursively, save_cache, write_file, Connection},
+    worker::{copy_dir_recursively, write_file, Connection},
 };
 use windmill_parser::Arg;
 use windmill_parser_java::parse_java_sig_meta;
@@ -22,12 +27,15 @@ use windmill_queue::{append_logs, CanceledBy, MiniPulledJob};
 use crate::{
     common::{
         build_command_with_isolation, create_args_and_out_file, get_reserved_variables,
-        read_result, start_child_process, OccupancyMetrics,
+        read_result, resolve_job_timeout, resolve_nsjail_timeout, resolve_nsjail_tmp_mount_block,
+        start_child_process, OccupancyMetrics,
     },
-    handle_child,
+    handle_child, is_sandboxing_enabled, read_ee_registry_bool_with_workspace_override,
+    read_ee_registry_with_workspace_override,
     universal_pkg_installer::{par_install_language_dependencies_all_at_once, RequiredDependency},
-    COURSIER_CACHE_DIR, DISABLE_NSJAIL, DISABLE_NUSER, JAVA_CACHE_DIR,
-    JAVA_REPOSITORY_DIR, MAVEN_REPOS, NO_DEFAULT_MAVEN, NSJAIL_PATH, PATH_ENV, PROXY_ENVS,
+    worker_utils::JobPingHeartbeat,
+    COURSIER_CACHE_DIR, DISABLE_NUSER, JAVA_CACHE_DIR, JAVA_HOME_DIR, JAVA_REPOSITORY_DIR,
+    MAVEN_REPOS, NO_DEFAULT_MAVEN, NSJAIL_PATH, PATH_ENV, PROXY_ENVS,
 };
 use windmill_common::client::AuthedClient;
 
@@ -58,6 +66,7 @@ pub(crate) struct JobHandlerInput<'a> {
     pub requirements_o: Option<&'a String>,
     pub shared_mount: &'a str,
     pub worker_name: &'a str,
+    pub modules: Option<&'a HashMap<String, windmill_common::scripts::ScriptModule>>,
 }
 
 pub async fn handle_java_job<'a>(mut args: JobHandlerInput<'a>) -> Result<Box<RawValue>, Error> {
@@ -120,6 +129,57 @@ async fn prepare<'a>(
     Ok(())
 }
 
+/// Returns the java home dir to use. If a workspace-specific maven_settings_xml
+/// override exists, writes it to `job_dir/.m2/settings.xml` and returns `job_dir`.
+/// Otherwise returns the global JAVA_HOME_DIR.
+async fn get_java_home_with_ws_settings(
+    job_id: &Uuid,
+    w_id: &str,
+    job_dir: &str,
+    conn: &Connection,
+) -> String {
+    let ws_settings_xml = {
+        let registries = crate::WORKSPACE_REGISTRIES.read().await;
+        registries
+            .as_ref()
+            .and_then(|m| m.get(w_id))
+            .and_then(|ws| ws.get("maven_settings_xml"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+    };
+    if let Some(ref content) = ws_settings_xml {
+        if !content.trim().is_empty() {
+            if cfg!(feature = "enterprise") {
+                let m2_dir = format!("{job_dir}/.m2");
+                if let Err(e) = create_dir_all(&m2_dir).await {
+                    tracing::error!("Failed to create per-job .m2 directory: {e:#}");
+                    return JAVA_HOME_DIR.to_string();
+                }
+                if let Err(e) =
+                    windmill_common::worker::write_file(&m2_dir, "settings.xml", content)
+                {
+                    tracing::error!("Failed to write per-job Maven settings.xml: {e:#}");
+                    return JAVA_HOME_DIR.to_string();
+                }
+                tracing::debug!(
+                    "Using workspace-specific Maven settings.xml for job {} in workspace {}",
+                    job_id,
+                    w_id
+                );
+                return job_dir.to_string();
+            } else {
+                append_logs(
+                    job_id,
+                    w_id,
+                    "Private registry (maven settings.xml) configuration ignored: this feature requires Windmill Enterprise Edition\n".to_string(),
+                    conn,
+                )
+                .await;
+            }
+        }
+    }
+    JAVA_HOME_DIR.to_string()
+}
+
 pub async fn resolve<'a>(
     job_id: &Uuid,
     code: &str,
@@ -155,7 +215,8 @@ pub async fn resolve<'a>(
         deps.join("\n")
     };
 
-    let req_hash = format!("java-{}", calculate_hash(&deps));
+    let ws_suffix = crate::workspace_registry_cache_suffix(w_id).await;
+    let req_hash = format!("java-{}{ws_suffix}", calculate_hash(&deps));
     if let Connection::Sql(db) = conn {
         if let Some(cached) = sqlx::query_scalar!(
             "SELECT lockfile FROM pip_resolution_cache WHERE hash = $1",
@@ -181,9 +242,12 @@ pub async fn resolve<'a>(
         } else {
             JAVA_PATH.as_str()
         });
+        let java_home = get_java_home_with_ws_settings(job_id, w_id, job_dir, conn).await;
         cmd.env_clear()
             .current_dir(job_dir.to_owned())
             .env("PATH", PATH_ENV.as_str())
+            .env("HOME", &java_home)
+            .env("COURSIER_CACHE", &*COURSIER_CACHE_DIR)
             .envs(PROXY_ENVS.clone());
 
         // Configure proxies
@@ -205,23 +269,25 @@ pub async fn resolve<'a>(
                 cmd.arg(&format!("-Dhttp.nonProxyHosts=\"{}\"", val));
             }
         }
+        cmd.arg(&format!("-Duser.home={}", java_home));
         if metadata(TRUST_STORE_PATH.clone()).await.is_ok() {
             cmd.args(&[
                 &format!("-Djavax.net.ssl.trustStore={}", *TRUST_STORE_PATH),
                 &format!("-Djavax.net.ssl.trustStorePassword={}", *STOREPASS),
             ]);
         }
+        let no_default = get_no_default(*job_id, w_id, conn).await;
         cmd.args(&[
             "-jar",
             &CS_PATH,
             "resolve",
-            &get_no_default(),
+            &no_default,
             "--parallel",
             &format!("{}", *JAVA_CONCURRENT_DOWNLOADS),
             "--cache",
-            COURSIER_CACHE_DIR,
+            &*COURSIER_CACHE_DIR,
         ])
-        .args(&get_repos().await)
+        .args(&get_repos(job_id, w_id, conn).await)
         .args(&deps.split("\n").collect_vec())
         .stderr(Stdio::piped());
 
@@ -234,7 +300,21 @@ pub async fn resolve<'a>(
                     std::env::var("TMP").unwrap_or_else(|_| String::from("/tmp")),
                 );
         }
-        let output = cmd.output().await?;
+        // The lockfile has to be read from a clean stdout, so this cannot go through handle_child's
+        // polling loop. That leaves resolution with neither a ping nor a time bound of its own: it
+        // needs the heartbeat not to be reaped as a zombie mid-resolution, and the timeout so a
+        // wedged registry connection cannot park the job in `running` forever.
+        cmd.kill_on_drop(true);
+        let (timeout, ..) = resolve_job_timeout(conn, w_id, *job_id, None).await;
+        let _heartbeat = JobPingHeartbeat::start(conn, *job_id, "java lockfile resolution");
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| {
+                Error::ExecutionErr(format!(
+                    "resolving the java lockfile timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })??;
         // Check if the command was successful
         if output.status.success() {
             String::from_utf8(output.stdout).expect("Failed to convert output to String")
@@ -272,7 +352,8 @@ async fn install<'a>(
             match (it.next(), it.next(), it.next()) {
                 (Some(group_id), Some(artifact_id), Some(version)) => {
                     let path = format!(
-                        "{JAVA_REPOSITORY_DIR}/{}/{artifact_id}/{version}",
+                        "{}/{}/{artifact_id}/{version}",
+                        *JAVA_REPOSITORY_DIR,
                         group_id.replace(".", "/")
                     );
                     Ok(RequiredDependency {
@@ -302,15 +383,16 @@ async fn install<'a>(
         workspace_id = %job.workspace_id,
         "JAVA classpath: {}", &classpath
     );
+    let java_home = get_java_home_with_ws_settings(&job.id, &job.workspace_id, job_dir, conn).await;
     let (repos, no_default, trust_store_metadata) = (
-        get_repos().await,
-        get_no_default(),
+        get_repos(&job.id, &job.workspace_id, conn).await,
+        get_no_default(job.id, &job.workspace_id, conn).await,
         metadata(TRUST_STORE_PATH.clone()).await,
     );
     let job_dir = job_dir.to_owned();
-    let fetch_dir = format!("{JAVA_CACHE_DIR}/tmp-fetch-{}", Uuid::new_v4());
-    let fetch_dir2 = fetch_dir.clone();
-    par_install_language_dependencies_all_at_once(
+    let fetch_dir = format!("{}/tmp-fetch-{}", *JAVA_CACHE_DIR, Uuid::new_v4());
+    let (cmd_fetch_dir, postinstall_fetch_dir) = (fetch_dir.clone(), fetch_dir.clone());
+    let installed = par_install_language_dependencies_all_at_once(
         deps,
         "java",
         "java",
@@ -330,6 +412,8 @@ async fn install<'a>(
             cmd.env_clear()
                 .current_dir(&job_dir)
                 .env("PATH", PATH_ENV.as_str())
+                .env("HOME", &java_home)
+                .env("COURSIER_CACHE", &*COURSIER_CACHE_DIR)
                 .envs(PROXY_ENVS.clone());
             // Configure proxies
             {
@@ -351,6 +435,7 @@ async fn install<'a>(
                 }
             }
 
+            cmd.arg(&format!("-Duser.home={}", java_home));
             if trust_store_metadata.is_ok() {
                 cmd.args(&[
                     &format!("-Djavax.net.ssl.trustStore={}", *TRUST_STORE_PATH),
@@ -366,7 +451,7 @@ async fn install<'a>(
                 "--parallel",
                 &format!("{}", *JAVA_CONCURRENT_DOWNLOADS),
                 "--cache",
-                &fetch_dir,
+                &cmd_fetch_dir,
             ])
             .args(&repos)
             .arg("--intransitive")
@@ -385,44 +470,132 @@ async fn install<'a>(
 
             Ok(cmd)
         },
-        async move |_| {
-            move_to_repository(&fetch_dir2, 0).await?;
-            remove_dir_all(&fetch_dir2).await?;
-            #[async_recursion]
-            async fn move_to_repository(path: &str, depth: u8) -> anyhow::Result<()> {
-                if depth == 3 {
-                    copy_dir_recursively(
-                        &PathBuf::from(path),
-                        &PathBuf::from(JAVA_REPOSITORY_DIR),
-                    )?;
-
-                    return Ok(());
-                }
-                let mut entries = tokio::fs::read_dir(path).await?;
-                loop {
-                    let Some(entry) = entries.next_entry().await? else {
-                        break Ok(());
-                    };
-
-                    let path = entry
-                        .path()
-                        .to_str()
-                        .ok_or(anyhow!("Internal Error: Cannot convert Path to Str"))?
-                        .to_owned();
-
-                    move_to_repository(&path, depth + 1).await?;
-                }
-            }
-            Ok(())
+        async move |dependencies| {
+            Ok(
+                move_to_repository(&postinstall_fetch_dir, &*JAVA_REPOSITORY_DIR, &dependencies)
+                    .await?,
+            )
         },
         &job.id,
         &job.workspace_id,
         worker_name,
-        !*DISABLE_NSJAIL,
+        is_sandboxing_enabled(),
         conn,
     )
-    .await?;
+    .await;
+
+    // coursier failing against the registry bails before the postinstall step ever runs, so the
+    // cache it was writing into has to be reclaimed on every path out
+    match remove_dir_all(&fetch_dir).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("could not remove java fetch dir {fetch_dir}: {e}")
+        }
+        _ => {}
+    }
+    installed?;
     Ok(classpath)
+}
+
+/// Copies every fetched artifact out of coursier's cache into the `<group as path>/<artifact>/
+/// <version>` location the classpath is built from. Coursier's cache is laid out as
+/// `<scheme>/<host>/<registry url path>/<group as path>/...`, so the depth at which the maven
+/// layout starts varies with the registry url and only the coordinate can be matched on.
+async fn move_to_repository(
+    fetch_dir: &str,
+    repository_dir: &str,
+    deps: &[RequiredDependency<()>],
+) -> anyhow::Result<()> {
+    struct Wanted {
+        coordinate: Vec<String>,
+        destination: String,
+        display_name: String,
+        found: bool,
+    }
+
+    #[async_recursion]
+    async fn find_and_copy(
+        dir: &Path,
+        // components walked past below the fetch dir, compared against coordinates one component
+        // at a time so that windows' native separator cannot defeat the match
+        below: &mut Vec<String>,
+        wanted: &mut Vec<Wanted>,
+    ) -> anyhow::Result<()> {
+        if wanted.iter().all(|w| w.found) {
+            return Ok(());
+        }
+        let (mut subdirs, mut holds_artifact) = (vec![], false);
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().await?.is_dir() {
+                subdirs.push((name, entry));
+            } else {
+                // coursier's own bookkeeping (`.<name>.checked`, `.<name>.error`, checksums) is
+                // dot-prefixed; only a downloaded artifact is not
+                holds_artifact |= !name.starts_with('.');
+            }
+        }
+        // a repository coursier probed and did not get the artifact from keeps a directory at the
+        // coordinate holding nothing but that bookkeeping, and default repositories are probed
+        // before the configured ones, so claiming the first match would cache an empty directory
+        // as the installed artifact
+        if holds_artifact {
+            if let Some(w) = wanted
+                .iter_mut()
+                .find(|w| !w.found && below.ends_with(&w.coordinate))
+            {
+                copy_dir_recursively(dir, &PathBuf::from(&w.destination))?;
+                w.found = true;
+                return Ok(());
+            }
+        }
+        for (name, entry) in subdirs {
+            below.push(name);
+            find_and_copy(&entry.path(), below, wanted).await?;
+            below.pop();
+        }
+        Ok(())
+    }
+
+    let mut wanted = deps
+        .iter()
+        .map(|RequiredDependency { path, display_name, .. }| {
+            let suffix = path
+                .strip_prefix(repository_dir)
+                .filter(|suffix| suffix.starts_with('/'))
+                .ok_or_else(|| anyhow!("Internal Error: {path} is not under {repository_dir}"))?;
+            Ok(Wanted {
+                coordinate: suffix
+                    .split('/')
+                    .filter(|component| !component.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                destination: path.clone(),
+                display_name: display_name.clone(),
+                found: false,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // longest coordinate first: a group id ending in another one's coordinates (com.org.foo:bar
+    // over org.foo:bar) would otherwise be free to claim the shorter one's directory
+    wanted.sort_by_key(|w| std::cmp::Reverse(w.coordinate.len()));
+
+    find_and_copy(&PathBuf::from(fetch_dir), &mut vec![], &mut wanted).await?;
+
+    let missing = wanted
+        .iter()
+        .filter(|w| !w.found)
+        .map(|w| w.display_name.as_str())
+        .sorted()
+        .collect_vec();
+    if !missing.is_empty() {
+        bail!(
+            "the configured maven repositories did not serve: {}. \
+            Coursier reported success but no artifact for them was found in its cache.",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 async fn compile<'a>(
@@ -440,27 +613,37 @@ async fn compile<'a>(
         inner_content,
         requirements_o,
         parent_runnable_path,
+        modules,
         ..
     }: &mut JobHandlerInput<'a>,
     classpath: &'a str,
     // plugins: Vec<&'a str>,
 ) -> Result<(), Error> {
-    fn compute_hash(code: &str, requirements_o: Option<&String>) -> String {
-        calculate_hash(&format!(
+    // The cached artifact is the whole `target/` dir, and companion modules are written
+    // into the job dir before this runs, so their content can land in it.
+    fn compute_hash(
+        code: &str,
+        requirements_o: Option<&String>,
+        modules: Option<&HashMap<String, windmill_common::scripts::ScriptModule>>,
+    ) -> String {
+        let base = format!(
             "{}{}",
             code,
             requirements_o
                 .as_ref()
                 .map(|x| x.to_string())
                 .unwrap_or_default()
-        ))
+        );
+        crate::worker::artifact_cache_name(base, modules)
     }
     let reserved_variables =
         get_reserved_variables(job, &client.token, conn, parent_runnable_path.clone()).await?;
-    let hash = compute_hash(inner_content, *requirements_o);
-    let bin_path = format!("{}/{hash}", JAVA_CACHE_DIR);
+    let ws_suffix = crate::workspace_registry_cache_suffix(&job.workspace_id).await;
+    let mut hash = compute_hash(inner_content, *requirements_o, *modules);
+    hash.push_str(&ws_suffix);
+    let bin_path = format!("{}/{hash}", *JAVA_CACHE_DIR);
     let remote_path = format!("java_jar/{hash}");
-    let (cache, ..) = windmill_common::worker::load_cache(&bin_path, &remote_path, true).await;
+    let (cache, ..) = crate::global_cache::load_cache(&bin_path, &remote_path, true).await;
 
     if cache {
         let target = format!("{job_dir}/target");
@@ -494,6 +677,7 @@ async fn compile<'a>(
             cmd.env_clear()
                 .current_dir(job_dir.to_owned())
                 .env("PATH", PATH_ENV.as_str())
+                .env("HOME", &*JAVA_HOME_DIR)
                 .env("BASE_INTERNAL_URL", base_internal_url)
                 .envs(envs)
                 .envs(reserved_variables)
@@ -526,7 +710,7 @@ async fn compile<'a>(
             mem_peak,
             canceled_by,
             child,
-            !*DISABLE_NSJAIL,
+            is_sandboxing_enabled(),
             worker_name,
             &job.workspace_id,
             "javac",
@@ -582,7 +766,7 @@ async fn run<'a>(
     let reserved_variables =
         get_reserved_variables(job, &client.token, conn, parent_runnable_path.clone()).await?;
 
-    let child = if !cfg!(windows) && !*DISABLE_NSJAIL {
+    let child = if !cfg!(windows) && is_sandboxing_enabled() {
         append_logs(
             &job.id,
             &job.workspace_id,
@@ -591,23 +775,32 @@ async fn run<'a>(
         )
         .await;
 
+        let nsjail_timeout =
+            resolve_nsjail_timeout(conn, &job.workspace_id, job.id, job.timeout).await;
         write_file(
             job_dir,
             "run.config.proto",
             &NSJAIL_CONFIG_RUN_JAVA_CONTENT
                 .replace("{JOB_DIR}", job_dir)
-                .replace("{CACHE_DIR}", JAVA_CACHE_DIR)
+                .replace("{CACHE_DIR}", &*JAVA_CACHE_DIR)
                 .replace("{SHARED_MOUNT}", &shared_mount)
                 // .replace("{CACHED_TARGET}", &shared_mount)
-                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string()),
+                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
+                .replace("{TIMEOUT}", &nsjail_timeout),
         )?;
         let mut cmd = Command::new(NSJAIL_PATH.as_str());
         cmd.env_clear()
             .current_dir(job_dir)
             .env("PATH", PATH_ENV.as_str())
+            .env("HOME", &*JAVA_HOME_DIR)
             .env("BASE_INTERNAL_URL", base_internal_url)
             .envs(envs)
             .envs(reserved_variables)
+            .envs(crate::get_otel_context_envs(&job.id))
             .args(vec![
                 "--config",
                 "run.config.proto",
@@ -662,9 +855,11 @@ async fn run<'a>(
         cmd.env_clear()
             .current_dir(job_dir.to_owned())
             .env("PATH", PATH_ENV.as_str())
+            .env("HOME", &*JAVA_HOME_DIR)
             .env("BASE_INTERNAL_URL", base_internal_url)
             .envs(envs)
-            .envs(reserved_variables);
+            .envs(reserved_variables)
+            .envs(crate::get_otel_context_envs(&job.id));
         if metadata(TRUST_STORE_PATH.clone()).await.is_ok() {
             cmd.args(&[
                 &format!("-Djavax.net.ssl.trustStore={}", *TRUST_STORE_PATH),
@@ -712,7 +907,7 @@ async fn run<'a>(
         mem_peak,
         canceled_by,
         child,
-        !*DISABLE_NSJAIL,
+        is_sandboxing_enabled(),
         worker_name,
         &job.workspace_id,
         "java",
@@ -739,18 +934,15 @@ fn parse_proxy() -> anyhow::Result<JavaProxySettings> {
     for (ident, mut val) in PROXY_ENVS.clone() {
         match ident {
             "HTTPS_PROXY" => {
-                if val.contains("http://") {
-                    bail!("HTTPS_PROXY url cannot contain http scheme.");
-                }
-                if !val.contains("https://") {
+                if !val.contains("://") {
                     val = format!("https://{val}");
                 }
                 let mut url = url::Url::parse(&val)?;
                 let port = url.port();
-                // Make sure port and schema is not included in final url
                 {
                     url.set_port(None).unwrap_or_default();
-                    jps.https_host = Some(url.as_str().replace("https://", ""));
+                    let host = url.as_str().replace("https://", "").replace("http://", "");
+                    jps.https_host = Some(host);
                     if let Some(port) = port {
                         jps.https_port = Some(format!("{}", port));
                     }
@@ -782,31 +974,41 @@ fn parse_proxy() -> anyhow::Result<JavaProxySettings> {
 
     Ok(jps)
 }
-async fn get_repos() -> Vec<String> {
-    MAVEN_REPOS
-        .read()
-        .await
-        .as_ref()
-        .map(|repos| {
-            repos
-                .trim()
-                .split_whitespace()
-                .into_iter()
-                .map(|el| vec!["--repository".to_owned(), el.to_owned()])
-                .collect_vec()
-        })
-        .unwrap_or_default()
-        .concat()
+async fn get_repos(job_id: &Uuid, w_id: &str, conn: &Connection) -> Vec<String> {
+    read_ee_registry_with_workspace_override(
+        MAVEN_REPOS.read().await.clone(),
+        "maven_repos",
+        "maven repos",
+        job_id,
+        w_id,
+        conn,
+    )
+    .await
+    .as_ref()
+    .map(|repos| {
+        repos
+            .trim()
+            .split_whitespace()
+            .into_iter()
+            .map(|el| vec!["--repository".to_owned(), el.to_owned()])
+            .collect_vec()
+    })
+    .unwrap_or_default()
+    .concat()
 }
 
-fn get_no_default() -> String {
-    if NO_DEFAULT_MAVEN.load(std::sync::atomic::Ordering::Relaxed) {
-        "--no-default"
-    } else {
-        // Command does not take empty arguments
-        "-q"
-    }
-    .into()
+async fn get_no_default(job_id: Uuid, w_id: &str, conn: &Connection) -> String {
+    let global_value = NO_DEFAULT_MAVEN.load(std::sync::atomic::Ordering::Relaxed);
+    let value = read_ee_registry_bool_with_workspace_override(
+        global_value,
+        "no_default_maven",
+        "no default maven",
+        &job_id,
+        w_id,
+        conn,
+    )
+    .await;
+    if value { "--no-default" } else { "-q" }.into()
 }
 
 /// Wraps content script
@@ -926,3 +1128,161 @@ class Wmill {
     }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dep(
+        repository_dir: &str,
+        group_path: &str,
+        artifact: &str,
+        version: &str,
+    ) -> RequiredDependency<()> {
+        RequiredDependency {
+            path: format!("{repository_dir}/{group_path}/{artifact}/{version}"),
+            _s3_handle: format!("{}:{artifact}:{version}", group_path.replace("/", ".")),
+            display_name: format!("{artifact}:{version}"),
+            custom_payload: (),
+        }
+    }
+
+    async fn touch(path: &str) {
+        let path = PathBuf::from(path);
+        create_dir_all(path.parent().unwrap()).await.unwrap();
+        File::create(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifacts_are_found_whatever_the_registry_url_path_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetch_dir = tmp.path().join("fetch").to_str().unwrap().to_owned();
+        let repository_dir = tmp.path().join("repository").to_str().unwrap().to_owned();
+
+        // maven central has a single url segment before the maven layout, a nexus repository two,
+        // and a root-hosted mirror none at all
+        touch(&format!("{fetch_dir}/https/repo1.maven.org/maven2/commons-cli/commons-cli/1.4/commons-cli-1.4.jar")).await;
+        touch(&format!("{fetch_dir}/https/nexus.local/repository/maven-public/com/google/code/gson/gson/2.8.9/gson-2.8.9.jar")).await;
+        touch(&format!("{fetch_dir}/https/maven.local/org/apache/commons/commons-lang3/3.8.1/commons-lang3-3.8.1.jar")).await;
+
+        let deps = vec![
+            dep(&repository_dir, "commons-cli", "commons-cli", "1.4"),
+            dep(&repository_dir, "com/google/code/gson", "gson", "2.8.9"),
+            dep(
+                &repository_dir,
+                "org/apache/commons",
+                "commons-lang3",
+                "3.8.1",
+            ),
+        ];
+
+        move_to_repository(&fetch_dir, &repository_dir, &deps)
+            .await
+            .unwrap();
+
+        for (dep, jar) in deps.iter().zip([
+            "commons-cli-1.4.jar",
+            "gson-2.8.9.jar",
+            "commons-lang3-3.8.1.jar",
+        ]) {
+            assert!(
+                metadata(format!("{}/{jar}", dep.path)).await.is_ok(),
+                "{} was not copied to {}",
+                dep.display_name,
+                dep.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_empty_directory_a_404_leaves_behind_does_not_claim_the_coordinate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetch_dir = tmp.path().join("fetch").to_str().unwrap().to_owned();
+        let repository_dir = tmp.path().join("repository").to_str().unwrap().to_owned();
+
+        // a repository that 404s is left with an empty directory at the coordinate. Each artifact
+        // is served by one of the two repositories and left empty under the other, so whichever
+        // one the walk reaches first, an empty directory precedes an artifact.
+        let central = format!("{fetch_dir}/https/repo1.maven.org/maven2");
+        let nexus = format!("{fetch_dir}/https/nexus.local/repository/maven-public");
+        touch(&format!("{central}/com/corp/public/1.0/public-1.0.jar")).await;
+        touch(&format!(
+            "{nexus}/com/corp/public/1.0/.public-1.0.jar.error"
+        ))
+        .await;
+        touch(&format!("{nexus}/com/corp/internal/1.0/internal-1.0.jar")).await;
+        touch(&format!(
+            "{central}/com/corp/internal/1.0/.internal-1.0.jar.error"
+        ))
+        .await;
+
+        let deps = vec![
+            dep(&repository_dir, "com/corp", "public", "1.0"),
+            dep(&repository_dir, "com/corp", "internal", "1.0"),
+        ];
+
+        move_to_repository(&fetch_dir, &repository_dir, &deps)
+            .await
+            .unwrap();
+
+        for (dep, jar) in deps.iter().zip(["public-1.0.jar", "internal-1.0.jar"]) {
+            assert!(
+                metadata(format!("{}/{jar}", dep.path)).await.is_ok(),
+                "{} was not copied to {}",
+                dep.display_name,
+                dep.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_id_ending_in_another_coordinate_does_not_claim_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetch_dir = tmp.path().join("fetch").to_str().unwrap().to_owned();
+        let repository_dir = tmp.path().join("repository").to_str().unwrap().to_owned();
+        let root = format!("{fetch_dir}/https/nexus.local/repository/maven-public");
+
+        touch(&format!("{root}/org/foo/bar/1/bar-1.jar")).await;
+        touch(&format!("{root}/com/org/foo/bar/1/bar-1.jar")).await;
+
+        let deps = vec![
+            dep(&repository_dir, "org/foo", "bar", "1"),
+            dep(&repository_dir, "com/org/foo", "bar", "1"),
+        ];
+
+        move_to_repository(&fetch_dir, &repository_dir, &deps)
+            .await
+            .unwrap();
+
+        for dep in &deps {
+            assert!(
+                metadata(format!("{}/bar-1.jar", dep.path)).await.is_ok(),
+                "{} was not copied to {}",
+                dep.display_name,
+                dep.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_missing_from_the_cache_is_named_in_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetch_dir = tmp.path().join("fetch").to_str().unwrap().to_owned();
+        let repository_dir = tmp.path().join("repository").to_str().unwrap().to_owned();
+
+        touch(&format!("{fetch_dir}/https/nexus.local/repository/maven-public/commons-cli/commons-cli/1.4/commons-cli-1.4.jar")).await;
+
+        let deps = vec![
+            dep(&repository_dir, "commons-cli", "commons-cli", "1.4"),
+            dep(&repository_dir, "com/google/code/gson", "gson", "2.8.9"),
+        ];
+
+        let err = move_to_repository(&fetch_dir, &repository_dir, &deps)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("gson:2.8.9"), "unexpected error: {err}");
+        assert!(!err.contains("commons-cli:1.4"), "unexpected error: {err}");
+    }
+}

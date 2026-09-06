@@ -15,12 +15,13 @@ use serde_json::value::RawValue;
 use sql_builder::SqlBuilder;
 use sqlx::{FromRow, Row};
 use tokio::sync::RwLock;
-use windmill_api_auth::{fetch_api_authed, ApiAuthed};
+use windmill_api_auth::ApiAuthed;
 use windmill_common::{
     error::{Error, Result},
     jobs::JobTriggerKind,
     triggers::{TriggerKind, TriggerMetadata},
     utils::report_critical_error,
+    worker::to_raw_value,
     DB, INSTANCE_NAME,
 };
 
@@ -61,13 +62,14 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
             "script_path",
             "is_flow",
             "edited_by",
-            "email",
+            "permissioned_as",
             "edited_at",
             "extra_perms",
             "mode",
             "error_handler_path",
             "error_handler_args",
             "retry",
+            "labels",
         ];
 
         fields.extend_from_slice(Self::ADDITIONAL_SELECT_FIELDS);
@@ -97,8 +99,8 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
                 path: trigger.base.path,
                 workspace_id: trigger.base.workspace_id,
                 is_flow: trigger.base.is_flow,
-                username: trigger.base.edited_by,
-                email: trigger.base.email,
+                edited_by: trigger.base.edited_by,
+                permissioned_as: trigger.base.permissioned_as,
                 script_path: trigger.base.script_path,
                 trigger_config: trigger.config,
                 error_handling: Some(trigger.error_handling),
@@ -119,7 +121,6 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
             "is_flow",
             "workspace_id",
             "owner AS username",
-            "email",
             "trigger_config",
         ];
 
@@ -143,17 +144,21 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
 
         let captures = captures
             .into_iter()
-            .map(|capture| ListeningTrigger {
-                username: capture.username,
-                path: capture.path,
-                workspace_id: capture.workspace_id,
-                script_path: "".to_string(),
-                email: capture.email,
-                trigger_config: capture.trigger_config,
-                trigger_mode: false,
-                is_flow: capture.is_flow,
-                error_handling: None,
-                suspended_mode: false,
+            .map(|capture| {
+                let permissioned_as =
+                    windmill_common::users::username_to_permissioned_as(&capture.username);
+                ListeningTrigger {
+                    edited_by: capture.username,
+                    path: capture.path,
+                    workspace_id: capture.workspace_id,
+                    script_path: "".to_string(),
+                    permissioned_as,
+                    trigger_config: capture.trigger_config,
+                    trigger_mode: false,
+                    is_flow: capture.is_flow,
+                    error_handling: None,
+                    suspended_mode: false,
+                }
             })
             .collect_vec();
 
@@ -229,6 +234,7 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
         listening_trigger: &ListeningTrigger<Self::TriggerConfig>,
         error: Option<&str>,
     ) -> Option<()> {
+        // SAFETY: Self::TABLE_NAME is a compile-time constant, not user input.
         let updated = sqlx::query_scalar::<_, i32>(&format!(
             r#"
                 UPDATE
@@ -331,6 +337,7 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
         listening_trigger: &ListeningTrigger<Self::TriggerConfig>,
     ) {
         if listening_trigger.trigger_mode {
+            // SAFETY: Self::TABLE_NAME is a compile-time constant.
             let _ = sqlx::query(&format!(
                 r#"
                 UPDATE
@@ -379,8 +386,14 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
         error: String,
     ) {
         if listening_trigger.trigger_mode {
-            let report_status = sqlx::query(&format!(
-                r#"
+            // Contract on `record_in_disable_tx`: one transaction so the row
+            // lock spans both writes.
+            let mut history_err = None;
+            let report_status = async {
+                let mut tx = db.begin().await?;
+                // SAFETY: Self::TABLE_NAME is a compile-time constant.
+                let rows = sqlx::query(&format!(
+                    r#"
                     UPDATE
                         {}
                     SET
@@ -390,18 +403,60 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
                         last_server_ping = NULL
                     WHERE
                         workspace_id = $2 AND
-                        path = $3
+                        path = $3 AND
+                        mode <> 'disabled'::TRIGGER_MODE
                 "#,
-                Self::TABLE_NAME
-            ))
-            .bind(&error)
-            .bind(&listening_trigger.workspace_id)
-            .bind(&listening_trigger.path)
-            .execute(db)
+                    Self::TABLE_NAME
+                ))
+                .bind(&error)
+                .bind(&listening_trigger.workspace_id)
+                .bind(&listening_trigger.path)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+
+                // Zero rows: deleted, or a user disabled it first — no
+                // transition of ours to record.
+                if rows > 0 {
+                    // `to_key`, not `Display`: it is what lines up with the
+                    // `TRIGGER_TYPE` the API records under.
+                    let trigger_kind = Self::TRIGGER_KIND.to_key();
+                    history_err = windmill_common::trigger_history::record_in_disable_tx(
+                        &mut tx,
+                        windmill_common::trigger_history::TriggerHistoryEvent::server_disable(
+                            &listening_trigger.workspace_id,
+                            &trigger_kind,
+                            &listening_trigger.path,
+                            serde_json::json!({ "mode": { "new": "disabled" } }),
+                            &error,
+                        ),
+                    )
+                    .await;
+                }
+                tx.commit().await?;
+                Ok::<(), Error>(())
+            }
             .await;
 
+            if let Some(history_err) = history_err {
+                // Spawned: the commit above made the cleared `server_id` visible,
+                // so the ping branch of the enclosing `select!` is about to
+                // finish and drop everything left in this future. Awaiting the
+                // alert here would lose the one signal that the row is missing.
+                let message = format!(
+                    "Disabled {} trigger {} but could not record it in the trigger history: {}",
+                    Self::TRIGGER_KIND,
+                    listening_trigger.path,
+                    history_err
+                );
+                let (db, workspace_id) = (db.clone(), listening_trigger.workspace_id.clone());
+                tokio::spawn(async move {
+                    report_critical_error(message, db, Some(&workspace_id), None).await;
+                });
+            }
+
             match report_status {
-                Ok(_) => {
+                Ok(()) => {
                     report_critical_error(
                         format!(
                             "Disabling {} trigger {} because of error: {}",
@@ -467,9 +522,13 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
         db: &DB,
         listening_trigger: &ListeningTrigger<Self::TriggerConfig>,
         payload: Self::Payload,
-        trigger_info: HashMap<String, Box<RawValue>>,
+        mut trigger_info: HashMap<String, Box<RawValue>>,
         _extra: Option<Self::Extra>,
     ) -> Result<()> {
+        trigger_info.insert(
+            "trigger_path".to_string(),
+            to_raw_value(&listening_trigger.path),
+        );
         let args = Self::build_job_args(
             &listening_trigger.script_path,
             listening_trigger.is_flow,
@@ -552,6 +611,11 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
             return Ok(());
         }
 
+        let mut trigger_info = trigger_info;
+        trigger_info.insert(
+            "trigger_path".to_string(),
+            to_raw_value(&listening_trigger.path),
+        );
         let (main_args, preprocessor_args) = Self::build_capture_payloads(&payload, trigger_info);
         if let Err(err) = insert_capture_payload(
             db,
@@ -561,7 +625,7 @@ pub trait Listener: TriggerCrud + TriggerJobArgs {
             &Self::TRIGGER_KIND,
             main_args,
             preprocessor_args,
-            &listening_trigger.username,
+            &listening_trigger.edited_by,
         )
         .await
         {
@@ -646,6 +710,7 @@ pub async fn listen_to_unlistened_events<T: Copy + Listener>(
         Ok(mut unlistend_enabled_triggers) => {
             unlistend_enabled_triggers.shuffle(&mut rand::rng());
             for trigger in unlistend_enabled_triggers {
+                // SAFETY: T::TABLE_NAME is a compile-time constant.
                 let has_lock = sqlx::query_scalar(&format!(
                     r#"
                         UPDATE
@@ -782,7 +847,6 @@ where
     is_flow: bool,
     workspace_id: String,
     username: String,
-    email: String,
     #[serde(flatten)]
     trigger_config: T,
 }
@@ -800,7 +864,6 @@ where
             is_flow: row.try_get("is_flow")?,
             workspace_id: row.try_get("workspace_id")?,
             username: row.try_get("username")?,
-            email: row.try_get("email")?,
             trigger_config,
         })
     }
@@ -811,8 +874,8 @@ pub struct ListeningTrigger<T> {
     pub path: String,
     pub is_flow: bool,
     pub workspace_id: String,
-    pub username: String,
-    pub email: String,
+    pub edited_by: String,
+    pub permissioned_as: String,
     pub trigger_config: T,
     pub script_path: String,
     pub trigger_mode: bool,
@@ -821,13 +884,19 @@ pub struct ListeningTrigger<T> {
 }
 
 impl<T> ListeningTrigger<T> {
-    pub async fn authed(&self, db: &DB, username: &str) -> Result<ApiAuthed> {
-        fetch_api_authed(
-            self.username.clone(),
-            self.email.clone(),
+    pub async fn authed(&self, db: &DB, trigger_kind: &str) -> Result<ApiAuthed> {
+        let email = windmill_common::users::get_email_from_permissioned_as(
+            &self.permissioned_as,
             &self.workspace_id,
             db,
-            Some(format!("{}-{}", username, self.path)),
+        )
+        .await?;
+        windmill_api_auth::fetch_api_authed_from_permissioned_as(
+            self.permissioned_as.clone(),
+            email,
+            &self.workspace_id,
+            db,
+            Some(format!("{}-{}", trigger_kind, self.path)),
         )
         .await
     }

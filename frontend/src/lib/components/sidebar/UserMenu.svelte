@@ -14,8 +14,9 @@
 	import { Crown, ServerCog, LogOut, Moon, Settings, Sun, User } from 'lucide-svelte'
 	import DarkModeObserver from '../DarkModeObserver.svelte'
 	import MenuButton from './MenuButton.svelte'
-	import { Menu, MenuItem } from '$lib/components/meltComponents'
+	import { Menu, MenuItem, Tooltip } from '$lib/components/meltComponents'
 	import { type MenubarBuilders } from '@melt-ui/svelte'
+	import { EXECUTIONS_HINT } from './executionsHint'
 
 	let darkMode: boolean = $state(false)
 
@@ -42,6 +43,7 @@
 			label={`User (${$userStore?.username ?? $userStore?.email})`}
 			{isCollapsed}
 			{lightMode}
+			showChevron
 			{trigger}
 		/>
 	{/snippet}
@@ -52,12 +54,22 @@
 				{$userStore?.email}
 			</p>
 			<span class="text-xs text-primary flex flex-row gap-2 items-center">
-				{#if $userStore?.is_admin}
+				{#if $userStore?.non_member}
+					Superadmin, not a member of this workspace <Crown size={14} />
+				{:else if $userStore?.is_admin}
 					Admin of this workspace <Crown size={14} />
 				{:else if $userStore?.operator}
 					Operator in this workspace <ServerCog size={14} />
 				{/if}
 			</span>
+			{#if $userStore?.non_member}
+				<span class="text-xs text-tertiary block mt-1">
+					You are not a member, but as a superadmin you can access this workspace. You act here
+					under the username
+					<span class="font-mono font-medium text-primary">{$userStore?.username}</span>
+					with admin permissions.
+				</span>
+			{/if}
 		</div>
 		<div class="py-1">
 			<MenuItem href={USER_SETTINGS_HASH} class={itemClass} {item}>
@@ -92,27 +104,41 @@
 			</MenuItem>
 		</div>
 
-		{#if isCloudHosted()}
+		<!-- Both branches below assert a plan, so neither may render for an unresolved or
+		failed tier: `{:else}` would read `undefined` as paid and claim "Premium plan". -->
+		{#if isCloudHosted() && $isPremiumStore !== undefined}
 			<div class="border-t">
-				{#if !$isPremiumStore}
-					<span class="text-secondary block w-full text-left px-4 py-2 text-xs"
-						>{$usageStore}/1000 user execs</span
-					>
+				{#if $isPremiumStore === false}
+					<span class="text-secondary block w-full text-left px-4 py-2 text-xs">
+						{$usageStore ?? '—'}/1000 user execs
+						<Tooltip small>
+							{#snippet text()}
+								{EXECUTIONS_HINT}
+							{/snippet}
+						</Tooltip>
+					</span>
 					<div class="px-4 w-full h-1 mb-1">
 						<div class="bg-gray-200 h-full rounded-sm overflow-hidden">
-							<div class="bg-blue-400 h-full" style="width: {Math.min($usageStore, 1000) / 10}%"
+							<div
+								class="bg-blue-400 h-full"
+								style="width: {Math.min($usageStore ?? 0, 1000) / 10}%"
 							></div>
 						</div>
 					</div>
 					{#if $workspaceStore != 'demo'}
-						<span class="text-secondary block w-full text-left px-4 py-2 text-xs"
-							>{$workspaceUsageStore}/1000 free workspace execs</span
-						>
+						<span class="text-secondary block w-full text-left px-4 py-2 text-xs">
+							{$workspaceUsageStore ?? '—'}/1000 free workspace execs
+							<Tooltip small>
+								{#snippet text()}
+									{EXECUTIONS_HINT}
+								{/snippet}
+							</Tooltip>
+						</span>
 						<div class="px-4 w-full h-1 mb-1">
 							<div class="bg-gray-200 h-full rounded-sm overflow-hidden">
 								<div
 									class="bg-blue-400 h-full"
-									style="width: {Math.min($workspaceUsageStore, 1000) / 10}%"
+									style="width: {Math.min($workspaceUsageStore ?? 0, 1000) / 10}%"
 								></div>
 							</div>
 						</div>

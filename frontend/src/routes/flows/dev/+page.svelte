@@ -16,8 +16,10 @@
 	import type { FlowState } from '$lib/components/flows/flowState'
 	import FlowModuleSchemaMap from '$lib/components/flows/map/FlowModuleSchemaMap.svelte'
 	import FlowEditorPanel from '$lib/components/flows/content/FlowEditorPanel.svelte'
+	import AgentEditorModal from '$lib/components/flows/content/AgentEditorModal.svelte'
 	import { deepEqual } from 'fast-equals'
-	import { page } from '$app/stores'
+	import { findModuleInFlow } from '$lib/components/flows/flowDiff'
+	import { page } from '$app/state'
 	import { userStore, workspaceStore } from '$lib/stores'
 	import { getUserExt } from '$lib/user'
 	import DarkModeToggle from '$lib/components/sidebar/DarkModeToggle.svelte'
@@ -28,14 +30,14 @@
 	import { StepsInputArgs } from '$lib/components/flows/stepsInputArgs.svelte'
 	import { ModulesTestStates } from '$lib/components/modulesTest.svelte'
 
-	let token = $page.url.searchParams.get('wm_token') ?? undefined
-	let workspace = $page.url.searchParams.get('workspace') ?? undefined
-	let themeDarkRaw = $page.url.searchParams.get('activeColorTheme')
+	let token = page.url.searchParams.get('wm_token') ?? undefined
+	let workspace = page.url.searchParams.get('workspace') ?? undefined
+	let themeDarkRaw = page.url.searchParams.get('activeColorTheme')
 	let themeDark = themeDarkRaw == '2' || themeDarkRaw == '4'
 
 	if (token) {
 		OpenAPI.WITH_CREDENTIALS = true
-		OpenAPI.TOKEN = $page.url.searchParams.get('wm_token')!
+		OpenAPI.TOKEN = page.url.searchParams.get('wm_token')!
 	}
 
 	if (workspace) {
@@ -52,8 +54,10 @@
 	}
 
 	let darkModeToggle: DarkModeToggle | undefined = $state()
-	let darkMode: boolean | undefined = $state(undefined)
+	let darkMode: boolean = $state(document.documentElement.classList.contains('dark'))
 	let modeInitialized = $state(false)
+	let paneWidth = $state(0)
+	let compactPreview = $derived(paneWidth < 800)
 	function initializeMode() {
 		modeInitialized = true
 		darkModeToggle?.toggle()
@@ -74,7 +78,7 @@
 
 	const previewArgsStore = $state({ val: {} })
 	const scriptEditorDrawer = writable(undefined)
-	const moving = writable<{ id: string } | undefined>(undefined)
+	const workspaceScriptSettingsDrawer = writable(undefined)
 	const history = initHistory(flowStore.val)
 
 	const stepsInputArgs = new StepsInputArgs()
@@ -92,8 +96,8 @@
 		selectionManager,
 		previewArgs: previewArgsStore,
 		scriptEditorDrawer,
+		workspaceScriptSettingsDrawer,
 		flowEditorDrawer: writable(undefined),
-		moving,
 		history,
 		pathStore: writable(''),
 		flowStateStore,
@@ -113,7 +117,10 @@
 		}),
 		currentEditor: writable(undefined),
 		modulesTestStates: new ModulesTestStates(),
-		outputPickerOpenFns: {}
+		outputPickerOpenFns: {},
+		preserveOnBehalfOf: writable(false),
+		savedOnBehalfOfEmail: writable<string | undefined>(undefined),
+		savedOnBehalfOfPermissionedAs: writable<string | undefined>(undefined)
 	})
 	setContext<PropPickerContext>('PropPickerContext', {
 		flowPropPickerConfig: writable<FlowPropPickerConfig | undefined>(undefined),
@@ -224,8 +231,15 @@
 	let editor: SimpleEditor | undefined = $state()
 
 	function updateCode(editor: SimpleEditor | undefined, flow: OpenFlow) {
-		if (editor && !deepEqual(flow, JSON.parse(editor.getCode()))) {
-			editor.setCode(JSON.stringify(flow, null, 4))
+		if (!editor) return
+		const code = editor.getCode()
+		if (!code) return
+		try {
+			if (!deepEqual(flow, JSON.parse(code))) {
+				editor.setCode(JSON.stringify(flow, null, 4))
+			}
+		} catch (e) {
+			// editor not ready yet
 		}
 	}
 
@@ -238,6 +252,13 @@
 			console.error('issue parsing new change:', code, e)
 		}
 	}
+
+	const selectedId = $derived(selectionManager.getSelectedId())
+	const selectedModule = $derived(
+		selectedId && flowStore.val?.value
+			? (findModuleInFlow(flowStore.val.value, selectedId) ?? undefined)
+			: undefined
+	)
 
 	let flowPreviewButtons: FlowPreviewButtons | undefined = $state()
 	$effect(() => {
@@ -265,7 +286,8 @@
 				updateFromCode(e.detail.code)
 			}}
 		/>
-		<div class="flex flex-col max-h-screen h-full relative">
+		<div class="flex flex-col max-h-screen h-full relative" bind:clientWidth={paneWidth}>
+			<div id="flow-editor"></div>
 			<div class="absolute top-0 left-2">
 				<DarkModeToggle bind:darkMode bind:this={darkModeToggle} forcedDarkMode={false} />
 				{#if $userStore}
@@ -275,10 +297,14 @@
 				{/if}
 			</div>
 
-			<div class="flex justify-center pt-1 z-50 absolute right-2 top-2 gap-2">
+			<div
+				class="flex justify-center pt-1 z-50 absolute gap-2 {compactPreview
+					? 'left-1/2 -translate-x-1/2 top-14'
+					: 'right-2 top-2'}"
+			>
 				<FlowPreviewButtons bind:this={flowPreviewButtons} {suspendStatus} />
 			</div>
-			<Splitpanes horizontal class="h-full max-h-screen grow">
+			<Splitpanes horizontal class="max-h-screen grow min-h-0">
 				<Pane size={33}>
 					{#if flowStore.val?.value?.modules}
 						<FlowModuleSchemaMap
@@ -306,6 +332,21 @@
 					/>
 				</Pane>
 			</Splitpanes>
+			{#if selectedModule}
+				<div class="flex items-center gap-2 px-3 py-1.5 border-t border-border bg-surface shrink-0">
+					<span class="text-xs text-secondary shrink-0">{selectedModule.id} summary</span>
+					<input
+						type="text"
+						class="text-xs w-full bg-transparent border border-border rounded px-2 py-1 focus:outline-none focus:border-blue-500"
+						placeholder="Summary"
+						bind:value={selectedModule.summary}
+					/>
+				</div>
+			{/if}
 		</div>
+		<!-- Every surface that can select an agent step needs one: the card's Edit only sets a
+		     module-global target, and without a mount here it would do nothing. `disableAi` matches
+		     the map and panel above. -->
+		<AgentEditorModal owns={() => true} />
 	</div>
 </main>

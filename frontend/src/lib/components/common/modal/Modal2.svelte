@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { stopPropagation } from 'svelte/legacy'
+
 	import Portal from '$lib/components/Portal.svelte'
 
 	import { twMerge } from 'tailwind-merge'
@@ -6,15 +8,54 @@
 	import { X } from 'lucide-svelte'
 	import List from '$lib/components/common/layout/List.svelte'
 	import { fade } from 'svelte/transition'
+	import { zIndexes } from '$lib/zIndexes'
+	import { chatState } from '$lib/components/copilot/chat/sharedChatState.svelte'
 
-	export let title: string
+	interface Props {
+		title: string
+		css?: any
+		target?: string
+		isOpen?: boolean
+		fixedWidth?: 'xs' | 'sm' | 'md' | 'lg' | 'xl' | 'xxl'
+		/** `adaptive` sizes the modal to its content (no fixed height,
+		 * still capped by max-h-screen-80). */
+		fixedHeight?: 'xs' | 'sm' | 'md' | 'lg' | 'xl' | 'xxl' | 'adaptive'
+		contentClasses?: string
+		/** Close when the user clicks outside the modal body. Default
+		 * true. Set false when the caller stacks a child modal on top
+		 * and clicks "outside" the child would otherwise propagate
+		 * here and close the underlying modal. */
+		closeOnOutsideClick?: boolean
+		/** Close on Escape. Default true. Every open modal listens on the
+		 * window, so a stacked pair would both close on one press; set it
+		 * false on the underlying modal while its child is up. */
+		closeOnEscape?: boolean
+		/** Wider side padding and a lighter title, for a dialog whose body is a form rather
+		 *  than a list. Opt-in: every other Modal2 keeps the padding and heading it had. */
+		formStyling?: boolean
+		headerLeft?: import('svelte').Snippet
+		headerRight?: import('svelte').Snippet
+		children?: import('svelte').Snippet
+	}
 
-	export let css: any = {}
-	export let target: string = ''
-	export let isOpen = false
-	export let fixedWidth: 'xs' | 'sm' | 'md' | 'lg' | 'xl' | 'xxl' = 'md'
-	export let fixedHeight: 'xs' | 'sm' | 'md' | 'lg' | 'xl' | 'xxl' = 'md'
-	export let contentClasses: string = ''
+	let {
+		title,
+		css = {},
+		// Forwarded to `Portal`. An empty string would hit
+		// `document.querySelector('')` and throw "The provided selector
+		// is empty" — match `Portal`'s own default instead.
+		target = 'body',
+		isOpen = $bindable(false),
+		fixedWidth = 'md',
+		fixedHeight = 'md',
+		contentClasses = '',
+		closeOnOutsideClick = true,
+		closeOnEscape = true,
+		formStyling = false,
+		headerLeft,
+		headerRight,
+		children
+	}: Props = $props()
 
 	const widthMap = {
 		xs: '400px',
@@ -30,7 +71,9 @@
 		md: '500px',
 		lg: '720px',
 		xl: '800px',
-		xxl: '1000px'
+		xxl: '1000px',
+		// Content-driven height — emit no `height:` rule at all.
+		adaptive: undefined
 	}
 
 	export function close() {
@@ -42,6 +85,7 @@
 	}
 
 	function handleKeyDown(event: KeyboardEvent) {
+		if (!isOpen || !closeOnEscape) return
 		if (event.key === 'Escape') {
 			event.preventDefault()
 			event.stopPropagation()
@@ -52,47 +96,55 @@
 	function fadeFast(node: HTMLElement) {
 		return fade(node, { duration: 200 })
 	}
+
+	// Elevate above the AI chat panel (zIndexes.aiChat) while chat is open so
+	// the dialog isn't hidden behind it; otherwise keep the default modal
+	// stacking just above disposables (zIndexes.disposables).
+	const overlayZIndex = $derived(
+		chatState.size > 0 ? zIndexes.aiChat + 1 : zIndexes.disposables + 10
+	)
 </script>
 
-<svelte:window on:keydown={handleKeyDown} />
+<svelte:window onkeydown={handleKeyDown} />
 
 {#if isOpen}
 	<Portal name="always-mounted" {target}>
 		<div
-			class={'fixed top-0 bottom-0 left-0 right-0 transition-all z-[1110] overflow-auto bg-black bg-opacity-60 w-full h-full'}
+			class={'fixed top-0 bottom-0 left-0 right-0 transition-all overflow-auto bg-black bg-opacity-60 w-full h-full'}
+			style="z-index: {overlayZIndex}"
 			transition:fadeFast|local
 		>
 			<div class="flex min-h-full items-center justify-center p-8">
 				<div
-					style={`width: ${widthMap[fixedWidth]}; height: ${heightMap[fixedHeight]}; ${
-						css?.popup?.style || ''
-					}`}
+					style={`width: ${widthMap[fixedWidth]}; ${
+						heightMap[fixedHeight] ? `height: ${heightMap[fixedHeight]}; ` : ''
+					}${css?.popup?.style || ''}`}
 					class={twMerge(
-						'max-h-screen-80 max-w-screen-80 rounded-lg relative bg-surface p-4',
+						'max-h-screen-80 max-w-screen-80 rounded-lg relative bg-surface',
+						formStyling ? 'py-4 px-6' : 'p-4',
 						css?.popup?.class,
 						'wm-modal-form-popup'
 					)}
-					use:clickOutside
-					on:click_outside={() => {
-						close()
+					use:clickOutside={{
+						onClickOutside: () => closeOnOutsideClick && close()
 					}}
 				>
 					<List gap="md">
 						<div class="flex w-full">
 							<List horizontal justify="between">
-								<h3>{title}</h3>
+								<h3 class={formStyling ? 'font-semibold' : undefined}>{title}</h3>
 								<div class="grow w-min-0">
 									<List horizontal justify="between">
 										<div class="min-w-0 grow">
-											<slot name="header-left" />
+											{@render headerLeft?.()}
 										</div>
 										<div class="min-w-0 grow-0 justify-end">
 											<List horizontal justify="end">
-												<slot name="header-right" />
+												{@render headerRight?.()}
 												<div class="w-8">
 													<button
 														id="modal-close-button"
-														on:click={() => {
+														onclick={() => {
 															close()
 														}}
 														class="hover:bg-surface-hover rounded-full w-8 h-8 flex items-center justify-center transition-all"
@@ -107,13 +159,13 @@
 							</List>
 						</div>
 
-						<!-- svelte-ignore a11y-click-events-have-key-events -->
-						<!-- svelte-ignore a11y-no-static-element-interactions -->
+						<!-- svelte-ignore a11y_click_events_have_key_events -->
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div
 							class="w-full flex grow min-h-0 {contentClasses}"
-							on:click|stopPropagation={() => {}}
+							onclick={stopPropagation(() => {})}
 						>
-							<slot />
+							{@render children?.()}
 						</div>
 					</List>
 				</div>

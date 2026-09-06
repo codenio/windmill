@@ -70,8 +70,8 @@
 								.then(() => {
 									sendUserToast('Value updated')
 								})
-								.catch(() => {
-									sendUserToast('Error updating value', true)
+								.catch((e) => {
+									sendUserToast('Error updating value: ' + ((e as Error)?.message || e), true)
 									refresh?.()
 								})
 						}
@@ -115,8 +115,8 @@
 								refresh?.()
 								sendUserToast('Row deleted')
 							})
-							.catch(() => {
-								sendUserToast('Error deleting row', true)
+							.catch((e) => {
+								sendUserToast(`Error deleting row: ${e?.message ?? e}`, true)
 							})
 					}
 				})

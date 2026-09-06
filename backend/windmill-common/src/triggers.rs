@@ -1,101 +1,86 @@
 use lazy_static::lazy_static;
 use quick_cache::sync::Cache;
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use strum_macros::EnumIter;
 
-use crate::jobs::JobTriggerKind;
-
-#[derive(sqlx::Type, Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash, EnumIter)]
-#[sqlx(type_name = "TRIGGER_KIND", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum TriggerKind {
-    Webhook,
-    Http,
-    Websocket,
-    Kafka,
-    DefaultEmail,
-    Email,
-    Nats,
-    Mqtt,
-    Sqs,
-    Postgres,
-    Gcp,
-    Nextcloud,
-}
-
-impl TriggerKind {
-    pub fn to_key(&self) -> String {
-        match self {
-            TriggerKind::Webhook => "webhook".to_string(),
-            TriggerKind::Http => "http".to_string(),
-            TriggerKind::Websocket => "websocket".to_string(),
-            TriggerKind::Kafka => "kafka".to_string(),
-            TriggerKind::Email => "email".to_string(),
-            TriggerKind::DefaultEmail => "email".to_string(), // to the user we also show kind email for default email
-            TriggerKind::Nats => "nats".to_string(),
-            TriggerKind::Mqtt => "mqtt".to_string(),
-            TriggerKind::Sqs => "sqs".to_string(),
-            TriggerKind::Postgres => "postgres".to_string(),
-            TriggerKind::Gcp => "gcp".to_string(),
-            TriggerKind::Nextcloud => "nextcloud".to_string(),
-        }
-    }
-}
-
-impl fmt::Display for TriggerKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            TriggerKind::Webhook => "webhook",
-            TriggerKind::Http => "http",
-            TriggerKind::Websocket => "websocket",
-            TriggerKind::Kafka => "kafka",
-            TriggerKind::Email => "email",
-            TriggerKind::DefaultEmail => "default_email",
-            TriggerKind::Nats => "nats",
-            TriggerKind::Mqtt => "mqtt",
-            TriggerKind::Sqs => "sqs",
-            TriggerKind::Postgres => "postgres",
-            TriggerKind::Gcp => "gcp",
-            TriggerKind::Nextcloud => "nextcloud",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-#[derive(Eq, PartialEq, Hash)]
-pub enum HubOrWorkspaceId {
-    Hub,
-    WorkspaceId(String),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Copy)]
-pub struct RunnableFormat {
-    pub version: RunnableFormatVersion,
-    pub has_preprocessor: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Copy)]
-pub enum RunnableFormatVersion {
-    V1,
-    V2,
-}
-
-pub type RunnableFormatCacheKey = (HubOrWorkspaceId, i64, TriggerKind);
+pub use windmill_types::triggers::*;
 
 lazy_static! {
     pub static ref RUNNABLE_FORMAT_VERSION_CACHE: Cache<RunnableFormatCacheKey, RunnableFormat> =
         Cache::new(1000);
 }
 
+/// Marks a moved trigger as not yet re-pointed at its new path.
+///
+/// Written in the same statement that moves the row, so it is committed before the rename returns.
+/// Re-pointing the webhook happens afterwards and off the request, and its outcome — success or
+/// failure — replaces this. Anything that stops it getting that far, a shutdown included, leaves
+/// the trigger visibly unfinished rather than quietly pointing at a path nothing serves.
+pub const REREGISTRATION_PENDING: &str =
+    "The runnable was renamed and the webhook registered on the service has not been re-pointed at \
+     it yet. If this persists, save the trigger again.";
+
+/// A `native_trigger` row carried onto the new path by a rename. The webhook registered on
+/// the external service embeds the runnable path, so each of these still has to be
+/// re-registered — see `windmill_native_triggers::rename`.
 #[derive(Debug, Clone)]
-pub struct TriggerMetadata {
-    pub trigger_path: Option<String>,
-    pub trigger_kind: JobTriggerKind,
+pub struct MovedNativeTrigger {
+    pub service_name: String,
+    pub external_id: String,
+    /// Where this rename put the trigger. Re-registration mints a `jobs:run:*` token for the
+    /// runnable it finds, so it must confirm the row still names this one: anything that moved it
+    /// afterwards was authorized separately, and its choice is not this rename's to overwrite.
+    pub script_path: String,
+    pub is_flow: bool,
 }
 
-impl TriggerMetadata {
-    pub fn new(trigger_path: Option<String>, trigger_kind: JobTriggerKind) -> TriggerMetadata {
-        TriggerMetadata { trigger_path, trigger_kind }
-    }
+/// Update `script_path` across all trigger tables when a runnable (script or flow) is renamed.
+/// For long-running triggers (with `server_id`), also resets `server_id = NULL` to force
+/// the heartbeat-based restart mechanism to pick up the new config.
+///
+/// Returns the `native_trigger` rows that moved.
+pub async fn update_triggers_script_path(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    new_path: &str,
+    old_path: &str,
+    w_id: &str,
+    is_flow: bool,
+) -> Result<Vec<MovedNativeTrigger>, sqlx::Error> {
+    // Triggers without server_id (request/response or webhook-based).
+    // `native_trigger` rows are only listed when a runnable still exists at `script_path`,
+    // so a row left behind on the old path is invisible in the UI and unrecoverable.
+    let moved_native_triggers = sqlx::query_as!(
+        MovedNativeTrigger,
+        "WITH \
+         t1 AS (UPDATE http_trigger SET script_path = $1 WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t2 AS (UPDATE email_trigger SET script_path = $1 WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4) \
+         UPDATE native_trigger SET script_path = $1, updated_at = NOW(), error = $5 WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4 \
+         RETURNING service_name::text AS \"service_name!\", external_id, script_path, is_flow",
+        new_path,
+        old_path,
+        w_id,
+        is_flow,
+        REREGISTRATION_PENDING,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    // Triggers with server_id (long-running listeners, reset server_id to force restart)
+    sqlx::query!(
+        "WITH \
+         t1 AS (UPDATE websocket_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t2 AS (UPDATE kafka_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t3 AS (UPDATE postgres_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t4 AS (UPDATE mqtt_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t5 AS (UPDATE nats_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t6 AS (UPDATE sqs_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4), \
+         t7 AS (UPDATE amqp_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4) \
+         UPDATE gcp_trigger SET script_path = $1, server_id = NULL WHERE script_path = $2 AND workspace_id = $3 AND is_flow = $4",
+        new_path,
+        old_path,
+        w_id,
+        is_flow,
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(moved_native_triggers)
 }

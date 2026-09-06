@@ -3,10 +3,12 @@
 	import CollapseLink from './CollapseLink.svelte'
 	import IconedResourceType from './IconedResourceType.svelte'
 	import Toggle from './Toggle.svelte'
-	import { onMount, untrack } from 'svelte'
+	import { untrack } from 'svelte'
 	import { enterpriseLicense } from '$lib/stores'
 	import Button from './common/button/Button.svelte'
 	import TextInput from './text_input/TextInput.svelte'
+	import Password from './Password.svelte'
+	import SettingCard from './instanceSettings/SettingCard.svelte'
 
 	interface Props {
 		name: string
@@ -17,61 +19,65 @@
 
 	let { name, value = $bindable(), login = true, eeOnly = false }: Props = $props()
 
-	let tenant: string = $state('')
+	// For Microsoft SSO, tenant is embedded in the login_config URLs, so we need
+	// a local state + bidirectional sync. For Teams, we bind directly to
+	// value['tenant'] in the template — no intermediate state, no effect loops.
+	let microsoftTenant: string = $state('')
 
-	onMount(() => {
-		try {
-			if (
-				name == 'microsoft' &&
-				value &&
-				value['login_config'] &&
-				typeof value['login_config']['auth_url'] == 'string'
-			) {
-				tenant = value['login_config']['auth_url'].split('/')[3]
+	// Sync microsoftTenant from value.login_config whenever value changes.
+	// Uses untrack for the write to avoid circular dependencies with the
+	// push effect below. Loop termination is guaranteed because
+	// URL.split('/')[3] of a URL we constructed with tenant X always yields X.
+	$effect(() => {
+		const v = value
+		untrack(() => {
+			try {
+				if (!v) {
+					if (microsoftTenant !== '') microsoftTenant = ''
+					return
+				}
+				if (
+					name == 'microsoft' &&
+					v['login_config'] &&
+					typeof v['login_config']['auth_url'] == 'string'
+				) {
+					const urlTenant = v['login_config']['auth_url'].split('/')[3]
+					if (urlTenant !== microsoftTenant) {
+						microsoftTenant = urlTenant
+					}
+				}
+			} catch (e) {
+				console.error('Could not set tenantId', e)
 			}
-			if (name === 'teams' && value?.tenant) {
-				tenant = value.tenant
-			}
-		} catch (e) {
-			console.error('Could not set tenantId', e)
-		}
+		})
 	})
 
-	function changeTenantId(tenant: string) {
-		if (value && tenant) {
-			if (tenant != '') {
-				if (name === 'teams') {
-					value = {
-						...value,
-						tenant
-					}
-				} else {
+	// Push microsoftTenant edits back into value.login_config URLs.
+	$effect(() => {
+		microsoftTenant
+		if (name === 'microsoft') {
+			untrack(() => {
+				if (!value) return
+				if (microsoftTenant !== '') {
 					value = {
 						...value,
 						login_config: {
-							auth_url: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`,
-							token_url: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,
+							auth_url: `https://login.microsoftonline.com/${microsoftTenant}/oauth2/v2.0/authorize`,
+							token_url: `https://login.microsoftonline.com/${microsoftTenant}/oauth2/v2.0/token`,
 							userinfo_url: `https://graph.microsoft.com/oidc/userinfo`,
 							scopes: ['openid', 'profile', 'email']
 						}
 					}
+				} else {
+					if (value['login_config']) {
+						delete value['login_config']
+					}
 				}
-			} else {
-				if (value['login_config']) {
-					delete value['login_config']
-				}
-			}
-		}
-	}
-
-	let enabled = $derived(value != undefined && !(eeOnly && !$enterpriseLicense))
-
-	$effect(() => {
-		tenant
-		if (name == 'microsoft' || name == 'teams') {
-			untrack(() => changeTenantId(tenant))
+			})
 		}
 	})
+
+	let enabled = $derived(value != undefined && !(eeOnly && !$enterpriseLicense))
 </script>
 
 <div class="flex flex-col gap-2">
@@ -84,7 +90,7 @@
 			disabled={eeOnly && !$enterpriseLicense}
 			on:change={(e) => {
 				if (e.detail) {
-					if (name === 'teams' || name === 'microsoft') {
+					if (name === 'teams') {
 						value = { id: '', secret: '', tenant: '' }
 					} else {
 						value = { id: '', secret: '' }
@@ -99,7 +105,7 @@
 		{/if}
 	</label>
 	{#if enabled}
-		<div class="p-4 rounded border mb-4 flex flex-col gap-6">
+		<SettingCard class="mb-4 flex flex-col gap-6">
 			{#if name != 'slack' && name != 'teams'}
 				<label class="flex flex-col gap-1">
 					<span class="text-emphasis font-semibold text-xs">Custom Name</span>
@@ -116,17 +122,28 @@
 					bind:value={value['id']}
 				/>
 			</label>
-			<label class="flex flex-col gap-1">
+			<label for="{name}_client_secret" class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs">Client Secret</span>
-				<TextInput
-					inputProps={{ type: 'text', placeholder: 'Client Secret' }}
-					bind:value={value['secret']}
+				<Password
+					id="{name}_client_secret"
+					placeholder="Client Secret"
+					bind:password={value['secret']}
 				/>
 			</label>
 			{#if name == 'microsoft' || name == 'teams'}
 				<label class="flex flex-col gap-1">
 					<span class="text-emphasis font-semibold text-xs">Tenant Id</span>
-					<TextInput inputProps={{ type: 'text', placeholder: 'Tenant Id' }} bind:value={tenant} />
+					{#if name === 'teams'}
+						<TextInput
+							inputProps={{ type: 'text', placeholder: 'Tenant Id' }}
+							bind:value={value['tenant']}
+						/>
+					{:else}
+						<TextInput
+							inputProps={{ type: 'text', placeholder: 'Tenant Id' }}
+							bind:value={microsoftTenant}
+						/>
+					{/if}
 				</label>
 			{:else if login}
 				<label class="flex flex-col gap-1">
@@ -175,7 +192,7 @@
 			{/if}
 			{#if name == 'google'}
 				<CollapseLink text="Instructions">
-					<div class="helper">
+					<div class="text-xs text-primary rounded-md">
 						Create a new OAuth 2.0 Client <a
 							href="https://console.cloud.google.com/apis/credentials"
 							target="_blank">in Google console</a
@@ -186,7 +203,7 @@
 				</CollapseLink>
 			{:else if name == 'slack'}
 				<CollapseLink text="Set up slack">
-					<div class="helper">
+					<div class="text-xs text-primary rounded-md">
 						To use Slack OAuth, create a new Slack app <a
 							href="https://api.slack.com/apps?new_app=1"
 							target="_blank"
@@ -265,7 +282,7 @@
 				</CollapseLink>
 			{:else if name == 'teams'}
 				<CollapseLink text="Instructions">
-					<div class="helper">
+					<div class="text-xs text-primary rounded-md">
 						Follow this guide on <a
 							href="https://www.windmill.dev/docs/misc/setup_oauth#microsoft-teams"
 							target="_blank">Windmill Docs</a
@@ -274,12 +291,6 @@
 					</div>
 				</CollapseLink>
 			{/if}
-		</div>
+		</SettingCard>
 	{/if}
 </div>
-
-<style>
-	.helper {
-		@apply text-xs text-primary rounded-md;
-	}
-</style>

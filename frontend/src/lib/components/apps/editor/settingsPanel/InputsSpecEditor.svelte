@@ -55,7 +55,6 @@
 		recomputeOnInputChanged?: boolean
 		showOnDemandOnlyToggle?: boolean
 		documentationLink?: string | undefined
-		markdownTooltip?: string | undefined
 		securedContext?: boolean
 		disabled?: boolean
 	}
@@ -86,7 +85,6 @@
 		recomputeOnInputChanged = true,
 		showOnDemandOnlyToggle = true,
 		documentationLink = undefined,
-		markdownTooltip = undefined,
 		securedContext = false
 	}: Props = $props()
 
@@ -174,9 +172,9 @@
 					{#if loading}
 						<Loader2 size={14} class="animate-spin ml-2" />
 					{/if}
-					{#if tooltip || markdownTooltip}
-						<Tooltip small {documentationLink} {markdownTooltip}>
-							{tooltip}
+					{#if tooltip}
+						<Tooltip small {documentationLink}>
+							{@html tooltip}
 						</Tooltip>
 					{/if}
 				</div>
@@ -361,6 +359,7 @@
 				}}
 				readOnlyMode={false}
 				regexFilter={/\.(png|jpg|jpeg|svg|webp)$/i}
+				lazyFolders={false}
 			/>
 		{:else if componentInput?.type === 'user'}
 			<span class="text-2xs italic text-primary">Field's value is set by the user</span>

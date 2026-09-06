@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { setContext } from 'svelte'
+	import { setContext, untrack } from 'svelte'
 	import { writable } from 'svelte/store'
 	import { createEventDispatcher } from 'svelte'
 	import { twMerge } from 'tailwind-merge'
+	import ScrollableX from '../ScrollableX.svelte'
 	import type { TabsContext } from '$lib/components/apps/editor/settingsPanel/inputEditor/tabs.svelte'
 
 	const dispatch = createEventDispatcher<{ selected: string }>()
@@ -52,7 +53,7 @@
 	setContext<TabsContext>('Tabs', {
 		selected: selectedStore,
 		update,
-		hashNavigation
+		hashNavigation: untrack(() => hashNavigation)
 	})
 
 	// Sync external prop changes to store (single direction: prop → store)
@@ -75,10 +76,12 @@
 
 <svelte:window onhashchange={hashChange} />
 {#if !hideTabs}
-	<div class="overflow-x-auto {wrapperClass}">
+	<ScrollableX class={wrapperClass}>
+		<!-- `scrollbar-hidden` is inert on this non-scrolling row (ScrollableX owns the
+			 scroll), but TroubleshootFlowTutorial targets it as a selector hook — keep it. -->
 		<div class={twMerge('border-b flex flex-row whitespace-nowrap scrollbar-hidden', c)} {style}>
 			{@render children?.({ selected })}
 		</div>
-	</div>
+	</ScrollableX>
 {/if}
 {@render content?.()}

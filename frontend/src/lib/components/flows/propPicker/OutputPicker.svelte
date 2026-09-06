@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Popover from '$lib/components/meltComponents/Popover.svelte'
+	import { overlayPortalTarget } from '$lib/components/common/overlayHost.svelte'
 	import { twMerge } from 'tailwind-merge'
 	import { getContext, onMount } from 'svelte'
 	import type { PropPickerContext } from '$lib/components/prop_picker'
@@ -40,6 +41,9 @@
 		onEditInput
 	}: Props = $props()
 
+	// Sized and positioned against the graph pane, so that stays the fallback.
+	const portalTarget = overlayPortalTarget('#flow-graph-v2')
+
 	const context = getContext<PropPickerContext>('PropPickerContext')
 	const flowPropPickerConfig = context?.flowPropPickerConfig
 	const MIN_WIDTH = 375
@@ -50,9 +54,7 @@
 
 	const zoom = $derived.by(useSvelteFlow().getZoom)
 
-	let showConnecting = $derived(
-		isConnectingCandidate && $flowPropPickerConfig?.insertionMode === 'connect'
-	)
+	let showConnecting = $derived(isConnectingCandidate && $flowPropPickerConfig != undefined)
 
 	function selectConnection(value: string) {
 		if ($flowPropPickerConfig?.onSelect(value)) {
@@ -67,7 +69,7 @@
 	export function toggleOpen(forceOpen: boolean = false) {
 		if (popover?.isOpened() && !forceOpen) {
 			popover?.close()
-		} else {
+		} else if (!popover?.isOpened()) {
 			popover?.open()
 		}
 	}
@@ -114,6 +116,7 @@
 	})
 </script>
 
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	class="relative h-0 w-[275px] -z-10"
 	onpointerdown={(e) => {
@@ -160,7 +163,7 @@
 					class="flex-1 h-full"
 					bind:isOpen={inputOpen}
 					bind:this={inputPopover}
-					portal="#flow-graph-v2"
+					portal={portalTarget()}
 				>
 					{#snippet trigger({ isOpen })}
 						<Button
@@ -194,6 +197,7 @@
 					flip: false
 				}}
 				usePointerDownOutside
+				excludeSelectors={`[data-run-button="${id}"]`}
 				closeOnOutsideClick={false}
 				on:click={(e) => {
 					e.preventDefault()
@@ -207,7 +211,7 @@
 				closeOnOtherPopoverOpen
 				class="flex-1 h-full"
 				bind:isOpen={outputOpen}
-				portal="#flow-graph-v2"
+				portal={portalTarget()}
 			>
 				{#snippet trigger({ isOpen })}
 					<AnimatedButton

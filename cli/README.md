@@ -110,6 +110,40 @@ source <(wmill completions zsh)
 
 ## Development
 
+### AI Guidance Variants
+
+`wmill init` can now materialize alternate AI guidance bundles without changing
+the generated defaults in the repo, but this is exposed as internal env-var
+overrides rather than public CLI flags.
+
+Examples:
+
+```bash
+WMILL_INIT_AI_SKILLS_SOURCE=/path/to/custom/skills wmill init --use-default
+WMILL_INIT_AI_SKILLS_SOURCE=/path/to/custom/skills WMILL_INIT_AI_AGENTS_SOURCE=/path/to/AGENTS.md wmill init --use-default
+WMILL_INIT_AI_SKILLS_SOURCE=/path/to/custom/skills WMILL_INIT_AI_CLAUDE_SOURCE=/path/to/CLAUDE.md wmill init --use-default
+```
+
+This is the same guidance-writing path used by the benchmark CLI under
+`ai_evals/`, so the benchmark harness and `wmill init` now generate the same
+project guidance shape:
+
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.agents/skills/*`
+- `.claude/skills/*`
+
+### `windmill-yaml-validator`
+
+`wmill lint` imports the sibling `windmill-yaml-validator` package from source rather than
+from npm, so its schemas always match the OpenAPI specs of the current checkout. `bun
+install` regenerates them through this package's `preinstall` script; run it again after
+editing `openflow.openapi.yaml` or `backend/windmill-api/openapi.yaml`:
+
+```bash
+npm --prefix ../windmill-yaml-validator run gen
+```
+
 ### Running Tests
 
 **Prerequisites:**
@@ -119,13 +153,13 @@ source <(wmill completions zsh)
 **Run tests locally (full features):**
 
 ```bash
-deno test --allow-all --no-check
+bun test test/
 ```
 
 **Run tests in CI mode (minimal features, skips EE tests):**
 
 ```bash
-CI_MINIMAL_FEATURES=true deno test --allow-all --no-check
+CI_MINIMAL_FEATURES=true bun test test/
 ```
 
 | Variable | Description |

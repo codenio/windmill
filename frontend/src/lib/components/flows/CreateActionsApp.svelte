@@ -5,25 +5,32 @@
 	import { Button } from '$lib/components/common'
 	import Drawer from '$lib/components/common/drawer/Drawer.svelte'
 	import DrawerContent from '$lib/components/common/drawer/DrawerContent.svelte'
+	import Tabs from '$lib/components/common/tabs/Tabs.svelte'
+	import Tab from '$lib/components/common/tabs/Tab.svelte'
 	import Modal from '$lib/components/common/modal/Modal.svelte'
-	import { LayoutDashboard, Loader2, Plus, Code2, FlaskConical } from 'lucide-svelte'
+	import { LayoutDashboard, Loader2, Plus, Code2 } from 'lucide-svelte'
 	import { importStore } from '../apps/store'
-	import Badge from '$lib/components/common/badge/Badge.svelte'
-
 	import YAML from 'yaml'
 
 	let drawer: Drawer | undefined = undefined
 	let pendingRaw: string = $state('')
 
 	let importType: 'yaml' | 'json' = $state('yaml')
+	let appKind: 'lowcode' | 'fullcode' = $state('lowcode')
 
-	// Modal states
 	let appTypeModalOpen = $state(false)
-	let featurePreviewModalOpen = $state(false)
 
 	async function importRaw() {
-		$importStore = importType === 'yaml' ? YAML.parse(pendingRaw) : JSON.parse(pendingRaw)
-		await goto('/apps/add?nodraft=true')
+		const parsed = importType === 'yaml' ? YAML.parse(pendingRaw) : JSON.parse(pendingRaw)
+		if (appKind === 'fullcode') {
+			// Navigation to /apps_raw/add triggers a full page reload (for cross-origin isolation),
+			// so the in-memory importStore would be lost. Use sessionStorage instead.
+			sessionStorage.setItem('rawAppImport', JSON.stringify(parsed))
+			await goto('/apps_raw/add')
+		} else {
+			$importStore = parsed
+			await goto('/apps/add')
+		}
 		drawer?.closeDrawer?.()
 	}
 
@@ -33,17 +40,12 @@
 
 	function selectLowCode() {
 		appTypeModalOpen = false
-		goto(`${base}/apps/add?nodraft=true`)
+		goto(`${base}/apps/add`)
 	}
 
 	function selectFullCode() {
 		appTypeModalOpen = false
-		featurePreviewModalOpen = true
-	}
-
-	function confirmFullCode() {
-		featurePreviewModalOpen = false
-		goto(`${base}/apps_raw/add?nodraft=true`)
+		goto(`${base}/apps_raw/add`)
 	}
 </script>
 
@@ -60,17 +62,19 @@
 		variant="accent"
 		dropdownItems={[
 			{
-				label: 'Import low-code app from YAML',
+				label: 'Import low-code app',
 				onClick: () => {
-					drawer?.toggleDrawer?.()
+					appKind = 'lowcode'
 					importType = 'yaml'
+					drawer?.toggleDrawer?.()
 				}
 			},
 			{
-				label: 'Import low-code app from JSON',
+				label: 'Import full-code app',
 				onClick: () => {
+					appKind = 'fullcode'
+					importType = 'yaml'
 					drawer?.toggleDrawer?.()
-					importType = 'json'
 				}
 			}
 		]}
@@ -80,7 +84,7 @@
 </div>
 
 <!-- App Type Selection Modal -->
-<Modal bind:open={appTypeModalOpen} title="Choose your app builder">
+<Modal bind:open={appTypeModalOpen} title="Choose your app builder" class="sm:max-w-3xl">
 	<div class="flex flex-col gap-4 pr-4">
 		<div class="grid grid-cols-2 gap-8">
 			<!-- Low-code option -->
@@ -117,75 +121,42 @@
 					<h3 class="font-semibold text-primary">Full-code App</h3>
 					<p class="text-xs text-tertiary mt-1">
 						Build with React or Svelte with full control and a powerful AI agent.
+
+						<br /><br />
+						Better for complex apps or apps that require full flexibility and control.
 					</p>
-				</div>
-				<br /><br />
-				<div class="flex flex-row items-center gap-2">
-					<Badge color="yellow">
-						<FlaskConical size={12} class="mr-1" />
-						Preview (unstable)
-					</Badge>
 				</div>
 			</button>
 		</div>
 	</div>
 </Modal>
 
-<!-- Feature Preview Warning Modal -->
-<Modal kind="X" bind:open={featurePreviewModalOpen} title="Feature Preview Notice">
-	<div class="flex flex-col gap-4">
-		<div
-			class="flex items-start gap-3 p-4 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800"
-		>
-			<FlaskConical size={24} class="text-yellow-600 dark:text-yellow-400 shrink-0 mt-0.5" />
-			<div class="text-sm text-yellow-800 dark:text-yellow-200">
-				<p class="font-semibold mb-2">Full-code Apps are in Feature Preview</p>
-				<p>
-					This feature is not yet stable and may change significantly before it reaches General
-					Availability (GA), which is expected in <strong>January 2026</strong>.
-				</p>
-				<ul class="list-disc list-inside mt-2 space-y-1 text-yellow-700 dark:text-yellow-300">
-					<li>APIs and interfaces may change without notice</li>
-					<li>Some functionality may be incomplete or buggy</li>
-					<li>Not recommended for production use yet</li>
-				</ul>
-			</div>
-		</div>
-
-		<div class="flex justify-end gap-3 pt-2">
-			<Button
-				variant="default"
-				unifiedSize="md"
-				onClick={() => {
-					featurePreviewModalOpen = false
-					appTypeModalOpen = true
-				}}
-			>
-				Go back
-			</Button>
-			<Button unifiedSize="md" variant="accent" on:click={confirmFullCode}
-				>I understand, continue</Button
-			>
-		</div>
-	</div>
-</Modal>
-
-<!-- Raw JSON -->
+<!-- Import Drawer -->
 <Drawer bind:this={drawer} size="800px">
 	<DrawerContent
-		title={'Import low-code app from ' + (importType === 'yaml' ? 'YAML' : 'JSON')}
+		title={appKind === 'fullcode' ? 'Import full-code app' : 'Import low-code app'}
 		on:close={() => drawer?.toggleDrawer?.()}
 	>
-		{#await import('$lib/components/SimpleEditor.svelte')}
-			<Loader2 class="animate-spin" />
-		{:then Module}
-			<Module.default
-				bind:code={pendingRaw}
-				lang={importType}
-				class="h-full"
-				fixedOverflowWidgets={false}
-			/>
-		{/await}
+		<Tabs bind:selected={importType}>
+			<Tab value="yaml" label="YAML" />
+			<Tab value="json" label="JSON" />
+			{#snippet content()}
+				<div class="relative pt-2 h-full">
+					{#key importType}
+						{#await import('$lib/components/SimpleEditor.svelte')}
+							<Loader2 class="animate-spin" />
+						{:then Module}
+							<Module.default
+								bind:code={pendingRaw}
+								lang={importType}
+								class="h-full"
+								fixedOverflowWidgets={false}
+							/>
+						{/await}
+					{/key}
+				</div>
+			{/snippet}
+		</Tabs>
 		{#snippet actions()}
 			<Button size="sm" on:click={importRaw}>Import</Button>
 		{/snippet}

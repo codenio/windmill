@@ -2,8 +2,9 @@ use sqlx::{Pool, Postgres};
 use tokio_stream::StreamExt;
 
 use windmill_api_client::types::NewScript;
-mod common;
-use common::{in_test_worker, init_client, listen_for_completed_jobs, ApiServer};
+use windmill_test_utils::{
+    in_test_worker, init_client, listen_for_completed_jobs, rebuild_dmap, ApiServer,
+};
 
 mod dependency_map {
     use super::*;
@@ -15,6 +16,7 @@ mod dependency_map {
         parent_hash: Option<String>,
     ) -> NewScript {
         NewScript {
+            draft_only: None,
             content: content.into(),
             language,
             lock,
@@ -25,7 +27,6 @@ mod dependency_map {
             cache_ttl: None,
             dedicated_worker: None,
             description: "".to_string(),
-            draft_only: None,
             envs: vec![],
             is_template: None,
             kind: None,
@@ -34,17 +35,18 @@ mod dependency_map {
             schema: std::collections::HashMap::new(),
             ws_error_handler_muted: Some(false),
             priority: None,
-            delete_after_use: None,
+            delete_after_secs: None,
             timeout: None,
             restart_unless_cancelled: None,
             deployment_message: None,
             concurrency_key: None,
             visible_to_runner_only: None,
-            no_main_func: None,
+            auto_kind: None,
             codebase: None,
             has_preprocessor: None,
             on_behalf_of_email: None,
             assets: vec![],
+            modules: None,
         }
     }
     async fn init(db: Pool<Postgres>) -> (windmill_api_client::Client, u16, ApiServer) {
@@ -170,7 +172,7 @@ mod dependency_map {
         let (client, _port, _s) = init(db.clone()).await;
         assert_dmap(&db, None, CORRECT_DMAP.clone()).await;
         // rebuild map
-        assert!(common::rebuild_dmap(&client).await);
+        assert!(rebuild_dmap(&client).await);
         assert_dmap(&db, None, CORRECT_DMAP.clone()).await;
         Ok(())
     }
@@ -183,7 +185,7 @@ mod dependency_map {
         // Spawn first rebuild
         let handle = {
             let client = client.clone();
-            tokio::spawn(async move { common::rebuild_dmap(&client).await })
+            tokio::spawn(async move { rebuild_dmap(&client).await })
         };
 
         // Immidiately spawn another
@@ -439,14 +441,17 @@ def main():
                     .unwrap(),
                 ),
                 schema: None,
-                draft_only: None,
                 tag: None,
                 dedicated_worker: None,
                 timeout: None,
                 deployment_message: None,
                 visible_to_runner_only: None,
                 on_behalf_of_email: None,
+                on_behalf_of: None,
+                preserve_on_behalf_of: None,
                 ws_error_handler_muted: None,
+                labels: None,
+                skip_draft_deletion: None,
             })
             .send()
             .await
@@ -507,6 +512,10 @@ def main():
                 policy: None,
                 deployment_message: None,
                 custom_path: None,
+                preserve_on_behalf_of: None,
+                labels: None,
+                skip_draft_deletion: None,
+                allow_kind_change: None,
             })
             .send()
             .await

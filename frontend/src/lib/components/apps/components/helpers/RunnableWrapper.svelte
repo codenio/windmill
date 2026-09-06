@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { getContext, onMount } from 'svelte'
+	import { getContext, onMount, untrack } from 'svelte'
 	import type { AppInput } from '../../inputType'
 	import type { Output } from '../../rx'
 	import type { AppViewerContext, ListContext } from '../../types'
-	import { isScriptByNameDefined, isScriptByPathDefined } from '../../utils'
+	import { appNavigateSameWindow, isScriptByNameDefined, isScriptByPathDefined } from '../../utils'
 	import NonRunnableComponent from './NonRunnableComponent.svelte'
 	import RunnableComponent from './RunnableComponent.svelte'
 	import { sendUserToast } from '$lib/toast'
@@ -161,7 +161,7 @@
 		}
 	})
 
-	const fullId = id + (extraKey ?? '')
+	const fullId = untrack(() => id) + (untrack(() => extraKey) ?? '')
 	if (!(initializing && componentInput?.type === 'runnable' && isRunnableDefined(componentInput))) {
 		initializing = false
 	} else {
@@ -261,7 +261,9 @@
 				if (newTab) {
 					window.open(gotoUrl, '_blank')
 				} else {
-					window.location.href = gotoUrl
+					// Top-level load; inside the opaque viewer iframe this targets the
+					// top page (pre-sandbox behavior) instead of the cookieless frame.
+					appNavigateSameWindow(gotoUrl)
 				}
 
 				break

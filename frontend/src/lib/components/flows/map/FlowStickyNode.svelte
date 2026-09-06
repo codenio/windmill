@@ -9,6 +9,9 @@
 	import Popover from '$lib/components/Popover.svelte'
 	import Button from '$lib/components/common/button/Button.svelte'
 	import { AIBtnClasses } from '$lib/components/copilot/chat/AIButtonStyle'
+	import OpenInSessionButton, {
+		type OpenInSessionSource
+	} from '$lib/components/sessions/OpenInSessionButton.svelte'
 
 	interface Props {
 		disableSettings?: boolean
@@ -17,10 +20,12 @@
 		aiChatOpen?: boolean
 		showFlowAiButton?: boolean
 		toggleAiChat?: () => void
+		sessionOpen?: OpenInSessionSource
 		noteMode?: boolean
 		toggleNoteMode?: () => void
 		disableAi?: boolean
 		diffManager?: FlowDiffManager
+		compact?: boolean
 	}
 
 	let {
@@ -30,10 +35,12 @@
 		aiChatOpen,
 		showFlowAiButton,
 		toggleAiChat,
+		sessionOpen,
 		noteMode,
 		toggleNoteMode,
 		disableAi,
-		diffManager
+		diffManager,
+		compact = false
 	}: Props = $props()
 
 	const { selectionManager, flowStore } = getContext<FlowEditorContext>('FlowEditorContext')
@@ -42,23 +49,37 @@
 
 <div class="flex flex-row gap-2 p-1 rounded-md bg-surface">
 	{#if !disableSettings}
-		<Button
-			unifiedSize="sm"
-			wrapperClasses="min-w-36"
-			startIcon={{ icon: Settings }}
-			selected={selectedId?.startsWith('settings')}
-			variant="default"
-			title="Settings"
-			onClick={() => selectionManager.selectId('settings')}
-		>
-			Settings
-			{#if flowStore.val.value.same_worker}
-				<Badge color="blue" wrapperClass="max-h-[18px]">./shared</Badge>
-			{/if}
-		</Button>
+		<Popover>
+			<Button
+				unifiedSize="sm"
+				wrapperClasses={compact ? undefined : 'min-w-36'}
+				startIcon={{ icon: Settings }}
+				selected={selectedId?.startsWith('settings')}
+				variant="default"
+				title="Settings"
+				iconOnly={compact && !flowStore.val.value.same_worker}
+				onClick={() => selectionManager.selectId('settings')}
+			>
+				{#if !compact}
+					Settings
+				{/if}
+				{#if flowStore.val.value.same_worker}
+					<Badge color="blue" wrapperClass="max-h-[18px]">./shared</Badge>
+				{/if}
+			</Button>
+			{#snippet text()}
+				Settings
+			{/snippet}
+		</Popover>
 	{/if}
 	<Popover>
-		<FlowErrorHandlerItem {disableAi} small={smallErrorHandler} {diffManager} on:generateStep />
+		<FlowErrorHandlerItem
+			{disableAi}
+			small={smallErrorHandler}
+			{compact}
+			{diffManager}
+			on:generateStep
+		/>
 		{#snippet text()}
 			Error Handler
 		{/snippet}
@@ -80,17 +101,17 @@
 		</Popover>
 	{/if}
 	{#if showFlowAiButton}
-		<Popover>
-			<AIButton
-				togglePanel={() => {
-					toggleAiChat?.()
-				}}
-				btnClasses={AIBtnClasses(aiChatOpen ? 'selected' : 'default')}
-			/>
-			{#snippet text()}
-				Flow AI Chat
+		<OpenInSessionButton source={sessionOpen}>
+			{#snippet fallback()}
+				<AIButton
+					label="Open AI chat"
+					togglePanel={() => {
+						toggleAiChat?.()
+					}}
+					btnClasses={AIBtnClasses(aiChatOpen ? 'selected' : 'default')}
+				/>
 			{/snippet}
-		</Popover>
+		</OpenInSessionButton>
 	{/if}
 	<Popover>
 		<Button

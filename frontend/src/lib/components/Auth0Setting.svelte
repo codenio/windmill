@@ -7,6 +7,8 @@
 	import ToggleButton from './common/toggleButton-v2/ToggleButton.svelte'
 	import ToggleButtonGroup from './common/toggleButton-v2/ToggleButtonGroup.svelte'
 	import TextInput from './text_input/TextInput.svelte'
+	import Password from './Password.svelte'
+	import SettingCard from './instanceSettings/SettingCard.svelte'
 
 	interface Props {
 		value: any
@@ -58,7 +60,7 @@
 		/></label
 	>
 	{#if enabled}
-		<div class="p-4 rounded-md border flex flex-col gap-6">
+		<SettingCard class="flex flex-col gap-6">
 			<label>
 				<div class="flex gap-2 items-start">
 					<div>
@@ -88,6 +90,7 @@
 				<TextInput
 					inputProps={{ type: 'text', placeholder: 'Custom Name' }}
 					bind:value={value['display_name']}
+					class="max-w-lg"
 				/>
 			</label>
 			<label class="flex flex-col gap-1">
@@ -98,15 +101,18 @@
 				<TextInput
 					inputProps={{ type: 'text', placeholder: 'Client Id' }}
 					bind:value={value['id']}
+					class="max-w-lg"
 				/>
 			</label>
-			<label class="flex flex-col gap-1">
+			<label for="auth0_client_secret" class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs"
 					>Client Secret <Tooltip>Client Secret of the auth0 service configuration</Tooltip></span
 				>
-				<TextInput
-					inputProps={{ type: 'text', placeholder: 'Client Secret' }}
-					bind:value={value['secret']}
+				<Password
+					id="auth0_client_secret"
+					small
+					placeholder="Client Secret"
+					bind:password={value['secret']}
 				/>
 			</label>
 			<CollapseLink text="Instructions">
@@ -158,6 +164,6 @@
 					</div>
 				</div>
 			</CollapseLink>
-		</div>
+		</SettingCard>
 	{/if}
 </div>

@@ -26,6 +26,10 @@ export function formatAsset(asset: Asset): string {
 			return `ducklake://${asset.path}`
 		case 'datatable':
 			return `datatable://${asset.path}`
+		case 'volume':
+			return `volume://${asset.path}`
+		case 'dbt':
+			return `dbt://${asset.path}`
 	}
 	return 'unknown'
 }
@@ -89,6 +93,14 @@ export function formatAssetKind(asset: {
 			return 'Ducklake'
 		case 'datatable':
 			return 'Data table'
+		case 'volume':
+			return 'Volume'
+		case 'dbt':
+			// The SCHEME says dbt because dbt is the only thing that creates one;
+			// the PATH stays the relation, so a mart one project builds and the
+			// `source` the next reads land on one node — their dbt `unique_id`s
+			// differ where the relation does not (docs/dbt-runtime.md, decision 11).
+			return 'dbt table'
 	}
 }
 
@@ -106,6 +118,27 @@ export function formatAssetAccessType(accessType: AssetUsageAccessType | undefin
 export function getAccessType(asset: AssetWithAltAccessType): AssetUsageAccessType | undefined {
 	if (asset.access_type) return asset.access_type
 	if (asset.alt_access_type) return asset.alt_access_type
+}
+
+function refsByAccess(
+	assets: AssetWithAltAccessType[],
+	match: (at: AssetUsageAccessType | undefined) => boolean
+): Array<{ kind: AssetKind; path: string }> {
+	return assets.filter((a) => match(getAccessType(a))).map((a) => ({ kind: a.kind, path: a.path }))
+}
+
+/** Write/rw assets reduced to their `{ kind, path }` identity. */
+export function extractWrites(
+	assets: AssetWithAltAccessType[]
+): Array<{ kind: AssetKind; path: string }> {
+	return refsByAccess(assets, (at) => at === 'w' || at === 'rw')
+}
+
+/** Read/rw assets reduced to their `{ kind, path }` identity. */
+export function extractReads(
+	assets: AssetWithAltAccessType[]
+): Array<{ kind: AssetKind; path: string }> {
+	return refsByAccess(assets, (at) => at === 'r' || at === 'rw')
 }
 
 export function getFlowModuleAssets(

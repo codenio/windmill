@@ -1,10 +1,17 @@
 <script lang="ts">
 	import { Alert, Button } from '$lib/components/common'
+	import {
+		clearPageDrawerAnchor,
+		setPageDrawerAnchor
+	} from '$lib/components/sessions/pageDrawerSession'
+	import { TRIGGER_PAGES } from '$lib/components/sessions/previewPaths'
 	import Drawer from '$lib/components/common/drawer/Drawer.svelte'
 	import DrawerContent from '$lib/components/common/drawer/DrawerContent.svelte'
 	import Path from '$lib/components/Path.svelte'
 	import { usedTriggerKinds, userStore, workspaceStore } from '$lib/stores'
+	import { getTriggerWorkspace } from '$lib/components/triggers/triggerWorkspace'
 	import { canWrite, capitalize, emptyString, sendUserToast } from '$lib/utils'
+	import { withForkConflictRetry } from '$lib/utils/forkConflict'
 	import { Loader2 } from 'lucide-svelte'
 	import Label from '$lib/components/Label.svelte'
 	import {
@@ -17,20 +24,23 @@
 		type TriggerMode
 	} from '$lib/gen'
 	import Section from '$lib/components/Section.svelte'
-	import ScriptPicker from '$lib/components/ScriptPicker.svelte'
-	import Required from '$lib/components/Required.svelte'
+	import TriggerRunnablePicker from '$lib/components/triggers/TriggerRunnablePicker.svelte'
 	import GcpTriggerEditorConfigSection from './GcpTriggerEditorConfigSection.svelte'
 	import { untrack, type Snippet } from 'svelte'
 	import TriggerEditorToolbar from '../TriggerEditorToolbar.svelte'
+	import PermissionedAsLine from '../PermissionedAsLine.svelte'
 	import { saveGcpTriggerFromCfg } from './utils'
 	import { getHandlerType, handleConfigChange, type Trigger } from '../utils'
 	import { deepEqual } from 'fast-equals'
+	import { useTriggerDraftSync } from '../useTriggerDraftSync.svelte'
+	import LocalDraftBanner from '$lib/components/LocalDraftBanner.svelte'
 	import TriggerSuspendedJobsAlert from '../TriggerSuspendedJobsAlert.svelte'
 	import TriggerSuspendedJobsModal from '../TriggerSuspendedJobsModal.svelte'
 	import { base } from '$lib/base'
 	import Tabs from '$lib/components/common/tabs/Tabs.svelte'
 	import Tab from '$lib/components/common/tabs/Tab.svelte'
 	import TriggerRetriesAndErrorHandler from '../TriggerRetriesAndErrorHandler.svelte'
+	import TriggerAdvancedBadges from '../TriggerAdvancedBadges.svelte'
 	import Subsection from '$lib/components/Subsection.svelte'
 	import Toggle from '$lib/components/Toggle.svelte'
 
@@ -49,13 +59,20 @@
 	let can_write = $state(true)
 	let drawerLoading = $state(true)
 	let topic_id: string = $state('')
-	let gcp_resource_path: string = $state('')
+	let gcp_resource_path: string | undefined = $state('')
+	// `undefined` rather than `''` is what marks application default credentials, and the two
+	// survive a round trip through the deployed config and the draft as `null` vs `''`.
+	let use_default_credentials = $state(false)
+	let project_id: string | undefined = $state(undefined)
 	let subscription_id: string = $state('')
 	let isValid = $state(false)
 	let delivery_config: PushConfig | undefined = $state(undefined)
 	let subscription_mode: SubscriptionMode = $state('create_update')
 	let initialConfig: Record<string, any> | undefined = undefined
 	let deploymentLoading = $state(false)
+	let permissionedAs = $state<string | undefined>(undefined)
+	let selectedPermissionedAs = $state<string | undefined>(undefined)
+	let preservePermissionedAs = $state(false)
 	let base_endpoint = $derived(`${window.location.origin}${base}`)
 	let auto_acknowledge_msg = $state(true)
 	let ack_deadline: number | undefined = $state()
@@ -66,6 +83,11 @@
 	let retry: Retry | undefined = $state()
 	let suspendedJobsModal = $state<TriggerSuspendedJobsModal | null>(null)
 	let originalConfig = $state<Record<string, any> | undefined>(undefined)
+	/** The credential mode the config was loaded in, as opposed to the one currently selected in
+	 * the form. A non-admin may keep a trigger that already uses the instance's credentials, but
+	 * may not move one onto them, so the permission has to key off this rather than the live mode.
+	 * Set at load rather than derived from the deployed row, so a draft-only trigger counts too. */
+	let loadedUsesDefaultCredentials = $state(false)
 	let {
 		useDrawer = true,
 		description = undefined,
@@ -99,35 +121,56 @@
 		onReset?: () => void
 		cloudDisabled?: boolean
 	} = $props()
+	const triggerWs = getTriggerWorkspace()
+	const wsId = $derived(triggerWs?.() ?? $workspaceStore)
 
 	let hasChanged = $derived(!deepEqual(getGcpConfig(), originalConfig ?? {}))
 	const gcpConfig = $derived.by(getGcpConfig)
+
+	const draftSync = useTriggerDraftSync({
+		itemKind: 'trigger_gcp',
+		path: () => initialPath,
+		workspace: () => wsId,
+		drawerLoading: () => drawerLoading,
+		getCfg: () => gcpConfig,
+		applyCfg: loadTriggerConfig,
+		deployed: () => originalConfig
+	})
 	const saveDisabled = $derived(
 		pathError != '' || emptyString(script_path) || !isValid || !can_write || !hasChanged
 	)
-	const captureConfig = $derived.by(isEditor ? getGcpCaptureConfig : () => ({}))
+	const captureConfig = $derived.by(untrack(() => isEditor) ? getGcpCaptureConfig : () => ({}))
 
 	export async function openEdit(
 		ePath: string,
 		isFlow: boolean,
-		defaultValues?: Record<string, any>
+		defaultValues?: Record<string, any>,
+		fixedScriptPath_?: string
 	) {
 		drawerLoading = true
 		try {
 			drawer?.openDrawer()
+			setPageDrawerAnchor(TRIGGER_PAGES.gcp.path, ePath)
 			initialPath = ePath
 			itemKind = isFlow ? 'flow' : 'script'
 			edit = true
 			dirtyPath = false
-			await loadTrigger(defaultValues)
+			fixedScriptPath = fixedScriptPath_ ?? ''
+			const { overlay: draftOverlay, noDeployed } = await loadTrigger(defaultValues)
+			// Draft-only triggers open as "new trigger prefilled from the
+			// draft" — no deployed row exists, so saving must CREATE (the
+			// update endpoint 404s).
+			edit = !noDeployed
 			originalConfig = structuredClone($state.snapshot(getGcpConfig()))
+			if (draftOverlay) loadTriggerConfig(draftOverlay)
+			if (!defaultValues) {
+				initialConfig = structuredClone($state.snapshot(getGcpConfig()))
+			}
+			await draftSync.maybeRestore()
 		} catch (err) {
 			sendUserToast(`Could not load GCP Pub/Sub trigger: ${err.body}`, true)
 		} finally {
 			drawerLoading = false
-			if (!defaultValues) {
-				initialConfig = structuredClone($state.snapshot(getGcpConfig()))
-			}
 		}
 	}
 
@@ -143,7 +186,20 @@
 			initialScriptPath = ''
 			fixedScriptPath = fixedScriptPath_ ?? ''
 			script_path = fixedScriptPath
-			gcp_resource_path = defaultValues?.gcp_resource_path ?? ''
+			// A draft or capture config reaches `openNew` too, and it stores the credentials mode as
+			// an explicit `gcp_resource_path: null`. Only an absent key means "fresh trigger", so
+			// collapsing null and missing here would silently reopen an ADC config in service
+			// account mode.
+			const reopenedAsDefaultCredentials =
+				!!defaultValues &&
+				'gcp_resource_path' in defaultValues &&
+				defaultValues.gcp_resource_path == null
+			gcp_resource_path = reopenedAsDefaultCredentials
+				? undefined
+				: (defaultValues?.gcp_resource_path ?? '')
+			use_default_credentials = reopenedAsDefaultCredentials
+			loadedUsesDefaultCredentials = reopenedAsDefaultCredentials
+			project_id = defaultValues?.project_id ?? undefined
 			delivery_type = defaultValues?.delivery_type ?? 'pull'
 			delivery_config = defaultValues?.delivery_config ?? undefined
 			subscription_id = ''
@@ -160,33 +216,50 @@
 			auto_acknowledge_msg = defaultValues?.auto_acknowledge_msg ?? true
 			ack_deadline = defaultValues?.ack_deadline
 			errorHandlerSelected = getHandlerType(error_handler_path ?? '')
+			permissionedAs = undefined
+			selectedPermissionedAs = undefined
+			preservePermissionedAs = false
 			originalConfig = undefined
 		} finally {
 			drawerLoading = false
 		}
 	}
 
-	async function loadTrigger(defaultConfig?: Record<string, any>): Promise<void> {
+	/** See `NatsTriggerEditorInner.loadTrigger` for the rationale. */
+	async function loadTrigger(
+		defaultConfig?: Record<string, any>
+	): Promise<{ overlay: Record<string, any> | undefined; noDeployed: boolean }> {
 		if (defaultConfig) {
 			loadTriggerConfig(defaultConfig)
-			return
-		} else {
-			try {
-				const s = await GcpTriggerService.getGcpTrigger({
-					workspace: $workspaceStore!,
-					path: initialPath
-				})
-				loadTriggerConfig(s)
-			} catch (error) {
-				sendUserToast(`Could not load GCP Pub/Sub trigger: ${error.body}`, true)
+			return { overlay: undefined, noDeployed: false }
+		}
+		try {
+			const s = await GcpTriggerService.getGcpTrigger({
+				workspace: wsId!,
+				path: initialPath,
+				getDraft: true
+			})
+			const { draft: draftFromBackend, ...deployedTrigger } = (s ?? {}) as any
+			loadTriggerConfig(deployedTrigger)
+			return {
+				noDeployed: !!(s as any)?.no_deployed,
+				overlay: draftFromBackend
+					? ({ ...deployedTrigger, ...draftFromBackend } as Record<string, any>)
+					: undefined
 			}
+		} catch (error) {
+			sendUserToast(`Could not load GCP Pub/Sub trigger: ${error.body}`, true)
+			return { overlay: undefined, noDeployed: false }
 		}
 	}
 
 	async function loadTriggerConfig(cfg?: Record<string, any>): Promise<void> {
 		script_path = cfg?.script_path
 		initialScriptPath = cfg?.script_path
-		gcp_resource_path = cfg?.gcp_resource_path
+		gcp_resource_path = cfg?.gcp_resource_path ?? undefined
+		use_default_credentials = cfg?.gcp_resource_path == null
+		loadedUsesDefaultCredentials = use_default_credentials
+		project_id = cfg?.project_id ?? undefined
 		delivery_type = cfg?.delivery_type
 		subscription_id = cfg?.subscription_id
 		delivery_config = cfg?.delivery_config
@@ -201,22 +274,21 @@
 		auto_acknowledge_msg = cfg?.auto_acknowledge_msg ?? true
 		ack_deadline = cfg?.ack_deadline
 		errorHandlerSelected = getHandlerType(error_handler_path ?? '')
+		permissionedAs = cfg?.permissioned_as
+		selectedPermissionedAs = cfg?.permissioned_as
+		preservePermissionedAs = !!cfg?.permissioned_as
 	}
 
 	async function updateTrigger(): Promise<void> {
 		deploymentLoading = true
+		const previousPath = initialPath
 		const cfg = gcpConfig
 		if (!cfg) {
 			return
 		}
-		const isSaved = await saveGcpTriggerFromCfg(
-			initialPath,
-			cfg,
-			edit,
-			$workspaceStore!,
-			usedTriggerKinds
-		)
+		const isSaved = await saveGcpTriggerFromCfg(initialPath, cfg, edit, wsId!, usedTriggerKinds)
 		if (isSaved) {
+			draftSync.discard(previousPath, getGcpConfig())
 			onUpdate?.(cfg.path)
 			originalConfig = structuredClone($state.snapshot(getGcpConfig()))
 			initialPath = cfg.path
@@ -230,7 +302,8 @@
 
 	function getGcpConfig() {
 		return {
-			gcp_resource_path,
+			gcp_resource_path: gcp_resource_path ?? null,
+			project_id,
 			subscription_mode,
 			subscription_id,
 			delivery_type,
@@ -245,13 +318,16 @@
 			error_handler_args,
 			retry,
 			auto_acknowledge_msg,
-			ack_deadline
+			ack_deadline,
+			permissioned_as: selectedPermissionedAs,
+			preserve_permissioned_as: preservePermissionedAs || undefined
 		}
 	}
 
 	function getGcpCaptureConfig() {
 		return {
-			gcp_resource_path,
+			gcp_resource_path: gcp_resource_path ?? null,
+			project_id,
 			subscription_mode,
 			subscription_id,
 			delivery_type,
@@ -265,15 +341,34 @@
 	}
 
 	async function handleToggleMode(newMode: TriggerMode) {
+		const previousMode = mode
 		mode = newMode
 		if (!trigger?.draftConfig) {
-			await GcpTriggerService.setGcpTriggerMode({
-				path: initialPath,
-				workspace: $workspaceStore ?? '',
-				requestBody: { mode: newMode }
-			})
+			let ok: boolean
+			try {
+				ok = await withForkConflictRetry(
+					(force) =>
+						GcpTriggerService.setGcpTriggerMode({
+							path: initialPath,
+							workspace: wsId ?? '',
+							requestBody: { mode: newMode, force }
+						}),
+					'GCP Pub/Sub trigger'
+				)
+			} catch (err) {
+				// `withForkConflictRetry` re-throws anything that is not a fork conflict, and
+				// enabling a trigger on application default credentials is rejected for non-admins,
+				// so a refusal here is expected rather than exceptional: put the toggle back and say
+				// why, instead of leaving it showing a mode the server did not accept.
+				mode = previousMode
+				sendUserToast(err?.body ?? err?.message ?? 'Could not change trigger mode', true)
+				return
+			}
+			if (!ok) {
+				mode = previousMode
+				return
+			}
 			sendUserToast(`${capitalize(newMode)} GCP Pub/Sub trigger ${initialPath}`)
-
 			onUpdate?.(initialPath)
 		}
 		if (originalConfig) {
@@ -311,8 +406,13 @@
 {/if}
 
 {#if useDrawer}
-	<Drawer size="800px" bind:this={drawer}>
+	<Drawer
+		size="800px"
+		bind:this={drawer}
+		on:close={() => clearPageDrawerAnchor(TRIGGER_PAGES.gcp.path)}
+	>
 		<DrawerContent
+			bannerReserved={draftSync.hasBaseline}
 			title={edit
 				? can_write
 					? `Edit GCP Pub/Sub trigger ${initialPath}`
@@ -322,6 +422,16 @@
 		>
 			{#snippet actions()}
 				{@render actionsButtons()}
+			{/snippet}
+			{#snippet banner()}
+				<LocalDraftBanner
+					show={draftSync.hasDraft}
+					getDeployed={() => draftSync.deployed}
+					reserveSpace={draftSync.hasBaseline}
+					getCurrent={() => draftSync.current}
+					onDiscard={() => draftSync.resetToDeployed(initialPath)}
+					disabled={!can_write}
+				/>
 			{/snippet}
 			{@render config()}
 		</DrawerContent>
@@ -343,6 +453,8 @@
 {#snippet actionsButtons()}
 	{#if !drawerLoading && can_write}
 		<TriggerEditorToolbar
+			triggerKind="gcp"
+			triggerPath={initialPath}
 			permissions={drawerLoading || !can_write ? 'none' : 'create'}
 			{saveDisabled}
 			{mode}
@@ -368,6 +480,14 @@
 			<p>Loading...</p>
 		</div>
 	{:else}
+		<PermissionedAsLine
+			{permissionedAs}
+			{path}
+			onPermissionedAsChange={(pa, preserve) => {
+				selectedPermissionedAs = pa
+				preservePermissionedAs = preserve
+			}}
+		/>
 		<div class="flex flex-col gap-5">
 			{#if mode === 'suspended'}
 				<TriggerSuspendedJobsAlert {suspendedJobsModal} />
@@ -389,6 +509,7 @@
 			<div class="flex flex-col gap-4">
 				<Label label="Path">
 					<Path
+						workspaceOverride={wsId}
 						bind:dirty={dirtyPath}
 						bind:error={pathError}
 						bind:path
@@ -404,38 +525,38 @@
 
 			{#if !hideTarget}
 				<Section label="Runnable">
-					<p class="text-xs mb-1 text-primary">
-						Pick a script or flow to be triggered <Required required={true} />
-					</p>
-					<div class="flex flex-row mb-2">
-						<ScriptPicker
-							disabled={fixedScriptPath != '' || !can_write}
-							initialPath={fixedScriptPath || initialScriptPath}
-							kinds={['script']}
-							allowFlow={true}
-							bind:itemKind
-							bind:scriptPath={script_path}
-							allowRefresh={can_write}
-							allowEdit={!$userStore?.operator}
-							clearable
-						/>
-						{#if emptyString(script_path)}
-							<Button
-								btnClasses="ml-4"
-								variant="default"
-								unifiedSize="md"
-								disabled={!can_write}
-								href={itemKind === 'flow' ? '/flows/add?hub=68' : '/scripts/add?hub=hub%2F19796'}
-								target="_blank">Create from template</Button
-							>
-						{/if}
-					</div>
+					<TriggerRunnablePicker
+						workspace={wsId}
+						{fixedScriptPath}
+						bind:itemKind
+						bind:scriptPath={script_path}
+						{initialScriptPath}
+						canWrite={can_write}
+						isOperator={!!$userStore?.operator}
+						promptText="Pick a script or flow to be triggered "
+					>
+						{#snippet createButton()}
+							{#if emptyString(script_path)}
+								<Button
+									btnClasses="ml-4"
+									variant="default"
+									unifiedSize="md"
+									disabled={!can_write}
+									href={itemKind === 'flow' ? '/flows/add?hub=68' : '/scripts/add?hub=hub%2F19796'}
+									target="_blank">Create from template</Button
+								>
+							{/if}
+						{/snippet}
+					</TriggerRunnablePicker>
 				</Section>
 			{/if}
 
 			<GcpTriggerEditorConfigSection
 				bind:isValid
 				bind:gcp_resource_path
+				bind:use_default_credentials
+				loaded_uses_default_credentials={loadedUsesDefaultCredentials}
+				bind:project_id
 				bind:subscription_id
 				bind:delivery_type
 				bind:delivery_config
@@ -452,7 +573,14 @@
 			/>
 
 			<Section label="Advanced" collapsable>
-				<div class="flex flex-col gap-4">
+				{#snippet header()}
+					<TriggerAdvancedBadges
+						{error_handler_path}
+						{retry}
+						extraBadges={[{ name: 'Manual Ack', active: !auto_acknowledge_msg }]}
+					/>
+				{/snippet}
+				<div class="flex flex-col gap-6">
 					<div class="min-h-96">
 						<Tabs bind:selected={optionTabSelected}>
 							<Tab value="settings" label="Settings" />
@@ -507,6 +635,7 @@
 								</div>
 							{:else}
 								<TriggerRetriesAndErrorHandler
+									workspace={wsId}
 									{optionTabSelected}
 									{itemKind}
 									{can_write}
@@ -520,6 +649,7 @@
 					</div>
 				</div>
 			</Section>
+			<div class="pb-8" />
 		</div>
 	{/if}
 {/snippet}

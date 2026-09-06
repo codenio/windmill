@@ -1,14 +1,12 @@
 <script lang="ts">
-	import { getContext } from 'svelte'
+	import { getContext, untrack } from 'svelte'
 	import { initConfig, initOutput } from '../../editor/appUtils'
 	import type { AppInput } from '../../inputType'
 	import type { AppViewerContext, ComponentCustomCSS, RichConfigurations } from '../../types'
 	import { initCss } from '../../utils'
 	import RunnableWrapper from '../helpers/RunnableWrapper.svelte'
-	import { Markdown, type Plugin } from 'svelte-exmarkdown'
-	import { gfmPlugin } from 'svelte-exmarkdown/gfm'
-	import rehypeRaw from 'rehype-raw'
-	import { rehypeGithubAlerts } from 'rehype-github-alerts'
+	import { Markdown } from 'svelte-exmarkdown'
+	import { markdownPlugins as plugins } from '$lib/components/markdownPlugins'
 	import { classNames } from '$lib/utils'
 	import { components } from '../../editor/component'
 	import ResolveConfig from '../helpers/ResolveConfig.svelte'
@@ -31,25 +29,20 @@
 		configuration
 	}: Props = $props()
 
-	const plugins: Plugin[] = [
-		gfmPlugin(),
-		{ rehypePlugin: [rehypeRaw] },
-		{ rehypePlugin: [rehypeGithubAlerts] }
-	]
 	const { app, worldStore, mode } = getContext<AppViewerContext>('AppViewerContext')
 
 	const resolvedConfig = $state(
-		initConfig(components['mardowncomponent'].initialData.configuration, configuration)
+		initConfig(components['mardowncomponent'].initialData.configuration, untrack(() => configuration))
 	)
 
-	const outputs = initOutput($worldStore, id, {
+	const outputs = initOutput($worldStore, untrack(() => id), {
 		result: undefined,
 		loading: false
 	})
 
 	let result: string | undefined = $state(undefined)
 
-	let css = $state(initCss($app.css?.mardowncomponent, customCss))
+	let css = $state(initCss($app.css?.mardowncomponent, untrack(() => customCss)))
 
 	const proseMapping = {
 		sm: 'prose-sm',
@@ -80,6 +73,7 @@
 {/each}
 
 {#if render}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		onpointerdown={(e) => {
 			if ($mode != 'preview') {

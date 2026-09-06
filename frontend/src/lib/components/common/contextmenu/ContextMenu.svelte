@@ -1,13 +1,15 @@
 <script lang="ts">
 	import { createContextMenu, melt } from '@melt-ui/svelte'
+	import { overlayPortalTarget } from '$lib/components/common/overlayHost.svelte'
 	import { fly } from 'svelte/transition'
 	import { twMerge } from 'tailwind-merge'
-	import type { Snippet } from 'svelte'
+	import { untrack, type Snippet } from 'svelte'
 	import { pointerDownOutside } from '$lib/utils'
 	import {
 		getContextMenuContainerClass,
 		CONTEXT_MENU_ITEM_BASE_CLASS,
 		CONTEXT_MENU_ITEM_HOVER_MELT_CLASS,
+		CONTEXT_MENU_ITEM_DELETE_CLASS,
 		CONTEXT_MENU_ITEM_DISABLED_CLASS,
 		CONTEXT_MENU_DIVIDER_CLASS,
 		CONTEXT_MENU_ANIMATION_CLASSES
@@ -20,6 +22,8 @@
 		disabled?: boolean
 		onClick?: () => void
 		divider?: boolean
+		type?: 'action' | 'delete'
+		shortcut?: string
 	}
 
 	interface Props {
@@ -40,15 +44,24 @@
 		closeOnOutsideClick = true
 	}: Props = $props()
 
+	// Overlays belong to the enclosing pane when there is one — see overlayHost.
+	const hostPortal = overlayPortalTarget('body')
+
 	const {
 		elements: { menu: menuElement, item, trigger },
-		states: { open }
+		states: { open },
+		options: { portal: portalOption }
 	} = createContextMenu({
 		positioning: {
 			placement: 'right-start'
 		},
 		preventScroll: true,
-		closeOnOutsideClick: false
+		closeOnOutsideClick: false,
+		portal: untrack(() => hostPortal())
+	})
+
+	$effect(() => {
+		$portalOption = hostPortal()
 	})
 
 	function handleItemClick(menuItem: ContextMenuItem) {
@@ -85,6 +98,11 @@
 		exclude: getMenuElements,
 		onClickOutside: handlePointerDownOutside
 	}}
+	onpointerdown={(e) => {
+		if (e.button === 0 && open.get()) {
+			close()
+		}
+	}}
 	data-context-menu-trigger
 >
 	{@render children?.()}
@@ -106,18 +124,23 @@
 						CONTEXT_MENU_ITEM_BASE_CLASS,
 						menuItem.disabled
 							? CONTEXT_MENU_ITEM_DISABLED_CLASS
-							: CONTEXT_MENU_ITEM_HOVER_MELT_CLASS
+							: menuItem.type === 'delete'
+								? CONTEXT_MENU_ITEM_DELETE_CLASS
+								: CONTEXT_MENU_ITEM_HOVER_MELT_CLASS
 					)}
 					use:melt={$item}
 					onclick={() => handleItemClick(menuItem)}
 				>
 					{#if menuItem.icon}
-						<menuItem.icon size={14} class="mr-2" />
+						<menuItem.icon size={14} class="mr-2 shrink-0" />
 					{/if}
 					{#if menu}
 						{@render menu({ item: menuItem })}
 					{:else}
-						<span>{menuItem.label}</span>
+						<span class="grow">{menuItem.label}</span>
+					{/if}
+					{#if menuItem.shortcut}
+						<span class="ml-auto pl-4 text-2xs text-secondary shrink-0">{menuItem.shortcut}</span>
 					{/if}
 				</div>
 			{/if}

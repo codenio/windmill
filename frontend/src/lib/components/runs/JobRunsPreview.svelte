@@ -20,21 +20,18 @@
 	interface Props {
 		id: string
 		workspace: string | undefined
+		onResolutionChanged?: () => void
 	}
 
-	let { id, workspace }: Props = $props()
+	let { id, workspace, onResolutionChanged }: Props = $props()
 
 	const dispatch = createEventDispatcher()
 
 	let job: (Job & { result_stream?: string }) | undefined = $state(undefined)
 
-	let result: any = $state()
-
-	function onDone(job: Job) {
-		result = job['result']
-	}
-
 	let currentJob: Job | undefined = $state(undefined)
+	let loadError: string | undefined = $state(undefined)
+	let isLoadingJobDetails: boolean = $state(false)
 
 	let lastJobId: string | undefined = $state(undefined)
 	let concurrencyKey: string | undefined = $state(undefined)
@@ -51,7 +48,16 @@
 	)
 
 	function asWorkflowStatus(x: any): Record<string, WorkflowStatus> {
-		return x as Record<string, WorkflowStatus>
+		if (!x || typeof x !== 'object') return {}
+		const result: Record<string, WorkflowStatus> = {}
+		for (const [k, v] of Object.entries(x)) {
+			if (!k.startsWith('_') || k.startsWith('_step/')) result[k] = v as WorkflowStatus
+		}
+		return result
+	}
+
+	function getStepResults(x: any): Record<string, any> {
+		return x?._checkpoint?.completed_steps ?? {}
 	}
 
 	function handleFilterByConcurrencyKey(key: string) {
@@ -67,15 +73,29 @@
 		}
 	})
 	$effect(() => {
-		id &&
-			jobLoader &&
+		if (id && jobLoader) {
+			loadError = undefined
+			isLoadingJobDetails = true
 			untrack(() =>
 				jobLoader?.watchJob(id, {
 					done(x) {
-						onDone(x)
+						loadError = undefined
+						isLoadingJobDetails = false
+					},
+					doneError({ error }) {
+						// Only show error state if we couldn't load the job data
+						// If the job failed but we have the job object, let it display normally
+						if (!currentJob) {
+							loadError = (error as any)?.body || error?.message || 'Failed to load job details'
+						}
+						isLoadingJobDetails = false
+					},
+					change() {
+						isLoadingJobDetails = false
 					}
 				})
 			)
+		}
 	})
 
 	$effect(() => {
@@ -109,9 +129,23 @@
 	bind:this={jobLoader}
 />
 
-<div class="h-full overflow-y-auto">
-	<div class="flex flex-col items-start p-4 pb-8 min-h-full">
-		{#if job}
+<div class="h-full">
+	<div class="flex flex-col items-start pb-4 min-h-full">
+		{#if isLoadingJobDetails}
+			<div class="w-full flex-1 flex items-center justify-center">
+				<div class="text-center">
+					<LoaderCircle size={32} class="animate-spin text-primary mx-auto" />
+					<div class="text-secondary text-sm mt-2">Loading job details...</div>
+				</div>
+			</div>
+		{:else if loadError}
+			<div class="w-full h-full flex items-center justify-center">
+				<div class="text-center">
+					<div class="text-red-500 text-lg font-semibold mb-2">Error loading job</div>
+					<div class="text-secondary text-sm">{loadError}</div>
+				</div>
+			</div>
+		{:else if job}
 			{@const isFlow = job?.job_kind == 'flow' || isFlowPreview(job?.job_kind)}
 			<JobDetailHeader
 				{job}
@@ -119,6 +153,7 @@
 				{concurrencyKey}
 				onFilterByConcurrencyKey={handleFilterByConcurrencyKey}
 				onFilterByWorker={handleFilterByWorker}
+				{onResolutionChanged}
 			/>
 
 			<!-- Workflow timeline -->
@@ -127,6 +162,10 @@
 					<WorkflowTimeline
 						flow_status={asWorkflowStatus(job.workflow_as_code_status)}
 						flowDone={job.type == 'CompletedJob'}
+						stepResults={getStepResults(job.workflow_as_code_status)}
+						result={(job as any).result}
+						success={(job as any).success !== false}
+						jobId={job.id}
 					/>
 				</div>
 			{/if}
@@ -134,7 +173,6 @@
 				{#if isFlow}
 					<FlowExecutionStatus
 						{job}
-						workspaceId={job?.workspace_id}
 						{isOwner}
 						innerModules={job?.flow_status?.modules}
 						{suspendStatus}
@@ -160,6 +198,7 @@
 						workspaceId={job.workspace_id}
 						initialJob={job}
 						bind:isOwner
+						bind:suspendStatus
 						wideResults
 					/>
 				{:else if job?.type === 'CompletedJob'}
@@ -171,7 +210,7 @@
 								<DisplayResult
 									workspaceId={job?.workspace_id}
 									jobId={job?.id}
-									{result}
+									result={job?.result}
 									disableExpand
 									language={job?.language}
 								/>

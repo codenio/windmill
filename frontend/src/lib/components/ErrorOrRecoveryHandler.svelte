@@ -33,7 +33,7 @@
 	import { base } from '$lib/base'
 	import { enterpriseLicense, workspaceStore } from '$lib/stores'
 	import MsTeamsIcon from '$lib/components/icons/MSTeamsIcon.svelte'
-	import { emptySchema, emptyString, sendUserToast, tryEvery } from '$lib/utils'
+	import { classNames, emptySchema, emptyString, sendUserToast, tryEvery } from '$lib/utils'
 	import MultiSelect from '$lib/components/select/MultiSelect.svelte'
 	import {
 		FlowService,
@@ -80,6 +80,14 @@
 		customScriptTemplate: string
 		customHandlerKind?: 'flow' | 'script'
 		customTabTooltip?: import('svelte').Snippet
+		noMargin?: boolean
+		/** Workspace for handler lookup / settings / test jobs. Defaults to the
+		 * nav `$workspaceStore`; a trigger editor in a forked session passes its
+		 * acting workspace so the handler is resolved and saved there. */
+		workspace?: string
+		/** Offer the instance critical alert channels as a destination. Workspace-level
+		 * error handling only: schedules and triggers have no such setting. */
+		showInstanceAlerts?: boolean
 	}
 
 	let {
@@ -92,8 +100,21 @@
 		handlerExtraArgs = $bindable(),
 		customScriptTemplate,
 		customHandlerKind = $bindable('script'),
-		customTabTooltip
+		customTabTooltip,
+		noMargin = false,
+		workspace = undefined,
+		showInstanceAlerts = false
 	}: Props = $props()
+
+	let effectiveWorkspace = $derived(workspace ?? $workspaceStore)
+	// Carry the acting workspace onto the "create from template" route when an
+	// explicit override is set, so a forked session creates the handler script
+	// there. `customScriptTemplate` already has a query string (`?hub=…`).
+	let templateHref = $derived(
+		workspace
+			? `${customScriptTemplate}&workspace=${encodeURIComponent(workspace)}`
+			: customScriptTemplate
+	)
 
 	let customHandlerSchema: Schema | undefined = $state()
 	let slackHandlerSchema: Schema | undefined = $state()
@@ -111,7 +132,7 @@
 	const CHANNEL_KEY = 'channel'
 
 	async function loadSlackResources() {
-		const settings = await WorkspaceService.getSettings({ workspace: $workspaceStore! })
+		const settings = await WorkspaceService.getPublicSettings({ workspace: effectiveWorkspace! })
 		if (!emptyString(settings.slack_name) && !emptyString(settings.slack_team_id)) {
 			workspaceConnectedToSlack = true
 			slack_team_name = settings.slack_name
@@ -122,7 +143,7 @@
 	}
 
 	async function loadTeamsResources() {
-		const settings = await WorkspaceService.getSettings({ workspace: $workspaceStore! })
+		const settings = await WorkspaceService.getPublicSettings({ workspace: effectiveWorkspace! })
 		if (!emptyString(settings.teams_team_name) && !emptyString(settings.teams_team_id)) {
 			workspaceConnectedToTeams = true
 		} else {
@@ -153,11 +174,11 @@
 				: WorkspaceService.runTeamsMessageTestJob
 
 		let submitted_job = await testJobFunction({
-			workspace: $workspaceStore!,
+			workspace: effectiveWorkspace!,
 			requestBody: {
 				hub_script_path: handlerPath,
 				channel: channel,
-				test_msg: `This is a notification to test the connection between ${platform} and Windmill workspace '${$workspaceStore!}'`
+				test_msg: `This is a notification to test the connection between ${platform} and Windmill workspace '${effectiveWorkspace!}'`
 			}
 		})
 
@@ -169,7 +190,7 @@
 		tryEvery({
 			tryCode: async () => {
 				const testResult = await JobService.getCompletedJob({
-					workspace: $workspaceStore!,
+					workspace: effectiveWorkspace!,
 					id: connectionTestJob!.uuid
 				})
 				connectionTestJob!.in_progress = false
@@ -178,7 +199,7 @@
 			timeoutCode: async () => {
 				try {
 					await JobService.cancelQueuedJob({
-						workspace: $workspaceStore!,
+						workspace: effectiveWorkspace!,
 						id: connectionTestJob!.uuid,
 						requestBody: {
 							reason: 'Slack message not sent after 10s'
@@ -217,8 +238,8 @@
 			} else {
 				let scriptOrFlow: Script | Flow =
 					customHandlerKind === 'script'
-						? await ScriptService.getScriptByPath({ workspace: $workspaceStore!, path: p })
-						: await FlowService.getFlowByPath({ workspace: $workspaceStore!, path: p })
+						? await ScriptService.getScriptByPath({ workspace: effectiveWorkspace!, path: p })
+						: await FlowService.getFlowByPath({ workspace: effectiveWorkspace!, path: p })
 				schema = scriptOrFlow.schema as Schema
 			}
 			if (schema && schema.properties) {
@@ -276,7 +297,7 @@
 	}
 
 	$effect(() => {
-		if ($workspaceStore) {
+		if (effectiveWorkspace) {
 			loadSlackResources()
 			loadTeamsResources()
 		}
@@ -297,21 +318,26 @@
 		teams: undefined as string | undefined,
 		email: undefined as string[] | undefined
 	})
+	let handlerPathCache: Partial<Record<ErrorHandler, string | undefined>> = $state({})
 	$effect(() => {
 		if (lastHandlerSelected !== handlerSelected && lastHandlerSelected !== undefined) {
 			if (lastHandlerSelected != 'custom') {
 				const key = lastHandlerSelected === 'email' ? EMAIL_RECIPIENTS_KEY : CHANNEL_KEY
 				handlerCache[lastHandlerSelected] = handlerExtraArgs[key]
 			}
+			handlerPathCache[lastHandlerSelected] = handlerPath
 
 			if (handlerSelected === 'custom') {
-				handlerExtraArgs[CHANNEL_KEY] = ''
-				handlerExtraArgs[EMAIL_RECIPIENTS_KEY] = []
-				handlerPath = undefined
+				delete handlerExtraArgs[CHANNEL_KEY]
+				delete handlerExtraArgs[EMAIL_RECIPIENTS_KEY]
+				handlerPath = handlerPathCache['custom']
 			} else if (handlerSelected === 'email') {
 				handlerExtraArgs[EMAIL_RECIPIENTS_KEY] = handlerCache[handlerSelected] ?? []
+				delete handlerExtraArgs[CHANNEL_KEY]
 			} else {
 				handlerExtraArgs[CHANNEL_KEY] = handlerCache[handlerSelected] ?? ''
+				delete handlerExtraArgs[EMAIL_RECIPIENTS_KEY]
+				handlerPath = handlerPathCache[handlerSelected]
 			}
 		}
 
@@ -341,9 +367,17 @@
 			handlerPath = hubPaths.emailErrorHandler
 		}
 	})
+
+	// The instance channels are reached by having no workspace handler at all, so the tab
+	// owns an empty path rather than a handler script.
+	$effect(() => {
+		if (handlerSelected === 'instance_alerts') {
+			handlerPath = undefined
+		}
+	})
 </script>
 
-<div class="mt-2 space-y-2">
+<div class={classNames('space-y-2', noMargin ? '' : 'mt-2')}>
 	<ToggleButtonGroup bind:selected={handlerSelected} disabled={!isEditable}>
 		{#snippet children({ item })}
 			<ToggleButton label="Slack" value="slack" {item} disabled={!isEditable} />
@@ -356,61 +390,75 @@
 				disabled={!isEditable}
 				tooltip={customTabTooltip ? 'Custom error handler with script or flow' : undefined}
 			/>
+			{#if showInstanceAlerts}
+				<ToggleButton
+					label="Instance alerts"
+					value="instance_alerts"
+					{item}
+					disabled={!isEditable}
+					tooltip="Report failures to the instance critical alert channels"
+				/>
+			{/if}
 		{/snippet}
 	</ToggleButtonGroup>
 
-	<div class="flex flex-col gap-6 p-4 rounded-md border">
+	<div class="flex flex-col gap-6 p-4 rounded-md shadow-sm bg-surface-tertiary">
 		{#if handlerSelected === 'custom'}
-			<div class="flex flex-row mb-6">
-				<ScriptPicker
-					disabled={!isEditable || !$enterpriseLicense}
-					kinds={['script', 'failure']}
-					allowFlow={true}
-					bind:scriptPath={handlerPath}
-					bind:itemKind={customHandlerKind}
-					allowRefresh={isEditable}
-					clearable
-				/>
+			<div class="flex flex-col gap-1">
+				<div class="flex flex-row">
+					<ScriptPicker
+						disabled={!isEditable || !$enterpriseLicense}
+						kinds={['script', 'failure']}
+						allowFlow={true}
+						bind:scriptPath={handlerPath}
+						bind:itemKind={customHandlerKind}
+						allowRefresh={isEditable}
+						workspace={effectiveWorkspace}
+						clearable
+					/>
 
-				{#if !handlerPath}
-					<Button
-						btnClasses="ml-4 whitespace-nowrap"
-						variant="default"
-						size="xs"
-						href={customScriptTemplate}
-						disabled={!isEditable}
-						target="_blank"
-					>
-						Create from template
-					</Button>
+					{#if !handlerPath}
+						<Button
+							btnClasses="ml-4 whitespace-nowrap"
+							variant="default"
+							size="xs"
+							href={templateHref}
+							disabled={!isEditable}
+							target="_blank"
+						>
+							Create from template
+						</Button>
+					{/if}
+				</div>
+				{#if showScriptHelpText}
+					<div class="text-2xs text-secondary">
+						Example of error handler scripts can be found on <a
+							target="_blank"
+							href="{$hubBaseUrlStore}/failures"
+						>
+							Windmill Hub</a
+						>
+					</div>
 				{/if}
 			</div>
-			{#if showScriptHelpText}
-				<div class="text-2xs text-secondary">
-					Example of error handler scripts can be found on <a
-						target="_blank"
-						href="{$hubBaseUrlStore}/failures"
-					>
-						Windmill Hub</a
-					>
-				</div>
-			{/if}
 			{#if handlerPath}
-				<p class="font-semibold text-xs mt-6 mb-1">Extra arguments</p>
-				{#await import('$lib/components/SchemaForm.svelte')}
-					<Loader2 class="animate-spin" />
-				{:then Module}
-					<Module.default
-						disabled={!isEditable}
-						schema={customHandlerSchema}
-						bind:args={handlerExtraArgs}
-						shouldHideNoInputs
-						className="text-xs"
-					/>
-				{/await}
-				{#if customHandlerSchema && customHandlerSchema.properties && Object.keys(customHandlerSchema.properties).length === 0}
-					<div class="text-xs texg-gray-700">This error handler takes no extra arguments</div>
-				{/if}
+				<div>
+					<p class="font-semibold text-xs mb-1">Extra arguments</p>
+					{#await import('$lib/components/SchemaForm.svelte')}
+						<Loader2 class="animate-spin" />
+					{:then Module}
+						<Module.default
+							disabled={!isEditable}
+							schema={customHandlerSchema}
+							bind:args={handlerExtraArgs}
+							shouldHideNoInputs
+							className="text-xs"
+						/>
+					{/await}
+					{#if customHandlerSchema && customHandlerSchema.properties && Object.keys(customHandlerSchema.properties).length === 0}
+						<div class="text-xs text-secondary">This error handler takes no extra arguments</div>
+					{/if}
+				</div>
 			{/if}
 		{:else if handlerSelected === 'slack'}
 			<!-- Slack Connection Status -->
@@ -482,7 +530,7 @@
 
 									<a
 										target="_blank"
-										href={`${base}/run/${connectionTestJob.uuid}?workspace=${$workspaceStore}`}
+										href={`${base}/run/${connectionTestJob.uuid}?workspace=${effectiveWorkspace}`}
 										class="inline-flex items-center gap-1"
 									>
 										{connectionTestJob.uuid}
@@ -539,6 +587,7 @@
 								containerClass="flex-grow"
 								minWidth="200px"
 								placeholder="Search Teams channels"
+								workspace={effectiveWorkspace}
 								teamId={teams_team_guid}
 								selectedChannel={handlerExtraArgs['channel']
 									? {
@@ -574,7 +623,7 @@
 								Message sent via Windmill job
 								<a
 									target="_blank"
-									href={`${base}/run/${connectionTestJob.uuid}?workspace=${$workspaceStore}`}
+									href={`${base}/run/${connectionTestJob.uuid}?workspace=${effectiveWorkspace}`}
 								>
 									{connectionTestJob.uuid}
 								</a>
@@ -624,6 +673,18 @@
 					{/if}
 				</div>
 			{/if}
+		{:else if handlerSelected === 'instance_alerts'}
+			<div class="flex flex-col gap-2">
+				<span class="text-xs text-secondary">
+					Failed jobs are reported to the Slack, Teams and email channels configured at the instance
+					level. Those channels are managed in instance settings by a superadmin, not here, and the
+					report is sent without adding an entry to the instance critical alert feed. Canceled jobs
+					are not reported.
+				</span>
+				<a class="text-xs w-fit" href="{base}/?workspace=admins#superadmin-settings">
+					Configure the instance critical alert channels
+				</a>
+			</div>
 		{/if}
 	</div>
 </div>

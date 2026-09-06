@@ -11,17 +11,21 @@
 	import { usedTriggerKinds, userStore, workspaceStore } from '$lib/stores'
 	import { canWrite, emptyString, sendUserToast } from '$lib/utils'
 	import { Button } from '$lib/components/common'
+	import TextInput from '$lib/components/text_input/TextInput.svelte'
 	import Drawer from '$lib/components/common/drawer/Drawer.svelte'
 	import DrawerContent from '$lib/components/common/drawer/DrawerContent.svelte'
-	import { Loader2, Save } from 'lucide-svelte'
+	import { Loader2, RefreshCw, Save } from 'lucide-svelte'
 	import ScriptPicker from '$lib/components/ScriptPicker.svelte'
 	import Section from '$lib/components/Section.svelte'
 	import Required from '$lib/components/Required.svelte'
 	import NextcloudTriggerForm from './services/nextcloud/NextcloudTriggerForm.svelte'
+	import GoogleTriggerForm from './services/google/GoogleTriggerForm.svelte'
+	import GitHubTriggerForm from './services/github/GitHubTriggerForm.svelte'
 	import TriggerEditorToolbar from '$lib/components/triggers/TriggerEditorToolbar.svelte'
 	import { handleConfigChange, type Trigger } from '$lib/components/triggers/utils'
 	import { deepEqual } from 'fast-equals'
 	import type { Snippet } from 'svelte'
+	import Alert from '$lib/components/common/alert/Alert.svelte'
 
 	interface Props {
 		service: NativeServiceName
@@ -71,6 +75,10 @@
 		switch (service) {
 			case 'nextcloud':
 				return NextcloudTriggerForm
+			case 'google':
+				return GoogleTriggerForm
+			case 'github':
+				return GitHubTriggerForm
 			default:
 				return null
 		}
@@ -91,10 +99,14 @@
 	let initialScriptPath = $state('')
 	let fixedScriptPath = $state('')
 	let isFlow = $state(false)
+	let summary = $state('')
 	let externalId = $state<string | null>(null)
 	let can_write = $state(true)
 	let originalConfig = $state<Record<string, any> | undefined>(undefined)
-	let initialConfig: Record<string, any> | undefined = undefined
+	let initialConfig = $state<Record<string, any> | undefined>(undefined)
+	let loadError = $state<string | undefined>(undefined)
+	let externalError = $state<string | undefined>(undefined)
+	let retryEdit = $state<(() => void) | undefined>(undefined)
 
 	export function openNew(
 		nis_flow?: boolean,
@@ -113,12 +125,17 @@
 		fixedScriptPath = fixedScriptPath_ ?? ''
 		scriptPath = fixedScriptPath
 		initialScriptPath = ''
-		isFlow = nis_flow ?? false
+		itemKind = nis_flow ? 'flow' : 'script'
 		externalId = null
 		loadingConfig = false
+		loadingForm = false
 		can_write = true
 		originalConfig = undefined
 		initialConfig = undefined
+		summary = ''
+		loadError = undefined
+		externalError = undefined
+		retryEdit = undefined
 	}
 
 	export function openRecreate(nativeTrigger: ExtendedNativeTrigger) {
@@ -135,13 +152,17 @@
 		errors = {}
 		scriptPath = nativeTrigger.script_path
 		initialScriptPath = nativeTrigger.script_path
-		isFlow = nativeTrigger.is_flow
+		itemKind = nativeTrigger.is_flow ? 'flow' : 'script'
 		externalId = null
 		loadingConfig = false
 		loadingForm = false
 		can_write = true
 		originalConfig = undefined
 		initialConfig = undefined
+		summary = nativeTrigger.summary ?? ''
+		loadError = undefined
+		externalError = undefined
+		retryEdit = undefined
 	}
 
 	export async function openEdit(
@@ -163,7 +184,18 @@
 		externalId = externalIdOrPath
 		loadingConfig = true
 		loadingForm = true
+		originalConfig = undefined
 		initialConfig = undefined
+		itemKind = nis_flow ? 'flow' : 'script'
+		loadError = undefined
+		externalError = undefined
+		retryEdit = undefined
+		// A failed load must not leave the previously edited trigger's target and config in the
+		// form, where saving would silently repoint this trigger at them.
+		serviceConfig = {}
+		scriptPath = ''
+		initialScriptPath = ''
+		summary = ''
 
 		try {
 			const fullTrigger = await NativeTriggerService.getNativeTrigger({
@@ -175,24 +207,26 @@
 			serviceConfig = (fullTrigger.service_config as Record<string, any>) || {}
 			scriptPath = fullTrigger.script_path
 			initialScriptPath = fullTrigger.script_path
-			isFlow = nis_flow ?? fullTrigger.is_flow
 			can_write = canWrite(fullTrigger.script_path, {}, $userStore)
+			summary = fullTrigger.summary ?? ''
 			externalData = fullTrigger.external_data
+			externalError = fullTrigger.external_error ?? undefined
 
 			// Apply default values if provided (for draft triggers)
 			if (defaultValues) {
 				serviceConfig = { ...serviceConfig, ...defaultValues }
 				externalData = { ...externalData, ...defaultValues }
 			}
-			originalConfig = structuredClone($state.snapshot(getSaveCfg()))
 		} catch (err: any) {
-			sendUserToast(`Failed to load trigger configuration: ${err}`, true)
+			loadError = err.body ?? err.message ?? String(err)
+			sendUserToast(`Failed to load trigger configuration: ${loadError}`, true)
 			externalData = null
+			// The service form is not rendered in the error state, so nothing else will ever
+			// clear its loading flag or narrow the permission left over from the last trigger.
+			loadingForm = false
+			can_write = false
+			retryEdit = () => openEdit(externalIdOrPath, nis_flow, defaultValues)
 		} finally {
-			// For drawer mode, set initialConfig here; for inline mode, the effect handles it after form settles
-			if (!defaultValues) {
-				initialConfig = structuredClone($state.snapshot(getSaveCfg()))
-			}
 			clearTimeout(loadingTimeout)
 			loadingConfig = false
 			showLoading = false
@@ -203,9 +237,19 @@
 		return {
 			script_path: scriptPath,
 			is_flow: isFlow,
-			service_config: serviceConfig
+			service_config: serviceConfig,
+			summary: summary !== '' ? summary : undefined
 		}
 	}
+
+	// Capture originalConfig after the form has settled (loadingConfig and loadingForm both false)
+	// This ensures we compare against the form's normalized config, not raw backend data
+	$effect(() => {
+		if (!loadingConfig && !loadingForm && originalConfig === undefined && !isNew) {
+			originalConfig = structuredClone($state.snapshot(getSaveCfg()))
+			initialConfig = structuredClone($state.snapshot(getSaveCfg()))
+		}
+	})
 
 	function close() {
 		drawer?.closeDrawer()
@@ -231,9 +275,6 @@
 	let isValid = $derived.by(() => Object.keys(validationErrors).length === 0)
 	let hasChanged = $derived(!deepEqual(getSaveCfg(), originalConfig ?? {}))
 
-	$effect(() => {
-		console.log('loading', getSaveCfg(), originalConfig)
-	})
 	let saveDisabled = $derived(
 		loading ||
 			!isValid ||
@@ -241,12 +282,13 @@
 			loadingConfig ||
 			loadingForm ||
 			!can_write ||
-			!hasChanged
+			!hasChanged ||
+			loadError !== undefined
 	)
 	const saveCfg = $derived.by(getSaveCfg)
 
 	$effect(() => {
-		if (!loadingConfig && !loadingForm) {
+		if (!loadingConfig && !loadingForm && (isNew || initialConfig)) {
 			handleConfigChange(saveCfg, initialConfig, saveDisabled, !isNew, onConfigChange)
 		}
 	})
@@ -296,7 +338,11 @@
 		loading = false
 	}
 	let templateUrl = $derived(isFlow ? flowTemplateUrl : scriptTemplateUrl)
-	let itemKind: 'flow' | 'script' = $derived(isFlow ? 'flow' : 'script')
+	let itemKind = $state<'flow' | 'script'>('script')
+
+	$effect(() => {
+		isFlow = itemKind === 'flow'
+	})
 </script>
 
 {#if useDrawer}
@@ -369,13 +415,58 @@
 {#snippet content()}
 	{#if loadingConfig && showLoading}
 		<Loader2 class="animate-spin" />
+	{:else if loadError}
+		<Alert
+			type="error"
+			title="Could not load this {serviceInfo?.serviceDisplayName} trigger"
+			descriptionClass="break-words"
+		>
+			<div class="flex flex-col gap-2 items-start">
+				<span>{loadError}</span>
+				<Button
+					size="xs"
+					variant="subtle"
+					startIcon={{ icon: RefreshCw }}
+					on:click={() => retryEdit?.()}
+				>
+					Retry
+				</Button>
+			</div>
+		</Alert>
 	{:else}
 		<div class="flex flex-col gap-4">
 			{#if description}
 				{@render description()}
 			{/if}
 		</div>
+		{#if externalError}
+			<div class="mt-4">
+				<Alert
+					type="warning"
+					title="Could not read this trigger from {serviceInfo?.serviceDisplayName}"
+					descriptionClass="break-words"
+				>
+					{externalError} The configuration below is the one Windmill last saved.
+				</Alert>
+			</div>
+		{/if}
 		<div class="flex flex-col gap-12 mt-6">
+			<Section headless>
+				<div class="flex flex-col gap-6">
+					<label class="flex flex-col gap-1">
+						<span class="text-xs font-semibold text-emphasis">Summary</span>
+						<TextInput
+							inputProps={{
+								type: 'text',
+								placeholder: 'Short summary to be displayed when listed',
+								disabled: !can_write
+							}}
+							bind:value={summary}
+						/>
+					</label>
+				</div>
+			</Section>
+
 			{#if !hideTarget}
 				<Section label="Runnable">
 					<p class="text-xs mb-1 text-primary">
@@ -388,9 +479,6 @@
 							bind:scriptPath
 							allowRefresh={can_write}
 							bind:itemKind
-							on:select={(e) => {
-								isFlow = e.detail.itemKind === 'flow'
-							}}
 							kinds={['script']}
 							allowFlow={true}
 							allowEdit={!$userStore?.operator}

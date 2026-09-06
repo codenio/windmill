@@ -5,7 +5,7 @@ pub use super::handler_ee::*;
 #[cfg(not(feature = "private"))]
 use {
     super::SqsTrigger,
-    axum::async_trait,
+    async_trait::async_trait,
     sqlx::PgConnection,
     windmill_api_auth::ApiAuthed,
     windmill_common::{
@@ -26,14 +26,15 @@ impl TriggerCrud for SqsTrigger {
 
     const TABLE_NAME: &'static str = "";
     const TRIGGER_TYPE: &'static str = "";
+    const DRAFT_KIND: windmill_common::user_drafts::UserDraftItemKind = windmill_common::user_drafts::UserDraftItemKind::TriggerSqs;
     const SUPPORTS_SERVER_STATE: bool = false;
     const SUPPORTS_TEST_CONNECTION: bool = false;
     const ROUTE_PREFIX: &'static str = "/sqs_triggers";
     const DEPLOYMENT_NAME: &'static str = "";
     const IS_ALLOWED_ON_CLOUD: bool = false;
 
-    fn get_deployed_object(path: String) -> DeployedObject {
-        DeployedObject::SqsTrigger { path }
+    fn get_deployed_object(path: String, parent_path: Option<String>) -> DeployedObject {
+        DeployedObject::SqsTrigger { path, parent_path }
     }
 
     async fn create_trigger(

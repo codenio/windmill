@@ -8,7 +8,7 @@ use windmill_trigger::TriggerData;
 #[cfg(not(feature = "private"))]
 use {
     super::NatsTrigger,
-    axum::async_trait,
+    async_trait::async_trait,
     sqlx::PgConnection,
     windmill_api_auth::ApiAuthed,
     windmill_common::{
@@ -16,27 +16,28 @@ use {
         error::{Error, Result},
     },
     windmill_git_sync::DeployedObject,
-    windmill_trigger::TriggerCrud,
+    windmill_trigger::{Trigger, TriggerCrud},
 };
 
 #[cfg(not(feature = "private"))]
 #[async_trait]
 impl TriggerCrud for NatsTrigger {
-    type Trigger = ();
+    type Trigger = Trigger<Self::TriggerConfig>;
     type TriggerConfig = ();
     type TriggerConfigRequest = ();
     type TestConnectionConfig = ();
 
     const TABLE_NAME: &'static str = "";
     const TRIGGER_TYPE: &'static str = "";
+    const DRAFT_KIND: windmill_common::user_drafts::UserDraftItemKind = windmill_common::user_drafts::UserDraftItemKind::TriggerNats;
     const SUPPORTS_SERVER_STATE: bool = false;
     const SUPPORTS_TEST_CONNECTION: bool = false;
     const ROUTE_PREFIX: &'static str = "/nats_triggers";
     const DEPLOYMENT_NAME: &'static str = "";
     const IS_ALLOWED_ON_CLOUD: bool = false;
 
-    fn get_deployed_object(path: String) -> DeployedObject {
-        DeployedObject::NatsTrigger { path }
+    fn get_deployed_object(path: String, parent_path: Option<String>) -> DeployedObject {
+        DeployedObject::NatsTrigger { path, parent_path }
     }
 
     async fn create_trigger(

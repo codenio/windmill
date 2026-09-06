@@ -1,14 +1,11 @@
-// deno-lint-ignore-file no-explicit-any
-
-import {
-  colors,
-  Diff,
-  log,
-  path,
-  SEP,
-  yamlParseContent,
-  yamlStringify,
-} from "../deps.ts";
+import { colors } from "@cliffy/ansi/colors";
+import * as Diff from "diff";
+import * as log from "./core/log.ts";
+import * as path from "node:path";
+import { sep as SEP } from "node:path";
+import { stringify as yamlStringify } from "yaml";
+import { yamlParseContent } from "./utils/yaml.ts";
+import { isDbtDescriptorPath } from "./utils/resource_folders.ts";
 import { pushApp } from "./commands/app/app.ts";
 import { pushFolder } from "./commands/folder/folder.ts";
 import { pushFlow } from "./commands/flow/flow.ts";
@@ -17,21 +14,28 @@ import { pushResourceType } from "./commands/resource-type/resource-type.ts";
 import { pushVariable } from "./commands/variable/variable.ts";
 import { yamlOptions } from "./commands/sync/sync.ts";
 import { showDiffs } from "./core/conf.ts";
-import { deepEqual, isFileResource, isWorkspaceDependencies } from "./utils/utils.ts";
+import { deepEqual, isFileResource, isFilesetResource, isWorkspaceDependencies, readTextFileSync } from "./utils/utils.ts";
 import { pushSchedule } from "./commands/schedule/schedule.ts";
 import { pushWorkspaceUser } from "./commands/user/user.ts";
 import { pushGroup } from "./commands/user/user.ts";
 import { pushWorkspaceDependencies } from "./commands/dependencies/dependencies.ts";
-import { pushWorkspaceSettings, pushWorkspaceKey } from "./core/settings.ts";
+import {
+  pushWorkspaceSettings,
+  pushWorkspaceKey,
+  PushWorkspaceKeyOptions,
+} from "./core/settings.ts";
 import { pushTrigger, pushNativeTrigger } from "./commands/trigger/trigger.ts";
 import { pushRawApp } from "./commands/app/raw_apps.ts";
+import type { PermissionedAsContext } from "./core/permissioned_as.ts";
 import {
   isFlowPath,
   isAppPath,
   isRawAppPath,
   extractResourceName,
   buildFolderPath,
+  isScriptModulePath,
 } from "./utils/resource_folders.ts";
+import { isSharedLockPath } from "./utils/script_common.ts";
 
 export interface DifferenceCreate {
   type: "CREATE";
@@ -61,8 +65,10 @@ export const TRIGGER_TYPES = [
   "nats",
   "postgres",
   "mqtt",
+  "amqp",
   "sqs",
   "gcp",
+  "azure",
   "email",
 ] as const;
 
@@ -130,9 +136,61 @@ export function showDiff(local: string, remote: string) {
 
 export function showConflict(path: string, local: string, remote: string) {
   log.info(colors.yellow(`- ${path}`));
-  showDiff(local, remote);
+  let isEncryptionKey = false;
+  try {
+    isEncryptionKey = getTypeStrFromPath(path) === "encryption_key";
+  } catch {
+    // ignore
+  }
+  if (isEncryptionKey) {
+    showDiff(redactEncryptionKey(local), redactEncryptionKey(remote));
+  } else {
+    showDiff(local, remote);
+  }
   log.info("\x1b[31mlocal\x1b[31m - \x1b[32mremote\x1b[32m");
   log.info("\n");
+}
+
+// Reveal only the first 5 chars of the key so a rotation is still visible in
+// the diff (different prefixes), without leaking the whole secret to stdout.
+// The remaining chars are replaced with `*`, preserving length so the diff
+// keeps showing whether the key length changed.
+export function redactEncryptionKey(content: string): string {
+  if (!content) return content;
+  // The encryption_key payload is JSON-encoded (a quoted string). Parse it so
+  // we redact the key value itself, then re-serialize to JSON to preserve the
+  // file's shape; fall back to raw redaction if parsing fails.
+  try {
+    const parsed = JSON.parse(content);
+    if (typeof parsed === "string") {
+      return JSON.stringify(redactString(parsed));
+    }
+  } catch {
+    // not JSON — treat content as the raw key
+  }
+  return redactString(content);
+}
+
+function redactString(s: string): string {
+  if (s.length <= 5) return s;
+  return s.slice(0, 5) + "*".repeat(s.length - 5);
+}
+
+export interface PushObjOptions {
+  /** Optional commit/update message */
+  message?: string;
+  /** The original local file path (used for branch-specific resource file resolution) */
+  originalLocalPath?: string;
+  /** Identity to attribute the push to, for the types that carry one */
+  permissionedAsContext?: PermissionedAsContext;
+  /** Whether the item is workspace-specific */
+  wsSpecific?: boolean;
+  /** encryption_key push: non-interactive flag and explicit re-encryption choice */
+  keyPushOpts?: PushWorkspaceKeyOptions;
+  /** TypeScript runtime a bare `.ts` denotes, for raw-app runnables */
+  defaultTs?: "bun" | "deno";
+  /** schedule push into a fork: the file's `enabled` is the parent's */
+  enabledOwnedByParent?: boolean;
 }
 
 /**
@@ -143,8 +201,7 @@ export function showConflict(path: string, local: string, remote: string) {
  * @param newObj - The new object state to push
  * @param plainSecrets - Whether to store secrets in plain text
  * @param alreadySynced - Array to track already synced items
- * @param message - Optional commit/update message
- * @param originalLocalPath - The original local file path (used for branch-specific resource file resolution)
+ * @param opts - Per-type extras; see PushObjOptions
  */
 export async function pushObj(
   workspace: string,
@@ -153,51 +210,72 @@ export async function pushObj(
   newObj: any,
   plainSecrets: boolean,
   alreadySynced: string[],
-  message?: string,
-  originalLocalPath?: string
+  opts: PushObjOptions = {},
 ) {
+  const {
+    message,
+    originalLocalPath,
+    permissionedAsContext,
+    wsSpecific,
+    keyPushOpts,
+    defaultTs,
+    enabledOwnedByParent,
+  } = opts;
   const typeEnding = getTypeStrFromPath(p);
 
   if (typeEnding === "app") {
-    const appName = extractResourceName(p, "app")!;
-    await pushApp(workspace, appName, buildFolderPath(appName, "app"), message);
+    const appName = extractResourceName(p, "app");
+    if (!appName) {
+      throw new Error(`Could not extract app name from path: ${p}`);
+    }
+    await pushApp(workspace, appName, buildFolderPath(appName, "app"), message, permissionedAsContext);
   } else if (typeEnding === "raw_app") {
-    const rawAppName = extractResourceName(p, "raw_app")!;
-    await pushRawApp(workspace, rawAppName, buildFolderPath(rawAppName, "raw_app"), message);
+    const rawAppName = extractResourceName(p, "raw_app");
+    if (!rawAppName) {
+      throw new Error(`Could not extract raw app name from path: ${p}`);
+    }
+    await pushRawApp(workspace, rawAppName, buildFolderPath(rawAppName, "raw_app"), message, defaultTs);
   } else if (typeEnding === "folder") {
     await pushFolder(workspace, p, befObj, newObj);
   } else if (typeEnding === "variable") {
-    await pushVariable(workspace, p, befObj, newObj, plainSecrets);
+    await pushVariable(workspace, p, befObj, newObj, plainSecrets, wsSpecific);
   } else if (typeEnding === "flow") {
-    const flowName = extractResourceName(p, "flow")!;
-    await pushFlow(workspace, flowName, buildFolderPath(flowName, "flow"), message);
+    const flowName = extractResourceName(p, "flow");
+    if (!flowName) {
+      throw new Error(`Could not extract flow name from path: ${p}`);
+    }
+    await pushFlow(workspace, flowName, buildFolderPath(flowName, "flow"), message, permissionedAsContext);
   } else if (typeEnding === "resource") {
     if (!alreadySynced.includes(p)) {
       alreadySynced.push(p);
-      await pushResource(workspace, p, befObj, newObj, originalLocalPath || p);
+      await pushResource(workspace, p, befObj, newObj, originalLocalPath || p, wsSpecific, true);
     }
   } else if (typeEnding === "resource-type") {
     await pushResourceType(workspace, p, befObj, newObj);
   } else if (typeEnding === "schedule") {
-    await pushSchedule(workspace, p, befObj, newObj);
+    await pushSchedule(workspace, p, befObj, newObj, permissionedAsContext, enabledOwnedByParent);
   } else if (typeEnding === "http_trigger") {
-    await pushTrigger("http", workspace, p, befObj, newObj);
+    await pushTrigger("http", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "websocket_trigger") {
-    await pushTrigger("websocket", workspace, p, befObj, newObj);
+    await pushTrigger("websocket", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "kafka_trigger") {
-    await pushTrigger("kafka", workspace, p, befObj, newObj);
+    await pushTrigger("kafka", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "nats_trigger") {
-    await pushTrigger("nats", workspace, p, befObj, newObj);
+    await pushTrigger("nats", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "postgres_trigger") {
-    await pushTrigger("postgres", workspace, p, befObj, newObj);
+    await pushTrigger("postgres", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "mqtt_trigger") {
-    await pushTrigger("mqtt", workspace, p, befObj, newObj);
+    await pushTrigger("mqtt", workspace, p, befObj, newObj, permissionedAsContext);
+  } else if (typeEnding === "amqp_trigger") {
+    await pushTrigger("amqp", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "sqs_trigger") {
-    await pushTrigger("sqs", workspace, p, befObj, newObj);
+    await pushTrigger("sqs", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "gcp_trigger") {
-    await pushTrigger("gcp", workspace, p, befObj, newObj);
+    await pushTrigger("gcp", workspace, p, befObj, newObj, permissionedAsContext);
+  } else if (typeEnding === "azure_trigger") {
+    await pushTrigger("azure", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "email_trigger") {
-    await pushTrigger("email", workspace, p, befObj, newObj);
+    await pushTrigger("email", workspace, p, befObj, newObj, permissionedAsContext);
   } else if (typeEnding === "native_trigger") {
     await pushNativeTrigger(workspace, p, befObj, newObj);
   } else if (typeEnding === "user") {
@@ -209,7 +287,7 @@ export async function pushObj(
   } else if (typeEnding === "settings") {
     await pushWorkspaceSettings(workspace, p, befObj, newObj);
   } else if (typeEnding === "encryption_key") {
-    await pushWorkspaceKey(workspace, p, befObj, newObj);
+    await pushWorkspaceKey(workspace, p, befObj, newObj, keyPushOpts);
   } else {
     throw new Error(
       `The item ${p} has an unrecognized type ending ${typeEnding}`
@@ -221,23 +299,52 @@ export function parseFromPath(p: string, content: string): any {
   return isWorkspaceDependencies(p)
     ? content
     : p.endsWith(".yaml")
-    ? yamlParseContent(p, content)
-    : p.endsWith(".json")
-    ? JSON.parse(content)
-    : content;
+      ? yamlParseContent(p, content)
+      : p.endsWith(".json")
+        ? JSON.parse(content)
+        : content;
 }
 export function parseFromFile(p: string): any {
   if (p.endsWith(".json")) {
-    return JSON.parse(Deno.readTextFileSync(p));
+    return JSON.parse(readTextFileSync(p));
   } else if (p.endsWith(".yaml") || p.endsWith(".yml")) {
-    return yamlParseContent(p, Deno.readTextFileSync(p));
+    return yamlParseContent(p, readTextFileSync(p));
   } else {
     throw new Error("Could not read file " + p);
   }
 }
+/**
+ * Parse a `migrations/datatable/<datatable>/<timestamp>_<name>.(up|down).sql`
+ * path into its parts. Returns undefined for any other path.
+ */
+export function parseDatatableMigrationPath(p: string):
+  | { datatable: string; timestamp: number; name: string; kind: "up" | "down" }
+  | undefined {
+  const parts = p.split("/");
+  if (
+    parts[0] !== "migrations" ||
+    parts[1] !== "datatable" ||
+    parts.length !== 4
+  )
+    return undefined;
+  const m = parts[3].match(/^(\d+)_(.*)\.(up|down)\.sql$/);
+  if (!m) return undefined;
+  return {
+    datatable: parts[2],
+    timestamp: Number(m[1]),
+    name: m[2],
+    kind: m[3] as "up" | "down",
+  };
+}
+
+export function isDatatableMigrationPath(p: string): boolean {
+  return parseDatatableMigrationPath(p) !== undefined;
+}
+
 export function getTypeStrFromPath(
   p: string
 ):
+  | "datatable_migration"
   | "script"
   | "variable"
   | "flow"
@@ -253,15 +360,24 @@ export function getTypeStrFromPath(
   | "nats_trigger"
   | "postgres_trigger"
   | "mqtt_trigger"
+  | "amqp_trigger"
   | "sqs_trigger"
   | "gcp_trigger"
+  | "azure_trigger"
   | "email_trigger"
   | "native_trigger"
   | "user"
   | "group"
   | "settings"
   | "encryption_key"
+  | "shared_lock"
   | "workspace_dependencies" {
+  if (isDatatableMigrationPath(p)) {
+    return "datatable_migration";
+  }
+  if (isScriptModulePath(p)) {
+    return "script";
+  }
   if (isFlowPath(p)) {
     return "flow";
   }
@@ -271,8 +387,15 @@ export function getTypeStrFromPath(
   if (isRawAppPath(p)) {
     return "raw_app";
   }
+  // A repo-side artifact of `dedupeLockfiles`: it has no object on the server.
+  if (isSharedLockPath(p)) {
+    return "shared_lock";
+  }
   if (p.startsWith("dependencies" + SEP)) {
     return "workspace_dependencies";
+  }
+  if (isFileResource(p) || isFilesetResource(p)) {
+    return "resource";
   }
   const parsed = path.parse(p);
   if (
@@ -290,8 +413,13 @@ export function getTypeStrFromPath(
     parsed.ext == ".nu" ||
     parsed.ext == ".java" ||
     parsed.ext == ".rb" ||
+    parsed.ext == ".r" ||
     // for related places search: ADD_NEW_LANG
-    (parsed.ext == ".yml" && parsed.name.split(".").pop() == "playbook")
+    (parsed.ext == ".yml" && parsed.name.split(".").pop() == "playbook") ||
+    // A dbt descriptor is `<project>__dbt/wm_dbt.yaml`. Without this it reads
+    // as one of the CLI's own `.yaml` metadata files and a pull writes the
+    // script's metadata and lock but never its content.
+    isDbtDescriptorPath(p)
   ) {
     return "script";
   }
@@ -326,8 +454,10 @@ export function getTypeStrFromPath(
     typeEnding === "nats_trigger" ||
     typeEnding === "postgres_trigger" ||
     typeEnding === "mqtt_trigger" ||
+    typeEnding === "amqp_trigger" ||
     typeEnding === "sqs_trigger" ||
     typeEnding === "gcp_trigger" ||
+    typeEnding === "azure_trigger" ||
     typeEnding === "email_trigger" ||
     typeEnding === "user" ||
     typeEnding === "group" ||
@@ -336,9 +466,6 @@ export function getTypeStrFromPath(
   ) {
     return typeEnding;
   } else {
-    if (isFileResource(p)) {
-      return "resource";
-    }
     throw new Error("Could not infer type of path " + JSON.stringify(parsed));
   }
 }
@@ -348,12 +475,16 @@ export function removeType(str: string, type: string) {
   const normalizedStr = path.normalize(str).replaceAll(SEP, "/");
 
   if (
-    !normalizedStr.endsWith("." + type + ".yaml") &&
-    !normalizedStr.endsWith("." + type + ".json")
+    normalizedStr.endsWith("." + type + ".yaml") ||
+    normalizedStr.endsWith("." + type + ".json")
   ) {
-    throw new Error(str + " does not end with ." + type + ".(yaml|json)");
+    return normalizedStr.slice(0, normalizedStr.length - type.length - 6);
   }
-  return normalizedStr.slice(0, normalizedStr.length - type.length - 6);
+  // Accept clean paths without the type suffix (e.g. "f/folder/name" instead of "f/folder/name.schedule.yaml")
+  if (normalizedStr.includes("." + type)) {
+    log.debug(`Path '${str}' contains '.${type}' but doesn't end with '.${type}.(yaml|json)' — treating as clean path`);
+  }
+  return normalizedStr;
 }
 
 /**

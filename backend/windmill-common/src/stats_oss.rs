@@ -32,6 +32,7 @@ pub async fn send_stats(
     _http_client: &reqwest::Client,
     _db: &DB,
     _reason: SendStatsReason,
+    _minimal: bool,
 ) -> Result<()> {
     // stats details are closed source
     Ok(())
@@ -49,4 +50,24 @@ pub async fn get_user_usage<'c, E: sqlx::Executor<'c, Database = Postgres>>(
 ) -> Result<ActiveUserUsage> {
     let usage = ActiveUserUsage { author_count: None, operator_count: None };
     Ok(usage)
+}
+
+#[cfg(not(feature = "private"))]
+#[derive(serde::Serialize)]
+pub struct Stats {}
+
+#[cfg(not(feature = "private"))]
+pub async fn get_stats_payload(
+    _db: &DB,
+    _reason: &SendStatsReason,
+    _minimal: bool,
+) -> Result<Stats> {
+    // stats details are closed source
+    Ok(Stats {})
+}
+
+#[cfg(not(feature = "private"))]
+pub fn sign_stats(_json: &str) -> String {
+    // stats details are closed source
+    String::new()
 }

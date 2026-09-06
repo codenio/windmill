@@ -10,9 +10,11 @@ export const importFlowStore = writable<Flow | undefined>(undefined)
 export async function initFlow(
 	flow: Flow,
 	flowStore: StateStore<Flow>,
-	flowStateStore: StateStore<FlowState>
+	flowStateStore: StateStore<FlowState>,
+	// The acting workspace when the flow editor runs in an AI session; else the nav workspace.
+	workspace?: string
 ) {
-	await initFlowState(flow, flowStateStore)
+	await initFlowState(flow, flowStateStore, workspace, flow.path ?? '')
 	flowStore.val = flow
 }
 
@@ -34,9 +36,11 @@ export async function copyFirstStepSchema(
 			})
 			return
 		}
-		return sendUserToast('Only scripts can be used as a input schema', true)
+		sendUserToast('Only scripts can be used as a input schema', true)
+		return
 	}
-	return sendUserToast('No first step found', true)
+	sendUserToast('No first step found', true)
+	return
 }
 
 export async function getFirstStepSchema(flowState: FlowState, flow: OpenFlow) {

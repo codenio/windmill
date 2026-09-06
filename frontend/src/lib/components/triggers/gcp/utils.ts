@@ -19,7 +19,8 @@ export async function saveGcpTriggerFromCfg(
 			: {}
 
 		const requestBody: GcpTriggerData = {
-			gcp_resource_path: cfg.gcp_resource_path,
+			gcp_resource_path: cfg.gcp_resource_path ?? undefined,
+			project_id: cfg.project_id,
 			subscription_mode: cfg.subscription_mode,
 			subscription_id: cfg.subscription_id,
 			delivery_type: cfg.delivery_type,
@@ -32,6 +33,8 @@ export async function saveGcpTriggerFromCfg(
 			is_flow: cfg.is_flow,
 			auto_acknowledge_msg: cfg.auto_acknowledge_msg,
 			ack_deadline: cfg.ack_deadline,
+			permissioned_as: cfg.permissioned_as,
+			preserve_permissioned_as: cfg.preserve_permissioned_as,
 			...errorHandlerAndRetries
 		}
 		if (edit) {

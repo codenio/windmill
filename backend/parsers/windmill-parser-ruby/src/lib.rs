@@ -29,14 +29,19 @@ pub fn parse_ruby_sig_meta(code: &str) -> anyhow::Result<MainArgSignature> {
     root_node.clone().to_string();
     // Traverse the AST to find the Main method signature
     let args = find_main_signature(root_node, code)?;
-    let no_main_func = Some(args.is_none());
+    let auto_kind = if args.is_none() {
+        Some("lib".to_string())
+    } else {
+        None
+    };
 
     let main_sig = MainArgSignature {
         star_args: false,
         star_kwargs: false,
         args: args.unwrap_or_default(),
         has_preprocessor: None,
-        no_main_func,
+        auto_kind,
+        ..Default::default()
     };
 
     Ok(main_sig)
@@ -198,7 +203,7 @@ def private_fn end
 
         assert_eq!(
             sig,
-            MainArgSignature { no_main_func: Some(true), ..Default::default() }
+            MainArgSignature { auto_kind: Some("lib".to_string()), ..Default::default() }
         );
     }
     #[test]
@@ -211,7 +216,7 @@ end
 
         assert_eq!(
             sig,
-            MainArgSignature { no_main_func: Some(false), ..Default::default() }
+            MainArgSignature { auto_kind: None, ..Default::default() }
         );
     }
     #[test]
@@ -235,7 +240,7 @@ end
                     Arg { name: "b".into(), ..Default::default() },
                     Arg { name: "c".into(), ..Default::default() }
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 ..Default::default()
             }
         );
@@ -266,7 +271,7 @@ end
                         ..Default::default()
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 ..Default::default()
             }
         );
@@ -296,7 +301,7 @@ end
                     default: Some(json!({"1": 4, "2": [ 1, 2, 3 ]})),
                     ..Default::default()
                 },],
-                no_main_func: Some(false),
+                auto_kind: None,
                 ..Default::default()
             }
         );
@@ -355,7 +360,7 @@ end
                         ..Default::default()
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 ..Default::default()
             }
         );

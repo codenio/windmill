@@ -39,7 +39,7 @@ export async function saveHttpRouteFromCfg(
 	routeCfg: Record<string, any>,
 	edit: boolean,
 	workspace: string,
-	isAdmin: boolean,
+	_isAdmin: boolean,
 	usedTriggerKinds: Writable<string[]>
 ): Promise<boolean> {
 	const requestBody: NewHttpTrigger = {
@@ -61,7 +61,9 @@ export async function saveHttpRouteFromCfg(
 		error_handler_path: routeCfg.error_handler_path,
 		error_handler_args: routeCfg.error_handler_path ? routeCfg.error_handler_args : undefined,
 		retry: routeCfg.retry,
-		mode: routeCfg.mode
+		mode: routeCfg.mode,
+		permissioned_as: routeCfg.permissioned_as,
+		preserve_permissioned_as: routeCfg.preserve_permissioned_as
 	}
 	try {
 		if (edit) {
@@ -70,7 +72,7 @@ export async function saveHttpRouteFromCfg(
 				path: initialPath,
 				requestBody: {
 					...requestBody,
-					route_path: isAdmin || !edit ? routeCfg.route_path : undefined
+					route_path: routeCfg.route_path
 				}
 			})
 			sendUserToast(`Route ${routeCfg.path} updated`)

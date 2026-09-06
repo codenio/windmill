@@ -13,14 +13,38 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub mod asset_parser;
+pub mod duckdb_builtins;
+pub mod duckdb_macros;
+pub mod sql_materialize;
+
+/// S3 output format for SQL queries (moved here to avoid pulling sqlx into WASM via windmill-types)
+#[derive(Clone, Copy, Debug)]
+pub enum S3ModeFormat {
+    Json,
+    Csv,
+    Parquet,
+}
+
+/// Returns the file extension for the given S3 mode format
+pub fn s3_mode_extension(format: S3ModeFormat) -> &'static str {
+    match format {
+        S3ModeFormat::Json => "json",
+        S3ModeFormat::Csv => "csv",
+        S3ModeFormat::Parquet => "parquet",
+    }
+}
 
 #[derive(Serialize, Debug, PartialEq, Default)]
 pub struct MainArgSignature {
     pub star_args: bool,
     pub star_kwargs: bool,
     pub args: Vec<Arg>,
-    pub no_main_func: Option<bool>,
+    pub auto_kind: Option<String>,
     pub has_preprocessor: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_cmd_binding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_should_process: Option<bool>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -65,6 +89,7 @@ pub enum Typ {
     List(Box<Typ>),
     Bytes,
     Datetime,
+    Date,
     Resource(String),
     Email,
     Sql,
@@ -84,6 +109,15 @@ pub struct Arg {
     pub default: Option<serde_json::Value>,
     pub has_default: bool,
     pub oidx: Option<i32>,
+    /// `true` when `otyp` is the parser's fallback default rather than a value
+    /// the user (or SDK) actually wrote down. Currently only set by the PG SQL
+    /// parser when a placeholder has no `-- $N name (TYPE)` declaration *and*
+    /// no `$N::TYPE` inline cast — the otyp is `"text"` purely as a
+    /// placeholder. Consumers that care about original intent (e.g. the PG
+    /// executor deciding whether to coerce `Number → String` for a text
+    /// target) should treat `otyp_inferred = true` as "type unknown".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub otyp_inferred: bool,
 }
 
 pub fn json_to_typ(js: &Value, precise_arrays: bool) -> Typ {
@@ -125,6 +159,7 @@ pub fn json_to_typ(js: &Value, precise_arrays: bool) -> Typ {
 pub fn to_snake_case(s: &str) -> String {
     s.with_boundaries(&Boundary::defaults())
         .without_boundaries(&Boundary::letter_digit())
+        .without_boundaries(&[Boundary::DigitLower])
         .to_case(Case::Snake)
 }
 
@@ -137,8 +172,8 @@ mod test {
         assert_eq!("s3", to_snake_case("S3"));
         assert_eq!("s3", to_snake_case("s3"));
         assert_eq!("s3_object", to_snake_case("S3Object"));
-        assert_eq!("s3_object", to_snake_case("S3object"));
-        assert_eq!("s3_object", to_snake_case("s3object"));
+        assert_eq!("s3object", to_snake_case("S3object"));
+        assert_eq!("s3object", to_snake_case("s3object"));
         assert_eq!("abc", to_snake_case("ABC"));
         assert_eq!("aa_bc", to_snake_case("AaBC"));
         assert_eq!("a_b_c", to_snake_case("A_B_C"));
@@ -180,6 +215,9 @@ mod test {
     fn test_mixed_case_with_numbers() {
         assert_eq!(to_snake_case("testCase1"), "test_case1");
         assert_eq!(to_snake_case("Test123Case"), "test123_case");
+        // digit followed by lowercase should NOT insert underscore (issue #7934)
+        assert_eq!(to_snake_case("Connect2allApi"), "connect2all_api");
+        assert_eq!(to_snake_case("Foo2barApi"), "foo2bar_api");
     }
 
     #[test]

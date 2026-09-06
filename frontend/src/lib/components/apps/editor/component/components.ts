@@ -1171,7 +1171,7 @@ export const components = {
 	chatcomponent: {
 		name: 'Chat',
 		icon: MessageSquare,
-		documentationLink: `${documentationBaseUrl}/chat`,
+		documentationLink: `${documentationBaseUrl}/app_component_library`,
 		dims: '3:8-6:12' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' },
@@ -1299,7 +1299,7 @@ export const components = {
 	jobprogressbarcomponent: {
 		name: 'Progress Bar by Job Id',
 		icon: Monitor,
-		documentationLink: `${documentationBaseUrl}/progress_bar`,
+		documentationLink: `${documentationBaseUrl}/app_component_library`,
 		dims: '2:2-6:2' as AppComponentDimensions,
 		customCss: {
 			header: { class: '', style: '' },
@@ -1467,7 +1467,7 @@ export const components = {
 		name: 'Code Input',
 		icon: Code,
 		dims: '2:1-4:4' as AppComponentDimensions,
-		documentationLink: `${documentationBaseUrl}/code`,
+		documentationLink: `${documentationBaseUrl}/code_input`,
 		customCss: {
 			text: { class: '', style: '' },
 			container: { class: '', style: '' }
@@ -1810,7 +1810,7 @@ export const components = {
 	piechartcomponent: {
 		name: 'Pie Chart',
 		icon: PieChart,
-		documentationLink: `${documentationBaseUrl}/pie_chart`,
+		documentationLink: `${documentationBaseUrl}/chartjs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -1919,7 +1919,7 @@ export const components = {
 	barchartcomponent: {
 		name: 'Bar/Line Chart',
 		icon: BarChart4,
-		documentationLink: `${documentationBaseUrl}/bar_line_chart`,
+		documentationLink: `${documentationBaseUrl}/chartjs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -2132,7 +2132,7 @@ This is a paragraph.
 	timeseriescomponent: {
 		name: 'Timeseries',
 		icon: GripHorizontal,
-		documentationLink: `${documentationBaseUrl}/timeseries`,
+		documentationLink: `${documentationBaseUrl}/chartjs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -2206,7 +2206,7 @@ This is a paragraph.
 	scatterchartcomponent: {
 		name: 'Scatter Chart',
 		icon: GripHorizontal,
-		documentationLink: `${documentationBaseUrl}/scatter_chart`,
+		documentationLink: `${documentationBaseUrl}/chartjs`,
 		dims: '2:8-6:8' as AppComponentDimensions,
 		customCss: {
 			container: { class: '', style: '' }
@@ -3069,18 +3069,7 @@ This is a paragraph.
 					type: 'static',
 					value: 'yyyy-MM-dd',
 					fieldType: 'text',
-					markdownTooltip: `### Output format
-See date-fns format for more information. By default, it is 'yyyy-MM-dd'
-
-| Format      | Result | Description |
-| ----------- | ----------- | ----------- |
-| dd 				| 01, 02, ..., 31 | Day of the month |
-| d 				| 1, 2, ..., 31 | Day of the month |
-| MM 				| 01, 02, ..., 12 | Month |
-| MMM 				| Jan, Feb, ..., Dec | Month |
-| MMMM 				| January, February, ..., December | Month |
-| yyyy 				| 2021, 2022, ... | Year |
-`,
+					tooltip: `<b>Output format</b><br>See date-fns format for more information. Default: <code>yyyy-MM-dd</code><table class="mt-1 text-2xs"><tr><th class="pr-2 text-left">Format</th><th class="pr-2 text-left">Result</th><th class="text-left">Description</th></tr><tr><td><code>dd</code></td><td>01, 02, ..., 31</td><td>Day of the month</td></tr><tr><td><code>d</code></td><td>1, 2, ..., 31</td><td>Day of the month</td></tr><tr><td><code>MM</code></td><td>01, 02, ..., 12</td><td>Month</td></tr><tr><td><code>MMM</code></td><td>Jan, Feb, ..., Dec</td><td>Month</td></tr><tr><td><code>MMMM</code></td><td>January, ..., December</td><td>Month</td></tr><tr><td><code>yyyy</code></td><td>2021, 2022, ...</td><td>Year</td></tr></table>`,
 
 					documentationLink: 'https://date-fns.org/v2.30.0/docs/format',
 					placeholder: 'yyyy-MM-dd'
@@ -3131,21 +3120,7 @@ See date-fns format for more information. By default, it is 'yyyy-MM-dd'
 					fieldType: 'text',
 					documentationLink: 'https://date-fns.org/v2.30.0/docs/format',
 					placeholder: 'dd.MM.yyyy HH:mm',
-					markdownTooltip: `### Output format
-See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
-
-| Format      | Result | Description |
-| ----------- | ----------- | ----------- |
-| dd 				| 01, 02, ..., 31 | Day of the month |
-| d 				| 1, 2, ..., 31 | Day of the month |
-| MM 				| 01, 02, ..., 12 | Month |
-| MMM 				| Jan, Feb, ..., Dec | Month |
-| MMMM 				| January, February, ..., December | Month |
-| yyyy 				| 2021, 2022, ... | Year |
-| HH 				| 00, 01, ..., 23 | Hours |
-| mm 				| 00, 01, ..., 59 | Minutes |
-| ss 				| 00, 01, ..., 59 | Seconds |
-					`
+					tooltip: `<b>Output format</b><br>See date-fns format for more information. Default: <code>dd.MM.yyyy HH:mm</code><table class="mt-1 text-2xs"><tr><th class="pr-2 text-left">Format</th><th class="pr-2 text-left">Result</th><th class="text-left">Description</th></tr><tr><td><code>dd</code></td><td>01, 02, ..., 31</td><td>Day of the month</td></tr><tr><td><code>d</code></td><td>1, 2, ..., 31</td><td>Day of the month</td></tr><tr><td><code>MM</code></td><td>01, 02, ..., 12</td><td>Month</td></tr><tr><td><code>MMM</code></td><td>Jan, Feb, ..., Dec</td><td>Month</td></tr><tr><td><code>MMMM</code></td><td>January, ..., December</td><td>Month</td></tr><tr><td><code>yyyy</code></td><td>2021, 2022, ...</td><td>Year</td></tr><tr><td><code>HH</code></td><td>00, 01, ..., 23</td><td>Hours</td></tr><tr><td><code>mm</code></td><td>00, 01, ..., 59</td><td>Minutes</td></tr><tr><td><code>ss</code></td><td>00, 01, ..., 59</td><td>Seconds</td></tr></table>`
 				},
 				defaultValue: {
 					type: 'static',
@@ -4158,7 +4133,8 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 						snowflake: 'Snowflake',
 						bigquery: 'BigQuery',
 						snowflake_oauth: 'Snowflake OAuth',
-						ducklake: 'Ducklake'
+						ducklake: 'Ducklake',
+						datatable: 'Data table'
 					},
 					configuration: {
 						postgresql: {
@@ -4183,14 +4159,16 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 								type: 'static',
 								fieldType: 'resource',
 								subFieldType: 'mysql',
-								value: ''
+								value: '',
+								allowTypeChange: false
 							} as StaticAppInput,
 							table: {
 								fieldType: 'select',
 								subFieldType: 'db-table',
 								type: 'static',
 								selectOptions: [],
-								value: undefined
+								value: undefined,
+								allowTypeChange: false
 							}
 						},
 						ms_sql_server: {
@@ -4198,14 +4176,16 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 								type: 'static',
 								fieldType: 'resource',
 								subFieldType: 'ms_sql_server',
-								value: ''
+								value: '',
+								allowTypeChange: false
 							} as StaticAppInput,
 							table: {
 								fieldType: 'select',
 								subFieldType: 'db-table',
 								type: 'static',
 								selectOptions: [],
-								value: undefined
+								value: undefined,
+								allowTypeChange: false
 							}
 						},
 						snowflake: {
@@ -4213,14 +4193,16 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 								type: 'static',
 								fieldType: 'resource',
 								subFieldType: 'snowflake',
-								value: ''
+								value: '',
+								allowTypeChange: false
 							} as StaticAppInput,
 							table: {
 								fieldType: 'select',
 								subFieldType: 'db-table',
 								type: 'static',
 								selectOptions: [],
-								value: undefined
+								value: undefined,
+								allowTypeChange: false
 							}
 						},
 						bigquery: {
@@ -4228,14 +4210,16 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 								type: 'static',
 								fieldType: 'resource',
 								subFieldType: 'bigquery',
-								value: ''
+								value: '',
+								allowTypeChange: false
 							} as StaticAppInput,
 							table: {
 								fieldType: 'select',
 								subFieldType: 'db-table',
 								type: 'static',
 								selectOptions: [],
-								value: undefined
+								value: undefined,
+								allowTypeChange: false
 							}
 						},
 						ducklake: {
@@ -4243,14 +4227,33 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 								type: 'static',
 								fieldType: 'ducklake',
 								subFieldType: 'ducklake',
-								value: ''
+								value: '',
+								allowTypeChange: false
 							} as StaticAppInput,
 							table: {
 								fieldType: 'select',
 								subFieldType: 'db-table',
 								type: 'static',
 								selectOptions: [],
-								value: undefined
+								value: undefined,
+								allowTypeChange: false
+							}
+						},
+						datatable: {
+							datatable: {
+								type: 'static',
+								fieldType: 'datatable',
+								subFieldType: 'datatable',
+								value: '',
+								allowTypeChange: false
+							} as StaticAppInput,
+							table: {
+								fieldType: 'select',
+								subFieldType: 'db-table',
+								type: 'static',
+								selectOptions: [],
+								value: undefined,
+								allowTypeChange: false
 							}
 						}
 					}
@@ -4260,7 +4263,8 @@ See date-fns format for more information. By default, it is 'dd.MM.yyyy HH:mm'
 					fieldType: 'array',
 					subFieldType: 'db-explorer',
 					value: [],
-					loading: false
+					loading: false,
+					allowTypeChange: false
 				} as StaticAppInput,
 				rowIdCol: {
 					type: 'static',

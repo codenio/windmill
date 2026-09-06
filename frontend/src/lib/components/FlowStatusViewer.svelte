@@ -5,7 +5,7 @@
 	import type { DurationStatus, FlowStatusViewerContext, GraphModuleState } from './graph'
 	import { isOwner as loadIsOwner, type StateStore } from '$lib/utils'
 	import { userStore, workspaceStore } from '$lib/stores'
-	import type { CompletedJob, Job } from '$lib/gen'
+	import type { CompletedJob, FlowModule, FlowNote, FlowValue, Job } from '$lib/gen'
 
 	interface Props {
 		jobId: string
@@ -23,6 +23,11 @@
 		isOwner?: boolean
 		wideResults?: boolean
 		localModuleStates?: Record<string, GraphModuleState>
+		/** Cached subflow definitions, keyed by graph node id (subflow step id, with
+		 * `subflow:` prefix for nested subflows). Populated as the user expands a
+		 * subflow in the graph. Bindable so callers can use it to walk inside
+		 * subflows (e.g. for nested-restart path-finding). */
+		expandedSubflows?: Record<string, { modules: FlowModule[]; groups?: any[] }>
 		localDurationStatuses?: Record<string, DurationStatus>
 		job?: Job | undefined
 		render?: boolean
@@ -34,6 +39,8 @@
 		onJobsLoaded?: ({ job, force }: { job: Job; force: boolean }) => void
 		onDone?: ({ job }: { job: CompletedJob }) => void
 		showLogsWithResult?: boolean
+		notes?: FlowNote[]
+		groups?: FlowValue['groups']
 	}
 
 	let {
@@ -42,6 +49,7 @@
 		workspaceId = undefined,
 		flowState = $bindable({}),
 		selectedJobStep = $bindable(undefined),
+		hideFlowResult = false,
 		hideTimeline = false,
 		hideDownloadInGraph = false,
 		hideNodeDefinition = false,
@@ -51,6 +59,15 @@
 		isOwner = $bindable(false),
 		wideResults = false,
 		localModuleStates = $bindable({}),
+		// `$bindable({})` is the right shape for this prop despite CLAUDE.md's
+		// general guidance against `$bindable(default_value)`: that rule targets
+		// props where `undefined` has distinct semantics from "empty default".
+		// For a Map-typed cache populated by the inner component, callers that
+		// don't bind it should still see a usable empty map (the inner writes to
+		// it when the user expands a subflow). Without the `{}` default, those
+		// callers would crash at write time. Same reasoning applies to the
+		// pre-existing `localModuleStates`/`localDurationStatuses` bindables.
+		expandedSubflows = $bindable({}),
 		localDurationStatuses = $bindable({}),
 		job = $bindable(undefined),
 		render = true,
@@ -59,10 +76,12 @@
 		onStart,
 		onJobsLoaded,
 		onDone,
-		showLogsWithResult = false
+		showLogsWithResult = false,
+		notes: notesProp = undefined,
+		groups: groupsProp = undefined
 	}: Props = $props()
 
-	let lastJobId: string = jobId
+	let lastJobId: string = untrack(() => jobId)
 
 	let retryStatus = $state({ val: {} })
 	let globalRefreshes: Record<string, ((clear, root) => Promise<void>)[]> = $state({})
@@ -71,11 +90,11 @@
 		flowState,
 		suspendStatus,
 		retryStatus,
-		hideDownloadInGraph,
-		hideNodeDefinition,
-		hideTimeline,
-		hideJobId,
-		hideDownloadLogs
+		hideDownloadInGraph: untrack(() => hideDownloadInGraph),
+		hideNodeDefinition: untrack(() => hideNodeDefinition),
+		hideTimeline: untrack(() => hideTimeline),
+		hideJobId: untrack(() => hideJobId),
+		hideDownloadLogs: untrack(() => hideDownloadLogs)
 	})
 
 	function loadOwner(path: string) {
@@ -92,6 +111,10 @@
 			for (let key in localModuleStates) delete flowState[key]
 			localDurationStatuses = {}
 			localModuleStates = {}
+			// Reset the subflow definition cache too — a new run can reference
+			// different subflow versions; stale entries would confuse nested
+			// restart path-finding.
+			expandedSubflows = {}
 		}
 	}
 
@@ -128,6 +151,7 @@
 		}}
 		globalModuleStates={[]}
 		bind:localModuleStates
+		bind:expandedSubflows
 		bind:selectedNode={selectedJobStep}
 		bind:localDurationStatuses
 		{onStart}
@@ -171,5 +195,8 @@
 			}
 		}}
 		{showLogsWithResult}
+		{hideFlowResult}
+		notes={notesProp}
+		groups={groupsProp}
 	/>
 {/key}

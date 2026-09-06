@@ -38,8 +38,6 @@ use uuid::Uuid;
 
 use windmill_common::job_metrics;
 
-#[cfg(target_os = "linux")]
-use tokio::io::AsyncWriteExt;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::{broadcast, watch},
@@ -52,16 +50,15 @@ use futures::{
 };
 
 use crate::common::{resolve_job_timeout, OccupancyMetrics, StreamNotifier};
-use crate::job_logger::{append_job_logs, append_result_stream, append_with_limit};
+use crate::job_logger::{append_job_logs, append_result_stream, append_with_limit, strip_nul};
 use crate::job_logger_oss::process_streaming_log_lines;
 use crate::worker_utils::{ping_job_status, update_worker_ping_from_job};
 use crate::{MAX_RESULT_SIZE, MAX_WAIT_FOR_SIGINT, MAX_WAIT_FOR_SIGTERM};
 
-use windmill_common::tracing_init::{QUIET_MODE, VERBOSE_TARGET};
+use windmill_common::tracing_init::{OTEL_JOB_LOGS, OTEL_PREFIX, QUIET_MODE, VERBOSE_TARGET};
 
 lazy_static::lazy_static! {
     pub static ref SLOW_LOGS: bool = std::env::var("SLOW_LOGS").ok().is_some_and(|x| x == "1" || x == "true");
-    pub static ref OTEL_JOB_LOGS: bool = std::env::var("OTEL_JOB_LOGS").ok().is_some_and(|x| x == "1" || x == "true");
 }
 
 //  - kill windows process along with all child processes
@@ -92,6 +89,18 @@ async fn kill_process_tree(pid: Option<u32>) -> Result<(), String> {
 
 pub struct HandleChildResult {
     pub result_stream: Option<String>,
+    /// Last non-empty line the child wrote to **stdout**, unmasked, for executors
+    /// whose result convention is "last line of stdout" and that have no wrapper
+    /// script to tee it to a file (sandboxed containers). stderr is excluded: the two
+    /// pipes are merged by a fair `select`, so their relative order is arbitrary — a
+    /// diagnostic on stderr must not be able to win over the real result.
+    pub last_line: Option<String>,
+}
+
+/// A line read from a child, tagged with the pipe it came from.
+struct OutputLine {
+    stderr: bool,
+    line: String,
 }
 
 /// - wait until child exits and return with exit status
@@ -128,17 +137,20 @@ pub async fn handle_child(
     let pid = child.id();
     #[cfg(target_os = "linux")]
     if let Some(pid) = pid {
-        //set the highest oom priority
-        if let Some(mut file) = File::create(format!("/proc/{pid}/oom_score_adj"))
-            .await
-            .map_err(|e| {
-                tracing::error!("Could not create oom_score_file to pid {pid}: {e:#}");
-                e
-            })
-            .ok()
-        {
-            let _ = file.write_all(b"1000").await;
-            let _ = file.sync_all().await;
+        let oom_score_adj = *windmill_common::worker::JOB_OOM_SCORE_ADJ;
+        // procfs handles writes synchronously in-kernel; no fsync (it returns
+        // EINVAL on procfs files).
+        match std::fs::write(
+            format!("/proc/{pid}/oom_score_adj"),
+            oom_score_adj.to_string(),
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(
+                    "Failed to set oom_score_adj={oom_score_adj} for pid {pid}: {e:#}. \
+                    OOM killer may target the worker instead of this job"
+                );
+            }
         }
     } else {
         tracing::info!("could not get child pid");
@@ -311,6 +323,7 @@ pub async fn handle_child(
     };
 
     let mut stream_result = Vec::new();
+    let mut last_line = String::new();
     /* a future that reads output from the child and appends to the database */
     let lines = write_lines(
         output,
@@ -325,6 +338,7 @@ pub async fn handle_child(
         child_name,
         &mut stream_result,
         stream_notifier,
+        Some(&mut last_line),
     )
     .instrument(trace_span!("child_lines"));
 
@@ -339,7 +353,10 @@ pub async fn handle_child(
         _ if *too_many_logs.borrow() => Err(Error::ExecutionErr(format!(
             "logs or result reached limit. (current max size: {MAX_RESULT_SIZE} characters)"
         ))),
-        Ok(Ok(status)) => process_status(&child_name, status, stream_result),
+        Ok(Ok(status)) => process_status(&child_name, status, stream_result).map(|mut r| {
+            r.last_line = (!last_line.is_empty()).then_some(last_line);
+            r
+        }),
         Ok(Err(kill_reason)) => match kill_reason {
             KillReason::AlreadyCompleted => {
                 Err(Error::AlreadyCompleted("Job already completed".to_string()))
@@ -352,10 +369,10 @@ pub async fn handle_child(
     }
 }
 
-pub const OTEL_PREFIX: &str = "OTEL: ";
+pub const WAC_STEP_PREFIX: &str = "WM_WAC_STEP: ";
 
-pub async fn write_lines(
-    output: impl stream::Stream<Item = io::Result<String>> + Send,
+async fn write_lines(
+    output: impl stream::Stream<Item = io::Result<OutputLine>> + Send,
     job_id: &Uuid,
     w_id: &str,
     worker: &str,
@@ -367,6 +384,7 @@ pub async fn write_lines(
     child_name: &str,
     stream_result: &mut Vec<String>,
     stream_notifier: Option<StreamNotifier>,
+    mut last_line: Option<&mut String>,
 ) {
     let max_log_size = if *CLOUD_HOSTED {
         MAX_RESULT_SIZE
@@ -426,18 +444,47 @@ pub async fn write_lines(
         let job_id = job_id.clone();
         let mut nstream = String::new();
 
+        // Snapshot secrets once per batch — no lock needed per line.
+        // Trade-off: secrets registered mid-batch (between snapshot and log line)
+        // won't be masked until the next batch. In practice the async HTTP round-trip
+        // to fetch a secret completes before the script's log line arrives.
+        let mask_snapshot = windmill_common::sensitive_log_masks::snapshot(&job_id);
+
         while let Some(line) = read_lines.next().await {
             match line {
-                Ok(line) => {
+                Ok(OutputLine { stderr, line }) => {
                     if line.is_empty() {
                         continue;
                     }
+                    // Masking is a log concern only: `mask` also appends a multi-line
+                    // notice, which would end up inside a captured result. Keep `line`
+                    // raw and log `logged`.
+                    let masked = mask_snapshot
+                        .as_ref()
+                        .and_then(|snap| match snap.mask(&line) {
+                            std::borrow::Cow::Owned(masked) => Some(masked),
+                            std::borrow::Cow::Borrowed(_) => None,
+                        });
+                    let logged = masked.as_deref().unwrap_or(line.as_str());
                     if *OTEL_JOB_LOGS {
-                        if let Some(otel_suffix) = line.strip_prefix(OTEL_PREFIX) {
+                        if let Some(otel_suffix) = logged.strip_prefix(OTEL_PREFIX) {
                             tracing::event!(tracing::Level::INFO, otel_suffix);
                         }
                     }
-                    if let Some(stream) = extract_stream_from_logs(&line) {
+                    if let Some(step_json) = logged.strip_prefix(WAC_STEP_PREFIX) {
+                        // Real-time WAC step start marker — fire-and-forget DB write
+                        let conn = conn.clone();
+                        let job_id = job_id.clone();
+                        let step_json = step_json.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_wac_step_marker(&conn, &job_id, &step_json).await
+                            {
+                                tracing::warn!(%job_id, "Failed to write WAC step marker: {e}");
+                            }
+                        });
+                        continue;
+                    }
+                    if let Some(stream) = extract_stream_from_logs(logged) {
                         let len = stream.len();
                         if log_remaining >= len {
                             log_remaining -= len;
@@ -447,7 +494,15 @@ pub async fn write_lines(
                             log_remaining = 0;
                         }
                     } else {
-                        append_with_limit(&mut joined, &line, &mut log_remaining);
+                        if let Some(buf) = last_line.as_mut() {
+                            if !stderr && !line.trim().is_empty() {
+                                buf.clear();
+                                // Same NUL scrub the log path applies: Postgres rejects
+                                // a NUL in the resulting jsonb too.
+                                buf.push_str(&strip_nul(&line));
+                            }
+                        }
+                        append_with_limit(&mut joined, logged, &mut log_remaining);
                     }
                     if log_remaining == 0 {
                         tracing::info!(%job_id, "Too many logs lines for job {job_id}");
@@ -564,6 +619,58 @@ pub async fn write_lines(
     }
 }
 
+/// Handle a real-time WAC step start marker emitted via stdout.
+/// Writes a timeline entry (with started_at but no duration_ms) to workflow_as_code_status
+/// so the frontend can show the step immediately while it's still running.
+async fn handle_wac_step_marker(
+    conn: &Connection,
+    job_id: &Uuid,
+    json_str: &str,
+) -> error::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct StepMarker {
+        key: String,
+        started_at: String,
+    }
+    let marker: StepMarker = serde_json::from_str(json_str).map_err(|e| {
+        error::Error::internal_err(format!("Failed to parse WM_WAC_STEP marker: {e}"))
+    })?;
+
+    let step_timeline_key = format!("_step/{}", marker.key);
+    let timeline_val = serde_json::json!({
+        "scheduled_for": marker.started_at,
+        "started_at": marker.started_at,
+        "name": marker.key,
+    });
+
+    match conn {
+        Connection::Sql(db) => {
+            sqlx::query(
+                "INSERT INTO v2_job_status (id, workflow_as_code_status)
+                 VALUES ($1, jsonb_build_object($2, $3::jsonb))
+                 ON CONFLICT (id) DO UPDATE SET
+                 workflow_as_code_status = jsonb_set(
+                     COALESCE(v2_job_status.workflow_as_code_status, '{}'::jsonb),
+                     ARRAY[$2],
+                     $3::jsonb
+                 )",
+            )
+            .bind(job_id)
+            .bind(&step_timeline_key)
+            .bind(&timeline_val)
+            .execute(db)
+            .await
+            .map_err(|e| {
+                error::Error::internal_err(format!("DB error writing WAC step marker: {e}"))
+            })?;
+        }
+        Connection::Http(_) => {
+            // Agent workers don't support WAC v2 yet
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn get_mem_peak(pid: Option<u32>, nsjail: bool) -> i32 {
     if pid.is_none() {
         return -1;
@@ -612,6 +719,68 @@ pub(crate) async fn get_mem_peak(pid: Option<u32>, nsjail: bool) -> i32 {
     } else {
         // rand::random::<i32>() % 100 // to remove - used to fake memory data on MacOS
         -3
+    }
+}
+
+/// The job state a command run outside the main script needs to stay
+/// cancellable. `dbt deps` can hang on an unreachable package endpoint and
+/// `dbt parse`/`ls` on a warehouse handshake, so running them detached would
+/// hold a worker slot past a cancel or a timeout.
+pub struct JobCtx<'a> {
+    pub mem_peak: &'a mut i32,
+    pub canceled_by: &'a mut Option<CanceledBy>,
+    pub occupancy_metrics: &'a mut OccupancyMetrics,
+    pub worker_name: &'a str,
+    pub deadline: JobDeadline,
+}
+
+impl JobCtx<'_> {
+    /// What is left of the job's wall clock, for the phase about to start.
+    pub fn timeout(&self) -> Option<i32> {
+        self.deadline.remaining_secs()
+    }
+}
+
+/// One wall clock for a job that runs several subprocesses in sequence.
+///
+/// Both `handle_child` and `run_future_with_polling_update_job_poller` resolve
+/// the timeout they are handed into a fresh duration, so handing each phase the
+/// job's full timeout lets a job with N phases run for N times it. Resolved
+/// once at the start, then spent down.
+#[derive(Clone, Copy)]
+pub struct JobDeadline(Option<Instant>);
+
+impl JobDeadline {
+    pub async fn start(
+        conn: &Connection,
+        w_id: &str,
+        job_id: Uuid,
+        custom_timeout: Option<i32>,
+    ) -> Self {
+        let (d, _, _) = resolve_job_timeout(conn, w_id, job_id, custom_timeout).await;
+        Self(Some(Instant::now() + d))
+    }
+
+    /// Whether the job's wall clock is already spent.
+    ///
+    /// Distinct from `remaining_secs`, which deliberately never reports zero:
+    /// an expired budget still has to hand the next phase a positive timeout so
+    /// the poller fires. A caller deciding whether to START more work needs the
+    /// honest answer.
+    pub fn is_expired(&self) -> bool {
+        self.0.is_some_and(|d| d <= Instant::now())
+    }
+
+    pub fn remaining_secs(&self) -> Option<i32> {
+        let deadline = self.0?;
+        // A non-positive timeout reads as "unset" downstream, so an expired
+        // budget must still ask for a positive one and let the poller fire.
+        Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .clamp(1, i32::MAX as u64) as i32,
+        )
     }
 }
 
@@ -672,6 +841,96 @@ where
     }?;
     drop(tx);
     Ok(rows)
+}
+
+/// Outcome of [`run_future_with_polling_update_job_poller_graceful`].
+pub enum GracefulPollOutcome<T> {
+    /// The future completed normally.
+    Ok(T),
+    /// The job timed out.
+    Timeout(u64),
+    /// The job was cancelled and the future finished within the grace period.
+    Cancelled { canceled_by: Option<CanceledBy> },
+    /// The job was cancelled but the future did NOT finish within the grace period.
+    CancelledTimeout { canceled_by: Option<CanceledBy> },
+    /// The job was already moved to v2_job_completed externally.
+    AlreadyCompleted,
+}
+
+/// Like [`run_future_with_polling_update_job_poller`] but on cancellation, signals
+/// `cancel_tx` and waits up to `grace_period` for the future to finish instead of
+/// dropping it immediately. This lets in-flight work (e.g. AI tool calls) complete
+/// and clean up properly.
+pub async fn run_future_with_polling_update_job_poller_graceful<Fut, T, S>(
+    job_id: Uuid,
+    timeout: Option<i32>,
+    conn: &Connection,
+    mem_peak: &mut i32,
+    canceled_by_ref: &mut Option<CanceledBy>,
+    result_f: Fut,
+    worker_name: &str,
+    w_id: &str,
+    occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
+    get_mem: S,
+    cancel_tx: watch::Sender<bool>,
+    grace_period: std::time::Duration,
+) -> error::Result<GracefulPollOutcome<T>>
+where
+    Fut: Future<Output = error::Result<T>>,
+    S: stream::Stream<Item = i32> + Unpin,
+{
+    let (tx, rx) = broadcast::channel::<()>(3);
+
+    let mut update_job = Box::pin(update_job_poller(
+        job_id,
+        conn,
+        mem_peak,
+        canceled_by_ref,
+        get_mem,
+        worker_name,
+        w_id,
+        rx,
+        occupancy_metrics,
+    ));
+
+    let timeout_ms = u64::try_from(
+        resolve_job_timeout(conn, w_id, job_id, timeout)
+            .await
+            .0
+            .as_millis(),
+    )
+    .unwrap_or(200_000);
+
+    let mut result_f = Box::pin(result_f);
+
+    let outcome = tokio::select! {
+        biased;
+        result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            &mut result_f,
+        ) => {
+            match result {
+                Ok(Ok(v)) => GracefulPollOutcome::Ok(v),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => GracefulPollOutcome::Timeout(timeout_ms),
+            }
+        }
+        ex = &mut update_job, if job_id != Uuid::nil() => {
+            match ex {
+                UpdateJobPollingExit::Done(cb) => {
+                    let _ = cancel_tx.send(true);
+                    match tokio::time::timeout(grace_period, &mut result_f).await {
+                        Ok(_) => GracefulPollOutcome::Cancelled { canceled_by: cb },
+                        Err(_) => GracefulPollOutcome::CancelledTimeout { canceled_by: cb },
+                    }
+                }
+                UpdateJobPollingExit::AlreadyCompleted => GracefulPollOutcome::AlreadyCompleted,
+            }
+        }
+    };
+
+    drop(tx);
+    Ok(outcome)
 }
 
 pub enum UpdateJobPollingExit {
@@ -737,21 +996,24 @@ where
                 let update_job_row = i == 2 || (!*SLOW_LOGS && (i < 20 || (i < 120 && i % 5 == 0) || i % 10 == 0)) || i % 20 == 0;
                 if update_job_row && job_id != Uuid::nil() {
                     if let Connection::Sql(ref db) = conn {
-                        // tracking metric starting at i >= 2 b/c first point it useless and we don't want to track metric for super fast jobs
-                        if i == 2 {
-                            memory_metric_id = job_metrics::register_metric_for_job(
-                                &db,
-                                w_id.to_string(),
-                                job_id,
-                                "memory_kb".to_string(),
-                                job_metrics::MetricKind::TimeseriesInt,
-                                Some("Job Memory Footprint (kB)".to_string()),
-                            )
-                            .await;
-                        }
-                        if let Ok(ref metric_id) = memory_metric_id {
-                            if let Err(err) = job_metrics::record_metric(&db, w_id.to_string(), job_id, metric_id.to_owned(), job_metrics::MetricNumericValue::Integer(current_mem)).await {
-                                tracing::error!("Unable to save memory stat for job {} in workspace {}. Error was: {:?}", job_id, w_id, err);
+                        // Only track memory when it's non-zero (avoids storing all-zero timeseries for jobs that don't report memory)
+                        if current_mem > 0 {
+                            // Register on first non-zero reading (deferred from i==2 to avoid metric for jobs with no memory reporting)
+                            if memory_metric_id.is_err() {
+                                memory_metric_id = job_metrics::register_metric_for_job(
+                                    &db,
+                                    w_id.to_string(),
+                                    job_id,
+                                    "memory_kb".to_string(),
+                                    job_metrics::MetricKind::TimeseriesInt,
+                                    Some("Job Memory Footprint (kB)".to_string()),
+                                )
+                                .await;
+                            }
+                            if let Ok(ref metric_id) = memory_metric_id {
+                                if let Err(err) = job_metrics::record_timeseries_value(&db, w_id.to_string(), job_id, metric_id.to_owned(), job_metrics::MetricNumericValue::Integer(current_mem), job_metrics::MetricKind::TimeseriesInt).await {
+                                    tracing::error!("Unable to save memory stat for job {} in workspace {}. Error was: {:?}", job_id, w_id, err);
+                                }
                             }
                         }
                     }
@@ -795,7 +1057,7 @@ fn child_joined_output_stream(
     child: &mut Box<dyn TokioChildWrapper>,
     job_id: Uuid,
     w_id: String,
-) -> impl stream::FusedStream<Item = io::Result<String>> {
+) -> impl stream::FusedStream<Item = io::Result<OutputLine>> {
     let stderr = child
         .stderr()
         .take()
@@ -809,8 +1071,10 @@ fn child_joined_output_stream(
     let stdout = BufReader::new(stdout).lines();
     let stderr = BufReader::new(stderr).lines();
     stream::select(
-        lines_to_stream(stderr, true, job_id.clone(), w_id.clone()),
-        lines_to_stream(stdout, false, job_id, w_id),
+        lines_to_stream(stderr, true, job_id.clone(), w_id.clone())
+            .map(|l| l.map(|line| OutputLine { stderr: true, line })),
+        lines_to_stream(stdout, false, job_id, w_id)
+            .map(|l| l.map(|line| OutputLine { stderr: false, line })),
     )
 }
 
@@ -839,6 +1103,7 @@ pub fn process_status(
             } else {
                 Some(stream_result.join(""))
             },
+            last_line: None,
         })
     } else if let Some(code) = status.code() {
         Err(error::Error::ExitStatus(program.to_string(), code))
@@ -855,5 +1120,21 @@ pub fn process_status(
         return Err(error::Error::ExecutionErr(String::from(
             "process terminated by signal",
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A non-positive timeout means "unset" to `resolve_job_timeout`, so an
+    // exhausted budget that reported 0 would hand the next phase no deadline at
+    // all — the opposite of what running out of time should do.
+    #[test]
+    fn an_exhausted_budget_still_asks_for_a_positive_timeout() {
+        let spent = JobDeadline(Some(Instant::now() - Duration::from_secs(30)));
+        assert_eq!(spent.remaining_secs(), Some(1));
+        let left = JobDeadline(Some(Instant::now() + Duration::from_secs(120)));
+        assert!(matches!(left.remaining_secs(), Some(s) if (118..=120).contains(&s)));
     }
 }

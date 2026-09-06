@@ -30,7 +30,14 @@
                 "sqs",
                 "gcp",
                 "mqtt",
-                "nextcloud"
+                "nextcloud",
+                "google",
+                "ci_test",
+                "github",
+                "azure",
+                "asset",
+                "freshness",
+                "amqp"
               ]
             }
           }

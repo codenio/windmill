@@ -1,15 +1,19 @@
 <script lang="ts">
+	import { run } from 'svelte/legacy'
+
 	import IconedResourceType from './IconedResourceType.svelte'
 	import TextInput from './text_input/TextInput.svelte'
+	import Password from './Password.svelte'
 	import Toggle from './Toggle.svelte'
+	import SettingCard from './instanceSettings/SettingCard.svelte'
 
-	export let value: any
+	interface Props {
+		value: any
+	}
 
-	$: enabled = value != undefined
+	let { value = $bindable() }: Props = $props()
 
-	let org = ''
-
-	$: changeOrg(org)
+	let org = $state('')
 
 	function changeOrg(org) {
 		if (value) {
@@ -29,10 +33,14 @@
 			}
 		}
 	}
+	let enabled = $derived(value != undefined)
+	run(() => {
+		changeOrg(org)
+	})
 </script>
 
 <div class="flex flex-col gap-1">
-	<!-- svelte-ignore a11y-label-has-associated-control -->
+	<!-- svelte-ignore a11y_label_has_associated_control -->
 	<label class="text-xs font-semibold text-emphasis flex gap-4 items-center"
 		><div class="w-[120px]"><IconedResourceType name={'authelia'} after={true} /></div><Toggle
 			checked={enabled}
@@ -46,7 +54,7 @@
 		/></label
 	>
 	{#if enabled}
-		<div class="border rounded p-4 flex flex-col gap-6">
+		<SettingCard class="flex flex-col gap-6">
 			<label class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs">Authelia Url</span>
 				<span class="text-secondary font-normal text-xs"
@@ -68,13 +76,14 @@
 					bind:value={value['id']}
 				/>
 			</label>
-			<label class="flex flex-col gap-1">
+			<label for="authelia_client_secret" class="flex flex-col gap-1">
 				<span class="text-emphasis font-semibold text-xs">Client Secret </span>
-				<TextInput
-					inputProps={{ type: 'text', placeholder: 'Client Secret' }}
-					bind:value={value['secret']}
+				<Password
+					id="authelia_client_secret"
+					placeholder="Client Secret"
+					bind:password={value['secret']}
 				/>
 			</label>
-		</div>
+		</SettingCard>
 	{/if}
 </div>

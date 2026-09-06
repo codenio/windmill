@@ -60,6 +60,10 @@ pub struct JobClaim {
     pub username: String,
     pub email: String,
     pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_parent_workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_user_email: Option<String>,
 }
 
 #[cfg(not(feature = "private"))]

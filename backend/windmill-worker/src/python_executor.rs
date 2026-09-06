@@ -24,18 +24,21 @@ use tokio::{
 use windmill_queue::MiniPulledJob;
 
 use uuid::Uuid;
-#[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
 use windmill_common::ee_oss::{get_license_plan, LicensePlan};
+
 use windmill_common::{
     error::{
         self,
         Error::{self},
     },
+    jobs::JobKind,
     scripts::ScriptLang,
     utils::calculate_hash,
     worker::{
-        copy_dir_recursively, pad_string, split_python_requirements, write_file, Connection,
-        PyVAlias, PythonAnnotations, WORKER_CONFIG,
+        copy_dir_recursively, is_allowed_file_location, pad_string, split_python_requirements,
+        write_file, Connection, PyVAlias, PythonAnnotations, WORKER_CONFIG,
     },
 };
 
@@ -59,19 +62,14 @@ lazy_static::lazy_static! {
     static ref PY_CONCURRENT_DOWNLOADS: usize =
     var("PY_CONCURRENT_DOWNLOADS").ok().map(|flag| flag.parse().unwrap_or(20)).unwrap_or(20);
 
-
     static ref NON_ALPHANUM_CHAR: Regex = regex::Regex::new(r"[^0-9A-Za-z=.-]").unwrap();
-
-    static ref TRUSTED_HOST: Option<String> = var("PY_TRUSTED_HOST").ok().or(var("PIP_TRUSTED_HOST").ok());
-    pub static ref INDEX_CERT: Option<String> = var("PY_INDEX_CERT").ok().or(var("PIP_INDEX_CERT").ok());
-    pub static ref NATIVE_CERT: bool = var("PY_NATIVE_CERT").ok().or(var("UV_NATIVE_TLS").ok()).map(|flag| flag == "true").unwrap_or(false);
 
     static ref RELATIVE_IMPORT_REGEX: Regex = Regex::new(r#"(import|from)\s(((u|f)\.)|\.)"#).unwrap();
 
     static ref EPHEMERAL_TOKEN_CMD: Option<String> = var("EPHEMERAL_TOKEN_CMD").ok();
 }
 
-#[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
 lazy_static::lazy_static! {
     static ref PIPTAR_UPLOAD_CHANNEL: tokio::sync::mpsc::UnboundedSender<PiptarUploadTask> = {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -83,17 +81,17 @@ lazy_static::lazy_static! {
     };
 }
 
-#[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
 #[derive(Debug)]
 struct PiptarUploadTask {
     venv_path: String,
     cache_dir: String,
 }
 
-#[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
 async fn handle_piptar_uploads(mut rx: tokio::sync::mpsc::UnboundedReceiver<PiptarUploadTask>) {
     use crate::global_cache::build_tar_and_push;
-    use windmill_common::s3_helpers::get_object_store;
+    use windmill_object_store::get_object_store;
 
     while let Some(task) = rx.recv().await {
         if let Some(os) = get_object_store().await {
@@ -117,24 +115,52 @@ async fn handle_piptar_uploads(mut rx: tokio::sync::mpsc::UnboundedReceiver<Pipt
 
 const NSJAIL_CONFIG_DOWNLOAD_PY_CONTENT: &str = include_str!("../nsjail/download.py.config.proto");
 const NSJAIL_CONFIG_RUN_PYTHON3_CONTENT: &str = include_str!("../nsjail/run.python3.config.proto");
-const RELATIVE_PYTHON_LOADER: &str = include_str!("../loader.py");
+pub const RELATIVE_PYTHON_LOADER: &str = include_str!("../loader.py");
 
-#[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+/// Every file exchanged with a job is UTF-8 by construction, so the interpreter
+/// must agree. A job env carries no locale: Linux then picks UTF-8 on its own
+/// (PEP 540), Windows picks the ANSI code page. Applied after the whitelisted
+/// envs so the protocol is not the user's to opt out of.
+pub const PYTHON_UTF8_ENVS: [(&str, &str); 1] = [("PYTHONUTF8", "1")];
+
+/// Render loader.py with the TEMP_SCRIPT_REFS placeholder substituted by a
+/// Python dict literal. Preview jobs pass a path -> temp-hash map so relative
+/// imports resolve from not-yet-deployed local content; deployed runs pass
+/// `None` which renders an empty dict (deployed resolution unchanged).
+fn render_relative_python_loader(temp_script_refs: &Option<HashMap<String, String>>) -> String {
+    let temp_refs_py = temp_script_refs
+        .as_ref()
+        .and_then(|m| serde_json::to_string(m).ok())
+        .unwrap_or_else(|| "{}".to_string());
+    RELATIVE_PYTHON_LOADER.replace("TEMP_SCRIPT_REFS_PLACEHOLDER", &temp_refs_py)
+}
+
+#[cfg(any(feature = "private", test))]
+pub fn has_relative_imports(content: &str) -> bool {
+    RELATIVE_IMPORT_REGEX.is_match(content)
+}
+
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
 use crate::global_cache::pull_from_tar;
 
-#[cfg(all(feature = "enterprise", feature = "parquet", unix))]
-use windmill_common::s3_helpers::OBJECT_STORE_SETTINGS;
+#[cfg(all(feature = "enterprise", feature = "parquet"))]
+use windmill_object_store::OBJECT_STORE_SETTINGS;
 
 use crate::{
     common::{
         build_command_with_isolation, create_args_and_out_file, get_reserved_variables, read_file,
-        read_result, start_child_process, OccupancyMetrics, StreamNotifier, DEV_CONF_NSJAIL,
+        read_result, render_nsjail_rlimit_as, resolve_nsjail_timeout,
+        resolve_nsjail_tmp_mount_block, start_child_process, OccupancyMetrics, StreamNotifier,
+        DEV_CONF_NSJAIL,
     },
     get_proxy_envs_for_lang,
     handle_child::handle_child,
+    is_sandboxing_enabled, read_ee_registry_with_workspace_override,
     worker_utils::ping_job_status,
-    PyV, DISABLE_NSJAIL, DISABLE_NUSER, HOME_ENV, NSJAIL_PATH, PATH_ENV, PIP_EXTRA_INDEX_URL,
-    PIP_INDEX_URL, PROXY_ENVS, PY_INSTALL_DIR, TRACING_PROXY_CA_CERT_PATH, TZ_ENV, UV_CACHE_DIR,
+    PyV, DISABLE_NUSER, HOME_ENV, INDEX_CERT, NATIVE_CERT, NSJAIL_AVAILABLE, NSJAIL_PATH,
+    NSJAIL_PY_RLIMIT_AS_MB, PATH_ENV, PIP_EXTRA_INDEX_URL, PIP_INDEX_URL, PROXY_ENVS,
+    PY_INSTALL_DIR, TRACING_PROXY_CA_CERT_PATH, TRUSTED_HOST, TZ_ENV, UV_CACHE_DIR,
+    UV_EXCLUDE_NEWER, UV_HTTP_TIMEOUT, UV_INDEX_STRATEGY, UV_PYTHON_INSTALL_MIRROR,
 };
 use windmill_common::client::AuthedClient;
 
@@ -170,6 +196,44 @@ pub fn handle_ephemeral_token(x: String) -> String {
     x
 }
 
+/// Removes lockfile/requirements entries matching the worker's `pip_local_dependencies`
+/// regexes. Those packages are already provided locally (e.g. via `additional_python_paths`),
+/// so installing them again duplicates files and triggers expensive `postinstall` copies on
+/// every job. `#`-prefixed comment lines (e.g. the `# py:` lockfile header) are always kept.
+/// Returns `(kept_lines, ignored_lines)`.
+fn filter_pip_local_dependencies(lines: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let Some(pip_local_dependencies) = WORKER_CONFIG.load().pip_local_dependencies.clone() else {
+        return (lines, vec![]);
+    };
+
+    let compiled_deps = pip_local_dependencies
+        .iter()
+        .filter_map(|dep| match Regex::new(dep) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(
+                    "regex compilation failed for Python local dependency: '{}' - it will be ignored",
+                    e
+                );
+                None
+            }
+        })
+        .collect::<Vec<Regex>>();
+
+    filter_lines_by_deps(lines, &compiled_deps)
+}
+
+/// Pure core of [`filter_pip_local_dependencies`]: partitions `lines` into
+/// `(kept, ignored)`. A line is ignored when it is not a `#` comment and matches any of
+/// `compiled_deps`. Kept separate from config/regex loading so it can be unit-tested.
+fn filter_lines_by_deps(lines: Vec<String>, compiled_deps: &[Regex]) -> (Vec<String>, Vec<String>) {
+    let (ignored, kept): (Vec<String>, Vec<String>) = lines
+        .into_iter()
+        .partition(|s| !s.starts_with('#') && compiled_deps.iter().any(|dep| dep.is_match(s)));
+
+    (kept, ignored)
+}
+
 // This function only invoked during deployment of script or test run.
 // And never for already deployed scripts, these have their lockfiles in PostgreSQL
 // thus this function call is skipped.
@@ -192,34 +256,18 @@ pub async fn uv_pip_compile(
     logs.push_str(&format!("\nresolving dependencies..."));
     logs.push_str(&format!("\ncontent of requirements:\n{}\n", requirements));
 
-    let requirements = if let Some(pip_local_dependencies) =
-        WORKER_CONFIG.read().await.pip_local_dependencies.as_ref()
-    {
-        let deps = pip_local_dependencies.clone();
-        let compiled_deps = deps.iter().map(|dep| {
-            let compiled_dep = Regex::new(dep);
-            match compiled_dep {
-                Ok(compiled_dep) => Some(compiled_dep),
-                Err(e) => {
-                    tracing::warn!("regex compilation failed for Python local dependency: '{}' - it will be ignored", e);
-                    return None;
-                }
-            }
-        }).filter(|dep_maybe| dep_maybe.is_some()).map(|dep| dep.unwrap()).collect::<Vec<Regex>>();
-        requirements
-            .lines()
-            .filter(|s| {
-                if compiled_deps.iter().any(|dep| dep.is_match(s)) {
-                    logs.push_str(&format!("\nignoring local dependency: {}", s));
-                    return false;
-                } else {
-                    return true;
-                }
-            })
-            .join("\n")
-    } else {
-        requirements.to_string()
+    let requirements = {
+        let (kept, ignored) =
+            filter_pip_local_dependencies(requirements.lines().map(str::to_owned).collect());
+        for line in ignored {
+            logs.push_str(&format!("\nignoring local dependency: {}", line));
+        }
+        kept.join("\n")
     };
+
+    let uv_index_strategy = UV_INDEX_STRATEGY.read().await.clone();
+    let uv_index_strategy = uv_index_strategy.as_deref().unwrap_or("unsafe-best-match");
+    let uv_exclude_newer = (*UV_EXCLUDE_NEWER.read().await).map(|secs| format!("{}s", secs));
 
     let py_version_str = py_version.clone().to_string();
     // Include python version to requirements.in
@@ -230,7 +278,15 @@ pub async fn uv_pip_compile(
     #[cfg(feature = "enterprise")]
     let requirements = replace_pip_secret(conn, w_id, &requirements, worker_name, job_id).await?;
 
-    let req_hash = format!("py-{}", calculate_hash(&requirements));
+    let ws_suffix = crate::workspace_registry_cache_suffix(w_id).await;
+    let exclude_newer_suffix = uv_exclude_newer
+        .as_deref()
+        .map(|v| format!("-en{}", v))
+        .unwrap_or_default();
+    let req_hash = format!(
+        "py-{}-{uv_index_strategy}{exclude_newer_suffix}{ws_suffix}",
+        calculate_hash(&requirements)
+    );
 
     if !no_cache {
         if let Some(db) = conn.as_sql() {
@@ -271,14 +327,9 @@ pub async fn uv_pip_compile(
             "--strip-extras",
             "-o",
             "requirements.txt",
-            // Prefer main index over extra
-            // https://docs.astral.sh/uv/pip/compatibility/#packages-that-exist-on-multiple-indexes
-            // TODO: Use env variable that can be toggled from UI
-            "--index-strategy",
-            "unsafe-best-match",
             // Target to /tmp/windmill/cache/uv
             "--cache-dir",
-            UV_CACHE_DIR,
+            &*UV_CACHE_DIR,
         ];
 
         args.extend(["-p", &py_version_str, "--python-preference", "only-managed"]);
@@ -286,32 +337,47 @@ pub async fn uv_pip_compile(
         if no_cache {
             args.extend(["--no-cache"]);
         }
-        let pip_extra_index_url = PIP_EXTRA_INDEX_URL
-            .read()
-            .await
-            .clone()
-            .map(handle_ephemeral_token);
+        let pip_extra_index_url = read_ee_registry_with_workspace_override(
+            PIP_EXTRA_INDEX_URL.read().await.clone(),
+            "pip_extra_index_url",
+            "pip extra index url",
+            job_id,
+            w_id,
+            conn,
+        )
+        .await
+        .map(handle_ephemeral_token);
         if let Some(url) = pip_extra_index_url.as_ref() {
             url.split(",").for_each(|url| {
                 args.extend(["--extra-index-url", url]);
             });
         }
-        let pip_index_url = PIP_INDEX_URL
-            .read()
-            .await
-            .clone()
-            .map(handle_ephemeral_token);
+        let pip_index_url = read_ee_registry_with_workspace_override(
+            PIP_INDEX_URL.read().await.clone(),
+            "pip_index_url",
+            "pip index url",
+            job_id,
+            w_id,
+            conn,
+        )
+        .await
+        .map(handle_ephemeral_token);
         if let Some(url) = pip_index_url.as_ref() {
             args.extend(["--index-url", url]);
         }
         if let Some(host) = TRUSTED_HOST.as_ref() {
-            args.extend(["--trusted-host", host]);
+            host.split_whitespace().for_each(|h| {
+                args.extend(["--trusted-host", h]);
+            });
         }
         if let Some(cert_path) = INDEX_CERT.as_ref() {
             args.extend(["--cert", cert_path]);
         }
         if *NATIVE_CERT {
             args.extend(["--native-tls"]);
+        }
+        if let Some(exclude_newer) = uv_exclude_newer.as_deref() {
+            args.extend(["--exclude-newer", exclude_newer]);
         }
         tracing::debug!("uv args: {:?}", args);
 
@@ -328,10 +394,15 @@ pub async fn uv_pip_compile(
             .env("HOME", HOME_ENV.to_string())
             .env("PATH", PATH_ENV.to_string())
             .env("UV_PYTHON_INSTALL_DIR", PY_INSTALL_DIR.to_string())
+            .env("UV_INDEX_STRATEGY", uv_index_strategy)
             .envs(PROXY_ENVS.clone())
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        if let Some(mirror) = UV_PYTHON_INSTALL_MIRROR.read().await.as_ref() {
+            child_cmd.env("UV_PYTHON_INSTALL_MIRROR", mirror);
+        }
 
         #[cfg(windows)]
         {
@@ -533,6 +604,84 @@ async fn postinstall(
     Ok(())
 }
 
+/// Python hard keywords cannot be used as a bare name in `import <name>` /
+/// `from <pkg> import <name>`. A flow inline step whose id (or a folder on its
+/// path) is such a keyword — e.g. a step id `in` — otherwise generates
+/// `from pkg import in as inner_script`, a SyntaxError. Prefix these with `_`,
+/// mirroring the existing digit-leading guard.
+fn is_python_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+/// Compute the directory (relative to job_dir) where Python writes the main script.
+/// Module files must be placed in this same directory for relative imports to work.
+pub fn compute_python_module_dir(script_path: &str) -> String {
+    let script_path_splitted = script_path.split("/").map(|x| {
+        if x.starts_with(|x: char| x.is_ascii_digit()) || is_python_keyword(x) {
+            format!("_{}", x)
+        } else {
+            x.to_string()
+        }
+    });
+    let dirs_full = script_path_splitted
+        .clone()
+        .take(script_path_splitted.clone().count() - 1)
+        .join("/")
+        .replace("-", "_")
+        .replace("@", ".");
+    if dirs_full.len() > 0 {
+        let dirs = dirs_full.strip_prefix("/").unwrap_or(&dirs_full);
+        // This directory is appended to job_dir and written to. Neutralize any
+        // `.`/`..` segment so the result stays a relative path inside job_dir: a
+        // Preview path is request-supplied and skips the DB `proper_id` CHECK that
+        // deployed runnables get, and the `@`->`.` rewrite above can also turn a
+        // segment like `@.` into `..`.
+        dirs.split('/')
+            .map(|seg| if seg == "." || seg == ".." { "_" } else { seg })
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        "tmp".to_string()
+    }
+}
+
 #[tracing::instrument(level = "trace", skip_all)]
 pub async fn handle_python_job(
     requirements_o: Option<&String>,
@@ -553,10 +702,37 @@ pub async fn handle_python_job(
     occupancy_metrics: &mut OccupancyMetrics,
     precomputed_agent_info: Option<PrecomputedAgentInfo>,
     has_stream: &mut bool,
+    modules: &Option<std::collections::HashMap<String, windmill_common::scripts::ScriptModule>>,
 ) -> windmill_common::error::Result<Box<RawValue>> {
     let script_path = crate::common::use_flow_root_path(job.runnable_path());
 
     let annotations = PythonAnnotations::parse(inner_content);
+
+    let is_wac_v2 = job.script_entrypoint_override.is_none()
+        && crate::wac_executor::is_wac_v2_py(inner_content);
+
+    if annotations.sandbox && NSJAIL_AVAILABLE.is_none() {
+        return Err(Error::ExecutionErr(
+            "Script has #sandbox annotation but nsjail is not available on this worker. \
+            Please ensure nsjail is installed or remove the #sandbox annotation."
+                .to_string(),
+        ));
+    }
+
+    // Preview jobs may carry _TEMP_SCRIPT_REFS so relative imports resolve from
+    // not-yet-deployed local content uploaded to raw_script_temp. Gated on
+    // JobKind::Preview because job.args includes caller-controlled request
+    // args; honoring this key on deployed runs would let a caller swap import
+    // resolution targets in deployed code.
+    let temp_script_refs: Option<HashMap<String, String>> = if matches!(job.kind, JobKind::Preview)
+    {
+        job.args
+            .as_ref()
+            .and_then(|x| x.get("_TEMP_SCRIPT_REFS"))
+            .and_then(|v| serde_json::from_str(v.get()).ok())
+    } else {
+        None
+    };
 
     let (py_version, mut additional_python_paths) = handle_python_deps(
         job_dir,
@@ -573,6 +749,7 @@ pub async fn handle_python_job(
         &mut Some(occupancy_metrics),
         precomputed_agent_info,
         annotations.clone(),
+        &temp_script_refs,
     )
     .await?;
 
@@ -596,16 +773,14 @@ pub async fn handle_python_job(
     }
 
     {
-        append_logs(
-            &job.id,
-            &job.workspace_id,
-            format!(
-                "\n\n--- PYTHON ({}) CODE EXECUTION ---\n",
-                py_version.clone().to_string()
-            ),
-            conn,
-        )
-        .await;
+        let mut logs = format!(
+            "\n\n--- PYTHON ({}) CODE EXECUTION ---\n",
+            py_version.clone().to_string()
+        );
+        if annotations.sandbox {
+            logs.push_str("sandbox mode (nsjail)\n");
+        }
+        append_logs(&job.id, &job.workspace_id, logs, conn).await;
     }
     let (
         import_loader,
@@ -618,6 +793,7 @@ pub async fn handle_python_job(
         spread,
         main_name,
         pre_spread,
+        wac_pre_spread,
     ) = prepare_wrapper(
         job_dir,
         job.flow_step_id.as_deref(),
@@ -625,6 +801,7 @@ pub async fn handle_python_job(
         job.script_entrypoint_override.as_deref(),
         inner_content,
         &script_path,
+        &temp_script_refs,
     )
     .await?;
 
@@ -647,7 +824,7 @@ pub async fn handle_python_job(
                 del pre_args[k]
         kwargs = inner_script.preprocessor(**pre_args)
         kwrags_json = res_to_json(kwargs, type(kwargs))
-        with open("args.json", 'w') as f:
+        with open("args.json", 'w', encoding="utf-8") as f:
             f.write(kwrags_json)"#
         )
     } else {
@@ -661,9 +838,99 @@ pub async fn handle_python_job(
     } else {
         String::new()
     };
+
     let main_override = main_name.unwrap_or_else(|| "main".to_string());
-    let wrapper_content: String = format!(
-        r#"
+    let res_to_json_body = python_res_to_json_body(postprocessor);
+    // Indented at 4 spaces so it can be inlined inside the wrapper's
+    // `try:` block — preprocessor failures route through the same error
+    // serializer as workflow failures.
+    let wac_preprocessor = if let Some(pre_spread) = wac_pre_spread.as_ref() {
+        format!(
+            r#"if not hasattr(inner_script, 'preprocessor') or not callable(inner_script.preprocessor):
+        raise ValueError("preprocessor function is missing")
+    pre_args = {{}}
+    {pre_spread}
+    for k, v in list(pre_args.items()):
+        if v == '<function call>':
+            del pre_args[k]
+    _pre_result = inner_script.preprocessor(**pre_args)
+    if hasattr(_pre_result, '__await__'):
+        import asyncio
+        _pre_result = asyncio.run(_pre_result)
+    kwargs = _pre_result if _pre_result is not None else {{}}
+    _pre_json = json.dumps(kwargs, separators=(',', ':'), default=str)
+    with open("args.json", 'w', encoding="utf-8") as f:
+        f.write(_pre_json)
+    sys.stdout.write("wm_res[preprocessed_args]:" + _pre_json + "\n")
+    sys.stdout.flush()"#
+        )
+    } else {
+        "".to_string()
+    };
+    let wrapper_content: String = if is_wac_v2 {
+        format!(
+            r#"
+import os
+import json
+{import_loader}
+{import_base64}
+{import_datetime}
+import traceback
+import sys
+from {module_dir_dot} import {last} as inner_script
+from wmill.client import _run_workflow
+
+with open("args.json", encoding="utf-8") as f:
+    kwargs = json.load(f, strict=False)
+{transforms}
+
+with open("checkpoint.json", encoding="utf-8") as f:
+    checkpoint = json.load(f, strict=False)
+
+result_json = os.path.join(os.path.abspath(os.path.dirname(__file__)), "result.json")
+
+try:
+    {wac_preprocessor}
+    args = kwargs
+    for k, v in list(args.items()):
+        if v == '<function call>':
+            del args[k]
+
+    workflow_fn = None
+    for name in dir(inner_script):
+        obj = getattr(inner_script, name)
+        if callable(obj) and getattr(obj, '_is_workflow', False):
+            workflow_fn = obj
+            break
+    if workflow_fn is None:
+        raise ValueError("No @workflow function found in script")
+
+    output = _run_workflow(workflow_fn, checkpoint, args)
+    if isinstance(output, dict) and output.get("type") == "complete":
+        print("")
+        print("--- WAC: complete ---")
+    output_json = json.dumps(output, separators=(',', ':'), default=str)
+    with open(result_json, 'w', encoding="utf-8") as f:
+        f.write(output_json)
+except BaseException as e:
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    tb = traceback.format_tb(exc_traceback)
+    with open(result_json, 'w', encoding="utf-8") as f:
+        err = {{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:]) }}
+        extra = e.__dict__
+        if extra and len(extra) > 0:
+            err['extra'] = extra
+        flow_node_id = os.environ.get('WM_FLOW_STEP_ID')
+        if flow_node_id:
+            err['step_id'] = flow_node_id
+        err_json = json.dumps(err, separators=(',', ':'), default=str).replace('\n', '')
+        f.write(err_json)
+        sys.exit(1)
+"#,
+        )
+    } else {
+        format!(
+            r#"
 import os
 import json
 {import_loader}
@@ -675,7 +942,7 @@ import sys
 from {module_dir_dot} import {last} as inner_script
 import re
 
-with open("args.json") as f:
+with open("args.json", encoding="utf-8") as f:
     kwargs = json.load(f, strict=False)
 args = {{}}
 {transforms}
@@ -685,24 +952,16 @@ def to_b_64(v: bytes):
     b64 = base64.b64encode(v)
     return b64.decode('ascii')
 
-replace_invalid_fields = re.compile(r'(?:\bNaN\b|\\*\\u0000|Infinity|\-Infinity)')
+_u=re.compile(r'\\\\|\\u0000')
+_us=lambda m:' null ' if m.group(0)[1]=='u' else m.group(0)
+_r=lambda m,s='':(_u.sub(_us,s) if '\\u0000' in s else s) if (s:=m.group(0))[0]=='"' else ' null '
+replace_invalid_fields=re.compile(r'"(?:\\.|[^"\\])*"|\bNaN\b|-?Infinity')
+_fix=lambda s:s if 'Infinity' not in s and 'NaN' not in s and '\\u0000' not in s else re.sub(replace_invalid_fields,_r,s)
 
 result_json = os.path.join(os.path.abspath(os.path.dirname(__file__)), "result.json")
 
 def res_to_json(res, typ):
-    if typ.__name__ == 'DataFrame':
-        if typ.__module__ == 'pandas.core.frame':
-            res = res.values.tolist()
-        elif typ.__module__ == 'polars.dataframe.frame':
-            res = res.rows()
-    elif typ.__name__ == 'bytes':
-        res = to_b_64(res)
-    elif typ.__name__ == 'dict':
-        for k, v in res.items():
-            if type(v).__name__ == 'bytes':
-                res[k] = to_b_64(v)
-    unprocessed = json.dumps(res, separators=(',', ':'), default=str).replace('\n', '')
-    return {postprocessor}
+{res_to_json_body}
 
 try:
     {preprocessor}
@@ -719,12 +978,12 @@ try:
             print("WM_STREAM: " + chunk.replace('\n', '\\n'))
         res = None
     res_json = res_to_json(res, typ)
-    with open(result_json, 'w') as f:
+    with open(result_json, 'w', encoding="utf-8") as f:
         f.write(res_json)
 except BaseException as e:
     exc_type, exc_value, exc_traceback = sys.exc_info()
     tb = traceback.format_tb(exc_traceback)
-    with open(result_json, 'w') as f:
+    with open(result_json, 'w', encoding="utf-8") as f:
         err = {{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:]) }}
         extra = e.__dict__
         if extra and len(extra) > 0:
@@ -736,8 +995,25 @@ except BaseException as e:
         f.write(err_json)
         sys.exit(1)
 "#,
-    );
+        )
+    };
     write_file(job_dir, "wrapper.py", &wrapper_content)?;
+
+    // For WAC v2, write checkpoint.json before python runs.
+    if is_wac_v2 {
+        if let Connection::Sql(db) = conn {
+            let checkpoint = crate::wac_executor::load_checkpoint(db, &job.id).await?;
+            let checkpoint =
+                crate::wac_executor::prepare_checkpoint_for_resume(db, &job.id, checkpoint).await?;
+
+            let checkpoint_json = serde_json::to_string(&checkpoint).map_err(|e| {
+                error::Error::internal_err(format!("Failed to serialize checkpoint: {e}"))
+            })?;
+            write_file(job_dir, "checkpoint.json", &checkpoint_json)?;
+        } else {
+            write_file(job_dir, "checkpoint.json", r#"{"completed_steps":{}}"#)?;
+        }
+    }
 
     tracing::debug!("Finished writing wrapper");
 
@@ -775,7 +1051,7 @@ except BaseException as e:
     #[cfg(windows)]
     let additional_python_paths_folders = additional_python_paths_folders.replace(":", ";");
 
-    if !*DISABLE_NSJAIL {
+    if is_sandboxing_enabled() || annotations.sandbox {
         let shared_deps = additional_python_paths
             .into_iter()
             .map(|pp| {
@@ -791,12 +1067,18 @@ mount {{
                 )
             })
             .join("\n");
+        let nsjail_timeout =
+            resolve_nsjail_timeout(conn, &job.workspace_id, job.id, job.timeout).await;
         let _ = write_file(
             job_dir,
             "run.config.proto",
             &NSJAIL_CONFIG_RUN_PYTHON3_CONTENT
+                .replace(
+                    "{RLIMIT_AS}",
+                    &render_nsjail_rlimit_as(NSJAIL_PY_RLIMIT_AS_MB.as_deref(), 4096),
+                )
                 .replace("{JOB_DIR}", job_dir)
-                .replace("{PY_INSTALL_DIR}", PY_INSTALL_DIR)
+                .replace("{PY_INSTALL_DIR}", &*PY_INSTALL_DIR)
                 .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
                 .replace("{SHARED_MOUNT}", shared_mount)
                 .replace("{SHARED_DEPENDENCIES}", shared_deps.as_str())
@@ -806,8 +1088,13 @@ mount {{
                     "{ADDITIONAL_PYTHON_PATHS}",
                     additional_python_paths_folders.as_str(),
                 )
-                .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
-                .replace("#{DEV}", DEV_CONF_NSJAIL),
+                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
+                .replace("#{DEV}", DEV_CONF_NSJAIL)
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
+                .replace("{TIMEOUT}", &nsjail_timeout),
         )?;
     } else {
         reserved_variables.insert("PYTHONPATH".to_string(), additional_python_paths_folders);
@@ -819,14 +1106,24 @@ mount {{
         job.id
     );
 
-    let child = if !*DISABLE_NSJAIL {
+    let child = if is_sandboxing_enabled() || annotations.sandbox {
         let mut nsjail_cmd = Command::new(NSJAIL_PATH.as_str());
         nsjail_cmd
             .current_dir(job_dir)
             .env_clear()
             // inject PYTHONPATH here - for some reason I had to do it in nsjail conf
             .envs(reserved_variables)
-            .envs(get_proxy_envs_for_lang(&ScriptLang::Python3).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::Python3,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
+            .envs(PYTHON_UTF8_ENVS)
             .env("PATH", PATH_ENV.as_str())
             .env("TZ", TZ_ENV.as_str())
             .env("BASE_INTERNAL_URL", base_internal_url)
@@ -852,7 +1149,17 @@ mount {{
             .env_clear()
             .envs(envs)
             .envs(reserved_variables)
-            .envs(get_proxy_envs_for_lang(&ScriptLang::Python3).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::Python3,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
+            .envs(PYTHON_UTF8_ENVS)
             .env("PATH", PATH_ENV.as_str())
             .env("TZ", TZ_ENV.as_str())
             .env("BASE_INTERNAL_URL", base_internal_url)
@@ -884,7 +1191,7 @@ mount {{
         mem_peak,
         canceled_by,
         child,
-        !*DISABLE_NSJAIL,
+        is_sandboxing_enabled(),
         worker_name,
         &job.workspace_id,
         "python run",
@@ -915,7 +1222,417 @@ mount {{
         *new_args = Some(args.clone());
     }
 
-    read_result(job_dir, handle_result.result_stream).await
+    let result = read_result(job_dir, handle_result.result_stream).await?;
+
+    // WAC v2 post-execution: parse output and handle dispatch/suspend.
+    // Box::pin to avoid bloating handle_python_job's async state machine (stack overflow).
+    if is_wac_v2 {
+        return Box::pin(crate::bun_executor::handle_wac_v2_output(
+            result,
+            job,
+            conn,
+            canceled_by,
+            modules,
+            new_args.as_ref(),
+        ))
+        .await;
+    }
+
+    Ok(result)
+}
+
+/// Generate Python code to spread preprocessor args from `kwargs` into `pre_args`.
+/// The `indent` parameter controls the join separator for multi-arg spreads.
+fn python_preprocessor_spread(sig: &windmill_parser::MainArgSignature, indent: &str) -> String {
+    if sig.star_kwargs {
+        "pre_args = kwargs".to_string()
+    } else {
+        sig.args
+            .iter()
+            .map(|x| {
+                let name = &x.name;
+                if x.default.is_none() {
+                    format!("pre_args[\"{name}\"] = kwargs.get(\"{name}\")")
+                } else {
+                    format!(
+                        r#"pre_args["{name}"] = kwargs.get("{name}")
+{indent}if pre_args["{name}"] is None:
+{indent}    del pre_args["{name}"]"#
+                    )
+                }
+            })
+            .join(&format!("\n{indent}"))
+    }
+}
+
+/// Pre-computed codegen data for a Python script.
+/// Computed in Rust from the parsed signature, then baked into the wrapper template.
+#[cfg(any(feature = "private", test))]
+pub struct PyScriptCodegen {
+    /// Python module directory dot notation (e.g., "f.my")
+    pub module_dir_dot: String,
+    /// Python module name / last path component (e.g., "script")
+    pub module_name: String,
+    /// Directory path for the module (e.g., "f/my")
+    pub dirs: String,
+    /// Inline Python code for type transforms (dates, bytes, etc.)
+    pub transforms: String,
+    /// Inline Python code for arg spread / filtering
+    pub spread: String,
+    /// Inline Python code for preprocessor arg spread (if applicable)
+    pub pre_spread: Option<String>,
+}
+
+/// Parse a Python script and compute the codegen data.
+/// This reuses the same logic that was used on main in `prepare_wrapper`.
+#[cfg(any(feature = "private", test))]
+pub fn compute_py_codegen(content: &str, script_path: &str) -> PyScriptCodegen {
+    let dirs = compute_python_module_dir(script_path);
+    let last = script_path
+        .split("/")
+        .map(|x| {
+            if x.starts_with(|x: char| x.is_ascii_digit()) {
+                format!("_{}", x)
+            } else {
+                x.to_string()
+            }
+        })
+        .last()
+        .unwrap()
+        .replace("-", "_")
+        .replace(" ", "_")
+        .to_lowercase();
+    // `last` is lowercased above, so this catches a keyword id in any case.
+    let last = if is_python_keyword(&last) {
+        format!("_{last}")
+    } else {
+        last
+    };
+
+    let sig = windmill_parser_py::parse_python_signature(content, None, false).unwrap_or_default();
+    let pre_sig = windmill_parser_py::parse_python_signature(
+        content,
+        Some("preprocessor".to_string()),
+        false,
+    )
+    .ok()
+    .filter(|s| !s.args.is_empty());
+
+    let init_sig = pre_sig.as_ref().unwrap_or(&sig);
+
+    let transforms = init_sig
+        .args
+        .iter()
+        .map(|x| match x.typ {
+            windmill_parser::Typ::Bytes => {
+                let name = &x.name;
+                format!(
+                    "if \"{name}\" in kwargs and kwargs[\"{name}\"] is not None:\n    \
+                                     kwargs[\"{name}\"] = base64.b64decode(kwargs[\"{name}\"])\n",
+                )
+            }
+            windmill_parser::Typ::Datetime => {
+                let name = &x.name;
+                format!(
+                    "if \"{name}\" in kwargs and kwargs[\"{name}\"] is not None:\n    \
+                                     kwargs[\"{name}\"] = datetime.fromisoformat(kwargs[\"{name}\"])\n",
+                )
+            }
+            windmill_parser::Typ::Date => {
+                let name = &x.name;
+                format!(
+                    "if \"{name}\" in kwargs and kwargs[\"{name}\"] is not None:\n    \
+                                     try:\n        \
+                                         kwargs[\"{name}\"] = date.fromisoformat(kwargs[\"{name}\"])\n    \
+                                     except ValueError:\n        \
+                                         for _fmt in (\"%d-%m-%Y\", \"%m/%d/%Y\", \"%d/%m/%Y\", \"%Y/%m/%d\"):\n            \
+                                             try:\n                \
+                                                 kwargs[\"{name}\"] = datetime.strptime(kwargs[\"{name}\"], _fmt).date()\n                \
+                                                 break\n            \
+                                             except ValueError:\n                \
+                                                 continue\n",
+                )
+            }
+            _ => "".to_string(),
+        })
+        .collect::<Vec<String>>()
+        .join("");
+
+    let spread = if sig.star_kwargs {
+        "args = kwargs".to_string()
+    } else {
+        sig.args
+            .into_iter()
+            .map(|x| {
+                let name = &x.name;
+                if x.default.is_none() {
+                    format!("args[\"{name}\"] = kwargs.get(\"{name}\")")
+                } else {
+                    format!(
+                        r#"args["{name}"] = kwargs.get("{name}")
+    if args["{name}"] is None:
+        del args["{name}"]"#
+                    )
+                }
+            })
+            .join("\n    ")
+    };
+
+    let pre_spread = pre_sig.map(|sig| python_preprocessor_spread(&sig, "    "));
+
+    let module_dir_dot = dirs.replace("/", ".").replace("-", "_");
+
+    PyScriptCodegen { module_dir_dot, module_name: last, dirs, transforms, spread, pre_spread }
+}
+
+/// Script entry for the Python unified wrapper generator.
+#[cfg(any(feature = "private", test))]
+pub struct PyScriptEntry<'a> {
+    pub original_path: &'a str,
+    pub codegen: &'a PyScriptCodegen,
+}
+
+/// Generate a wrapper for Python dedicated workers and runner groups.
+/// All scripts are baked in at codegen time with proper Python imports and inline arg handling.
+/// Protocol:
+///   execd:<json_args>               -> execute the single registered script (non-runner-group)
+///   exec:<path>:<json_args>         -> execute script by path (runner groups)
+///   end                             -> exit
+#[cfg(any(feature = "private", test))]
+pub fn generate_multi_script_wrapper(
+    scripts: &[PyScriptEntry<'_>],
+    skip_result_postprocessing: bool,
+    any_relative_imports: bool,
+) -> String {
+    let postprocessor = get_result_postprocessor(skip_result_postprocessing);
+    let res_to_json_body = python_res_to_json_body(postprocessor);
+
+    let imports: String = scripts
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            format!(
+                "from {module_dir_dot} import {module_name} as _s{i}",
+                module_dir_dot = e.codegen.module_dir_dot,
+                module_name = e.codegen.module_name,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut functions = String::new();
+    let mut registrations = String::new();
+
+    for (i, entry) in scripts.iter().enumerate() {
+        let cg = entry.codegen;
+        let indented_transforms = cg
+            .transforms
+            .split('\n')
+            .map(|line| {
+                if line.is_empty() {
+                    String::new()
+                } else {
+                    format!("    {}", line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        functions.push_str(&format!(
+            r#"
+def transform_{i}(kwargs):
+{indented_transforms}
+    args = dict()
+    {spread}
+    for k, v in list(args.items()):
+        if v == '<function call>':
+            del args[k]
+    return args
+"#,
+            spread = cg.spread
+        ));
+
+        let pre_fn = if let Some(ref pre_spread) = cg.pre_spread {
+            functions.push_str(&format!(
+                r#"
+def pre_transform_{i}(kwargs):
+    pre_args = dict()
+    {pre_spread}
+    for k, v in list(pre_args.items()):
+        if v == '<function call>':
+            del pre_args[k]
+    return pre_args
+"#,
+            ));
+            format!("pre_transform_{i}")
+        } else {
+            "None".to_string()
+        };
+
+        registrations.push_str(&format!(
+            "scripts[\"{path}\"] = {{ 'mod': _s{i}, 'transform': transform_{i}, 'pre_transform': {pre_fn} }}\n",
+            path = entry.original_path,
+        ));
+    }
+
+    let import_loader = if any_relative_imports {
+        "import loader"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"
+import json
+import sys
+import traceback
+import re
+import base64
+from datetime import datetime, date
+{import_loader}
+
+{imports}
+
+scripts = {{}}
+
+def to_b_64(v: bytes):
+    b64 = base64.b64encode(v)
+    return b64.decode('ascii')
+
+_u=re.compile(r'\\\\|\\u0000')
+_us=lambda m:' null ' if m.group(0)[1]=='u' else m.group(0)
+_r=lambda m,s='':(_u.sub(_us,s) if '\\u0000' in s else s) if (s:=m.group(0))[0]=='"' else ' null '
+replace_invalid_fields=re.compile(r'"(?:\\.|[^"\\])*"|\bNaN\b|-?Infinity')
+_fix=lambda s:s if 'Infinity' not in s and 'NaN' not in s and '\\u0000' not in s else re.sub(replace_invalid_fields,_r,s)
+
+def res_to_json(res, typ):
+{res_to_json_body}
+{functions}
+{registrations}
+
+sys.stdout.write('start\n')
+sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if line == 'end':
+        break
+
+    if line.startswith('exec_preprocess:'):
+        try:
+            rest = line[len('exec_preprocess:'):]
+            colon_idx = rest.index(':')
+            script_path = rest[:colon_idx]
+            args_json = rest[colon_idx + 1:]
+
+            entry = scripts.get(script_path)
+            if not entry:
+                err_json = json.dumps({{ "message": "Script not found: " + script_path, "name": "Error" }}, separators=(',', ':'), default=str).replace('\n', '')
+                sys.stdout.write("wm_res[error]:" + err_json + "\n")
+                sys.stdout.flush()
+                continue
+
+            mod = entry['mod']
+            if not hasattr(mod, 'preprocessor') or not callable(mod.preprocessor):
+                err_json = json.dumps({{"message": "preprocessor function is missing", "name": "Error"}}, separators=(',', ':'), default=str).replace('\n', '')
+                sys.stdout.write("wm_res[error]:" + err_json + "\n")
+                sys.stdout.flush()
+                continue
+            kwargs = json.loads(args_json, strict=False)
+            pre_args = entry['pre_transform'](kwargs)
+            preprocessed = mod.preprocessor(**pre_args)
+            preprocessed_json = json.dumps(preprocessed, separators=(',', ':'), default=str).replace('\n', '')
+            sys.stdout.write("wm_res[preprocessed_args]:" + preprocessed_json + "\n")
+            main_args = entry['transform'](preprocessed if preprocessed else {{}})
+            res = mod.main(**main_args)
+            typ = type(res)
+            res_json = res_to_json(res, typ)
+            sys.stdout.write("wm_res[success]:" + res_json + "\n")
+        except BaseException as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb = traceback.format_tb(exc_traceback)
+            err_json = json.dumps({{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:]) }}, separators=(',', ':'), default=str).replace('\n', '')
+            sys.stdout.write("wm_res[error]:" + err_json + "\n")
+        sys.stdout.flush()
+        continue
+
+    if line.startswith('execd_preprocess:'):
+        try:
+            args_json = line[len('execd_preprocess:'):]
+            entry = next(iter(scripts.values()))
+            mod = entry['mod']
+            if not hasattr(mod, 'preprocessor') or not callable(mod.preprocessor):
+                err_json = json.dumps({{"message": "preprocessor function is missing", "name": "Error"}}, separators=(',', ':'), default=str).replace('\n', '')
+                sys.stdout.write("wm_res[error]:" + err_json + "\n")
+                sys.stdout.flush()
+                continue
+            kwargs = json.loads(args_json, strict=False)
+            pre_args = entry['pre_transform'](kwargs)
+            preprocessed = mod.preprocessor(**pre_args)
+            preprocessed_json = json.dumps(preprocessed, separators=(',', ':'), default=str).replace('\n', '')
+            sys.stdout.write("wm_res[preprocessed_args]:" + preprocessed_json + "\n")
+            main_args = entry['transform'](preprocessed if preprocessed else {{}})
+            res = mod.main(**main_args)
+            typ = type(res)
+            res_json = res_to_json(res, typ)
+            sys.stdout.write("wm_res[success]:" + res_json + "\n")
+        except BaseException as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb = traceback.format_tb(exc_traceback)
+            err_json = json.dumps({{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:]) }}, separators=(',', ':'), default=str).replace('\n', '')
+            sys.stdout.write("wm_res[error]:" + err_json + "\n")
+        sys.stdout.flush()
+        continue
+
+    if line.startswith('execd:'):
+        try:
+            args_json = line[len('execd:'):]
+            entry = next(iter(scripts.values()))
+            kwargs = json.loads(args_json, strict=False)
+            args = entry['transform'](kwargs)
+            res = entry['mod'].main(**args)
+            typ = type(res)
+            res_json = res_to_json(res, typ)
+            sys.stdout.write("wm_res[success]:" + res_json + "\n")
+        except BaseException as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb = traceback.format_tb(exc_traceback)
+            err_json = json.dumps({{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:]) }}, separators=(',', ':'), default=str).replace('\n', '')
+            sys.stdout.write("wm_res[error]:" + err_json + "\n")
+        sys.stdout.flush()
+        continue
+
+    if line.startswith('exec:'):
+        try:
+            rest = line[len('exec:'):]
+            colon_idx = rest.index(':')
+            script_path = rest[:colon_idx]
+            args_json = rest[colon_idx + 1:]
+
+            entry = scripts.get(script_path)
+            if not entry:
+                err_json = json.dumps({{ "message": "Script not found: " + script_path, "name": "Error" }}, separators=(',', ':'), default=str).replace('\n', '')
+                sys.stdout.write("wm_res[error]:" + err_json + "\n")
+                sys.stdout.flush()
+                continue
+
+            kwargs = json.loads(args_json, strict=False)
+            args = entry['transform'](kwargs)
+            res = entry['mod'].main(**args)
+            typ = type(res)
+            res_json = res_to_json(res, typ)
+            sys.stdout.write("wm_res[success]:" + res_json + "\n")
+        except BaseException as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb = traceback.format_tb(exc_traceback)
+            err_json = json.dumps({{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:]) }}, separators=(',', ':'), default=str).replace('\n', '')
+            sys.stdout.write("wm_res[error]:" + err_json + "\n")
+        sys.stdout.flush()
+        continue
+
+    sys.stderr.write("Unknown command: " + line + "\n")
+"#
+    )
 }
 
 async fn prepare_wrapper(
@@ -925,6 +1642,7 @@ async fn prepare_wrapper(
     job_script_entrypoint_override: Option<&str>,
     inner_content: &str,
     script_path: &str,
+    temp_script_refs: &Option<HashMap<String, String>>,
 ) -> error::Result<(
     &'static str,
     &'static str,
@@ -936,6 +1654,7 @@ async fn prepare_wrapper(
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
 )> {
     let main_override = job_script_entrypoint_override.as_deref();
     let apply_preprocessor =
@@ -943,6 +1662,7 @@ async fn prepare_wrapper(
 
     let relative_imports = RELATIVE_IMPORT_REGEX.is_match(&inner_content);
 
+    let dirs = compute_python_module_dir(script_path);
     let script_path_splitted = script_path.split("/").map(|x| {
         if x.starts_with(|x: char| x.is_ascii_digit()) {
             format!("_{}", x)
@@ -950,20 +1670,6 @@ async fn prepare_wrapper(
             x.to_string()
         }
     });
-    let dirs_full = script_path_splitted
-        .clone()
-        .take(script_path_splitted.clone().count() - 1)
-        .join("/")
-        .replace("-", "_")
-        .replace("@", ".");
-    let dirs = if dirs_full.len() > 0 {
-        dirs_full
-            .strip_prefix("/")
-            .unwrap_or(&dirs_full)
-            .to_string()
-    } else {
-        "tmp".to_string()
-    };
     let last = script_path_splitted
         .clone()
         .last()
@@ -971,12 +1677,26 @@ async fn prepare_wrapper(
         .replace("-", "_")
         .replace(" ", "_")
         .to_lowercase();
+    // `last` is lowercased above, so this catches a keyword id in any case.
+    let last = if is_python_keyword(&last) {
+        format!("_{last}")
+    } else {
+        last
+    };
     let module_dir = format!("{}/{}", job_dir, dirs);
+    // Defense-in-depth: `dirs`/`last` derive from the (request-supplied for
+    // previews) script path. compute_python_module_dir already neutralizes `..`,
+    // but assert containment here too so the write can never escape job_dir.
+    is_allowed_file_location(job_dir, &format!("{dirs}/{last}.py"))?;
     tokio::fs::create_dir_all(format!("{module_dir}/")).await?;
 
     let _ = write_file(&module_dir, &format!("{last}.py"), inner_content)?;
     if relative_imports {
-        let _ = write_file(job_dir, "loader.py", RELATIVE_PYTHON_LOADER)?;
+        let _ = write_file(
+            job_dir,
+            "loader.py",
+            &render_relative_python_loader(temp_script_refs),
+        )?;
     }
 
     let sig = windmill_parser_py::parse_python_signature(
@@ -1016,6 +1736,21 @@ async fn prepare_wrapper(
                                      kwargs[\"{name}\"] = datetime.fromisoformat(kwargs[\"{name}\"])\n",
                 )
             }
+            windmill_parser::Typ::Date => {
+                let name = &x.name;
+                format!(
+                    "if \"{name}\" in kwargs and kwargs[\"{name}\"] is not None:\n    \
+                                     try:\n        \
+                                         kwargs[\"{name}\"] = date.fromisoformat(kwargs[\"{name}\"])\n    \
+                                     except ValueError:\n        \
+                                         for _fmt in (\"%d-%m-%Y\", \"%m/%d/%Y\", \"%d/%m/%Y\", \"%Y/%m/%d\"):\n            \
+                                             try:\n                \
+                                                 kwargs[\"{name}\"] = datetime.strptime(kwargs[\"{name}\"], _fmt).date()\n                \
+                                                 break\n            \
+                                             except ValueError:\n                \
+                                                 continue\n",
+                )
+            }
             _ => "".to_string(),
         })
         .collect::<Vec<String>>()
@@ -1035,14 +1770,19 @@ async fn prepare_wrapper(
     } else {
         ""
     };
-    let import_datetime = if init_sig
+    let has_datetime = init_sig
         .args
         .iter()
-        .any(|x| x.typ == windmill_parser::Typ::Datetime)
-    {
-        "from datetime import datetime"
-    } else {
-        ""
+        .any(|x| x.typ == windmill_parser::Typ::Datetime);
+    let has_date = init_sig
+        .args
+        .iter()
+        .any(|x| x.typ == windmill_parser::Typ::Date);
+    let import_datetime = match (has_datetime, has_date) {
+        (true, true) => "from datetime import datetime, date",
+        (true, false) => "from datetime import datetime",
+        (false, true) => "from datetime import datetime, date",
+        (false, false) => "",
     };
     let spread = if sig.star_kwargs {
         "args = kwargs".to_string()
@@ -1064,31 +1804,14 @@ async fn prepare_wrapper(
             .join("\n    ")
     };
 
-    let pre_spread = if let Some(pre_sig) = pre_sig {
-        let spread = if pre_sig.star_kwargs {
-            "pre_args = kwargs".to_string()
-        } else {
-            pre_sig
-                .args
-                .into_iter()
-                .map(|x| {
-                    let name = &x.name;
-                    if x.default.is_none() {
-                        format!("pre_args[\"{name}\"] = kwargs.get(\"{name}\")")
-                    } else {
-                        format!(
-                            r#"pre_args["{name}"] = kwargs.get("{name}")
-        if pre_args["{name}"] is None:
-            del pre_args["{name}"]"#
-                        )
-                    }
-                })
-                .join("\n        ")
-        };
-        Some(spread)
-    } else {
-        None
-    };
+    let pre_spread = pre_sig
+        .as_ref()
+        .map(|sig| python_preprocessor_spread(sig, "        "));
+    // 4-space indent for the WAC wrapper, where the preprocessor block is
+    // injected inside the `try:` body so failures get serialized to result.json.
+    let wac_pre_spread = pre_sig
+        .as_ref()
+        .map(|sig| python_preprocessor_spread(sig, "    "));
 
     let module_dir_dot = dirs.replace("/", ".").replace("-", "_");
 
@@ -1103,6 +1826,7 @@ async fn prepare_wrapper(
         spread,
         main_override.map(ToString::to_string),
         pre_spread,
+        wac_pre_spread,
     ))
 }
 
@@ -1154,7 +1878,7 @@ async fn replace_pip_secret(
     }
 }
 
-async fn handle_python_deps(
+pub(crate) async fn handle_python_deps(
     job_dir: &str,
     requirements_o: Option<&String>,
     inner_content: &str,
@@ -1169,16 +1893,15 @@ async fn handle_python_deps(
     occupancy_metrics: &mut Option<&mut OccupancyMetrics>,
     precomputed_agent_info: Option<PrecomputedAgentInfo>,
     annotations: PythonAnnotations,
+    temp_script_refs: &Option<HashMap<String, String>>,
 ) -> error::Result<(PyV, Vec<String>)> {
     create_dependencies_dir(job_dir).await;
 
     let mut additional_python_paths: Vec<String> = WORKER_CONFIG
-        .read()
-        .await
+        .load()
         .additional_python_paths
         .clone()
-        .unwrap_or_else(|| vec![])
-        .clone();
+        .unwrap_or_else(|| vec![]);
 
     let (pyv, resolved_lines) = match requirements_o {
         // Deployed
@@ -1199,6 +1922,7 @@ async fn handle_python_deps(
                         &mut version_specifiers,
                         &mut locked_v,
                         &None,
+                        temp_script_refs,
                     ))
                     .await?;
 
@@ -1294,6 +2018,24 @@ Returned from server: py_version - {:?}, py_version_v2 - {:?}
         }
     };
 
+    // Filter out packages matched by pip_local_dependencies. For preview runs this is also
+    // handled inside uv_pip_compile, but deployed scripts skip uv_pip_compile entirely and
+    // would otherwise pass every lockfile entry to handle_python_reqs — causing duplicate
+    // installs alongside additional_python_paths and triggering expensive postinstall copies.
+    let resolved_lines = {
+        let (kept, ignored) = filter_pip_local_dependencies(resolved_lines);
+        if !ignored.is_empty() {
+            append_logs(
+                job_id,
+                w_id,
+                format!("\nignoring local dependencies:\n{}\n", ignored.join("\n")),
+                conn,
+            )
+            .await;
+        }
+        kept
+    };
+
     if !resolved_lines.is_empty() {
         let mut venv_path = handle_python_reqs(
             resolved_lines,
@@ -1318,6 +2060,33 @@ Returned from server: py_version - {:?}, py_version_v2 - {:?}
 
 lazy_static::lazy_static! {
     static ref PIP_SECRET_VARIABLE: Regex = Regex::new(r"\$\{PIP_SECRET:([^\s\}]+)\}").unwrap();
+
+    /// venv paths whose wheel RECORD this process has already verified against
+    /// disk. A cache entry is only damaged out-of-band (disk-pressure eviction,
+    /// an interrupted extraction on a shared cache volume, or a corrupt entry
+    /// that predates this worker), never spontaneously while we keep running, so
+    /// re-verifying it once per process is enough — every later reuse trusts the
+    /// in-memory marker and pays only the original single stat.
+    static ref VERIFIED_VENVS: tokio::sync::Mutex<HashSet<String>> =
+        tokio::sync::Mutex::new(HashSet::new());
+
+    // In-process locks serializing concurrent installs into the same shared
+    // `venv_p` cache dir; `uv --reinstall` removes a package's .dist-info/RECORD
+    // before rewriting it, so a sibling install/verify racing it corrupts the
+    // dir. Keyed by venv_p so distinct deps still install in parallel.
+    static ref PY_INSTALL_LOCKS: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+        tokio::sync::Mutex::new(std::collections::HashMap::new());
+}
+
+/// Returns the in-process install lock for a given target cache dir, creating it
+/// on first use. Idle entries (only the map holds a reference) are pruned each
+/// call so the map stays bounded by the number of in-flight installs.
+async fn get_venv_install_lock(venv_p: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = PY_INSTALL_LOCKS.lock().await;
+    map.retain(|_, v| Arc::strong_count(v) > 1);
+    map.entry(venv_p.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Spawn process of uv install
@@ -1333,7 +2102,15 @@ async fn spawn_uv_install(
     py_path: Option<String>,
     worker_dir: &str,
 ) -> Result<Box<dyn TokioChildWrapper>, Error> {
-    if !*DISABLE_NSJAIL {
+    let uv_index_strategy_guard = UV_INDEX_STRATEGY.read().await.clone();
+    let uv_index_strategy = uv_index_strategy_guard
+        .as_deref()
+        .unwrap_or("unsafe-best-match");
+    let uv_exclude_newer = (*UV_EXCLUDE_NEWER.read().await).map(|secs| format!("{}s", secs));
+    let uv_exclude_newer = uv_exclude_newer.as_deref();
+    let uv_python_install_mirror = UV_PYTHON_INSTALL_MIRROR.read().await.clone();
+
+    if is_sandboxing_enabled() {
         tracing::info!(
             workspace_id = %w_id,
             "starting nsjail"
@@ -1355,6 +2132,10 @@ async fn spawn_uv_install(
         if *NATIVE_CERT {
             vars.push(("UV_NATIVE_TLS", "true"));
         }
+        if let Some(timeout) = UV_HTTP_TIMEOUT.as_ref() {
+            vars.push(("UV_HTTP_TIMEOUT", timeout.as_str()));
+        }
+
         let _owner;
         if let Some(py_path) = py_path.as_ref() {
             _owner = format!(
@@ -1365,6 +2146,13 @@ async fn spawn_uv_install(
         }
         vars.push(("REQ", &req));
         vars.push(("TARGET", venv_p));
+        vars.push(("UV_INDEX_STRATEGY", uv_index_strategy));
+        if let Some(v) = uv_exclude_newer {
+            vars.push(("UV_EXCLUDE_NEWER", v));
+        }
+        if let Some(mirror) = uv_python_install_mirror.as_ref() {
+            vars.push(("UV_PYTHON_INSTALL_MIRROR", mirror));
+        }
 
         std::fs::create_dir_all(venv_p)?;
         let nsjail_proto = format!("{req}.config.proto");
@@ -1374,11 +2162,15 @@ async fn spawn_uv_install(
             &nsjail_proto,
             NSJAIL_CONFIG_DOWNLOAD_PY_CONTENT
                 .replace("{WORKER_DIR}", worker_dir)
-                .replace("{PY_INSTALL_DIR}", &PY_INSTALL_DIR)
+                .replace("{PY_INSTALL_DIR}", &*PY_INSTALL_DIR)
                 .replace("{TARGET_DIR}", &venv_p)
                 .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
-                .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
+                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
                 .replace("#{DEV}", DEV_CONF_NSJAIL)
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
                 .as_str(),
         )?;
 
@@ -1410,16 +2202,14 @@ async fn spawn_uv_install(
             "--no-config",
             "--link-mode=copy",
             "--system",
-            // Prefer main index over extra
-            // https://docs.astral.sh/uv/pip/compatibility/#packages-that-exist-on-multiple-indexes
-            // TODO: Use env variable that can be toggled from UI
-            "--index-strategy",
-            "unsafe-best-match",
             "--target",
             venv_p,
             "--no-cache",
             // If we invoke uv pip install, then we want to overwrite existing data
             "--reinstall",
+            // Compile .py to .pyc at install time so imports are fast even
+            // through read-only nsjail mounts (no in-memory compilation per job).
+            "--compile-bytecode",
         ];
 
         if let Some(py_path) = py_path.as_ref() {
@@ -1441,15 +2231,27 @@ async fn spawn_uv_install(
                 command_args.extend(["--extra-index-url", url]);
             });
         }
+        if let Some(v) = uv_exclude_newer {
+            command_args.extend(["--exclude-newer", v]);
+        }
 
         let mut envs = vec![("PATH", PATH_ENV.as_str())];
         envs.push(("HOME", HOME_ENV.as_str()));
+        envs.push(("UV_INDEX_STRATEGY", uv_index_strategy));
+        if let Some(timeout) = UV_HTTP_TIMEOUT.as_ref() {
+            envs.push(("UV_HTTP_TIMEOUT", timeout.as_str()));
+        }
+        if let Some(mirror) = uv_python_install_mirror.as_ref() {
+            envs.push(("UV_PYTHON_INSTALL_MIRROR", mirror));
+        }
 
         if let Some(url) = pip_index_url.as_ref() {
             command_args.extend(["--index-url", url]);
         }
         if let Some(host) = TRUSTED_HOST.as_ref() {
-            command_args.extend(["--trusted-host", &host]);
+            host.split_whitespace().for_each(|h| {
+                command_args.extend(["--trusted-host", h]);
+            });
         }
         if *NATIVE_CERT {
             command_args.extend(["--native-tls"]);
@@ -1530,6 +2332,84 @@ async fn spawn_uv_install(
     }
 }
 
+/// Verify that every file listed in the wheel's RECORD exists on disk under
+/// `venv_p`. Used as a structural integrity check after both a successful
+/// `pull_from_tar` (object-store cache hit) and a successful local
+/// `uv pip install`, so a truncated tar or a dropped wheel entry can never
+/// become an authoritative cache entry. Returns Err with a short description
+/// on the first integrity issue (no .dist-info, no RECORD, or any listed
+/// path missing on disk).
+async fn verify_wheel_record(venv_p: &str) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(venv_p)
+        .await
+        .map_err(|e| format!("read_dir({venv_p}): {e}"))?;
+
+    let mut dist_info: Option<String> = None;
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                let name = entry.file_name();
+                let name_s = name.to_string_lossy();
+                if name_s.ends_with(".dist-info") {
+                    if let Ok(ft) = entry.file_type().await {
+                        if ft.is_dir() {
+                            dist_info = Some(name_s.into_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("read_dir entry in {venv_p}: {e}")),
+        }
+    }
+
+    let dist_info = match dist_info {
+        Some(d) => d,
+        None => return Err(format!("no .dist-info directory in {venv_p}")),
+    };
+
+    let record_path = format!("{venv_p}/{dist_info}/RECORD");
+    let record_content = tokio::fs::read_to_string(&record_path)
+        .await
+        .map_err(|e| format!("read RECORD at {record_path}: {e}"))?;
+
+    let mut missing: Vec<String> = Vec::new();
+    for line in record_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rel_path = match trimmed.split(',').next() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        // Defensive: skip absolute paths or escaping entries — we only
+        // validate package-relative files.
+        if rel_path.starts_with('/') || rel_path.contains("..") {
+            continue;
+        }
+        let full = format!("{venv_p}/{rel_path}");
+        if tokio::fs::metadata(&full).await.is_err() {
+            missing.push(rel_path.to_string());
+            // Bound error size in pathological cases (e.g. wholly empty dir).
+            if missing.len() >= 10 {
+                missing.push("...".to_string());
+                break;
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "wheel RECORD lists files missing on disk: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 /// uv pip install, include cached or pull from S3
 pub async fn handle_python_reqs(
     requirements: Vec<String>,
@@ -1563,12 +2443,12 @@ pub async fn handle_python_reqs(
         instant: std::time::Instant,
         conn: &Connection,
     ) {
-        #[cfg(not(all(feature = "enterprise", feature = "parquet", unix)))]
+        #[cfg(not(all(feature = "enterprise", feature = "parquet")))]
         {
             (s3_pull, s3_push) = (false, false);
         }
 
-        #[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+        #[cfg(all(feature = "enterprise", feature = "parquet"))]
         if OBJECT_STORE_SETTINGS.read().await.is_none() {
             (s3_pull, s3_push) = (false, false);
         }
@@ -1611,16 +2491,26 @@ pub async fn handle_python_reqs(
     );
 
     let pip_indexes = (
-        PIP_EXTRA_INDEX_URL
-            .read()
-            .await
-            .clone()
-            .map(handle_ephemeral_token),
-        PIP_INDEX_URL
-            .read()
-            .await
-            .clone()
-            .map(handle_ephemeral_token),
+        read_ee_registry_with_workspace_override(
+            PIP_EXTRA_INDEX_URL.read().await.clone(),
+            "pip_extra_index_url",
+            "pip extra index url",
+            job_id,
+            w_id,
+            conn,
+        )
+        .await
+        .map(handle_ephemeral_token),
+        read_ee_registry_with_workspace_override(
+            PIP_INDEX_URL.read().await.clone(),
+            "pip_index_url",
+            "pip index url",
+            job_id,
+            w_id,
+            conn,
+        )
+        .await
+        .map(handle_ephemeral_token),
     );
 
     // Cached paths
@@ -1642,8 +2532,53 @@ pub async fn handle_python_reqs(
             req.replace(' ', "").replace('/', "").replace(':', "")
         );
         if metadata(venv_p.clone() + "/.valid.windmill").await.is_ok() {
-            req_paths.push(venv_p);
-            in_cache.push(req.to_string());
+            // The .valid.windmill marker is written once at creation time, after
+            // verify_wheel_record passes on the install/pull paths. It is an empty
+            // file with no binding to the directory contents, so a file dropped
+            // out-of-band afterwards (disk-pressure eviction, interrupted tar
+            // extraction on a shared cache volume, or a corrupt entry that
+            // predates this worker) leaves the marker intact while the wheel is
+            // incomplete. Re-verify the RECORD once per process so such an entry
+            // is repaired rather than trusted; VERIFIED_VENVS makes every later
+            // reuse skip the scan and pay only the single stat above.
+            let already_verified = VERIFIED_VENVS.lock().await.contains(&venv_p);
+            let verify_res = if already_verified {
+                Ok(())
+            } else {
+                verify_wheel_record(&venv_p).await
+            };
+            match verify_res {
+                Ok(()) => {
+                    if !already_verified {
+                        VERIFIED_VENVS.lock().await.insert(venv_p.clone());
+                    }
+                    req_paths.push(venv_p);
+                    in_cache.push(req.to_string());
+                }
+                Err(verify_err) => {
+                    tracing::warn!(
+                        workspace_id = %w_id,
+                        job_id = %job_id,
+                        "Local cache for {venv_p} failed wheel RECORD verification, will reinstall: {verify_err}"
+                    );
+                    append_logs(
+                        &job_id,
+                        w_id,
+                        format!(
+                            "\n[!] cached wheel for {req} failed integrity check, reinstalling: {verify_err}\n"
+                        ),
+                        conn,
+                    )
+                    .await;
+                    if let Err(rm_err) = tokio::fs::remove_dir_all(&venv_p).await {
+                        tracing::warn!(
+                            workspace_id = %w_id,
+                            "could not remove broken cache dir {venv_p}: {rm_err}"
+                        );
+                    }
+                    req_with_penv.push((req.to_string(), venv_p));
+                }
+            }
         } else {
             // There is no valid or no wheel at all. Regardless of if there is content or not, we will overwrite it with --reinstall flag
             req_with_penv.push((req.to_string(), venv_p));
@@ -1685,7 +2620,7 @@ pub async fn handle_python_reqs(
                         let mut local_mem_peak = 0;
                         for pid_o in pids.lock().await.iter() {
                             if pid_o.is_some(){
-                                let mem = crate::handle_child::get_mem_peak(*pid_o, !*DISABLE_NSJAIL).await;
+                                let mem = crate::handle_child::get_mem_peak(*pid_o, is_sandboxing_enabled()).await;
                                 if mem < 0 {
                                     tracing::warn!(
                                         workspace_id = %w_id_2,
@@ -1795,7 +2730,7 @@ pub async fn handle_python_reqs(
         }
 
         // Do we use Nsjail?
-        if !*DISABLE_NSJAIL {
+        if is_sandboxing_enabled() {
             logs.push_str(&format!(
                 "\nStarting isolated installation... ({} tasks in parallel) \n",
                 parallel_limit
@@ -1813,7 +2748,7 @@ pub async fn handle_python_reqs(
     let mut handles = Vec::with_capacity(total_to_install);
     // let mem_peak_thread_safe = Arc::new(tokio::sync::Mutex::new(0));
 
-    #[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+    #[cfg(all(feature = "enterprise", feature = "parquet"))]
     let is_not_pro = !matches!(get_license_plan().await, LicensePlan::Pro);
 
     let total_time = std::time::Instant::now();
@@ -1861,7 +2796,7 @@ pub async fn handle_python_reqs(
         let pids = pids.clone();
         let worker_dir = worker_dir.clone();
 
-        #[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+        #[cfg(all(feature = "enterprise", feature = "parquet"))]
         let py_version = py_version.clone();
 
         handles.push(task::spawn(async move {
@@ -1879,9 +2814,100 @@ pub async fn handle_python_reqs(
             );
 
             let start = std::time::Instant::now();
-            #[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+
+            // Lock the shared target dir (see PY_INSTALL_LOCKS). In-process lock
+            // first; only one task per dir then contends the cross-process file
+            // lock below. Both guards drop on every return path.
+            let venv_lock = get_venv_install_lock(&venv_p).await;
+            let _venv_guard = tokio::select! {
+                _ = kill_rx.recv() => {
+                    pids.lock().await.get_mut(i).and_then(|e| e.take());
+                    return Err(Error::from(anyhow::anyhow!(
+                        "install of {venv_p} canceled while waiting for venv lock"
+                    )));
+                }
+                guard = venv_lock.lock_owned() => guard,
+            };
+
+            // Cross-process advisory lock. Best-effort: if the filesystem doesn't
+            // support locking we log and proceed — verify_wheel_record + job retry
+            // still guard correctness, just without the dedup. Cross-platform
+            // (flock on unix, LockFileEx on windows) so agents sharing a wheel-cache
+            // dir on a Windows host serialize just as they do on unix.
+            let _venv_file_lock: Option<std::fs::File> = {
+                use fs4::fs_std::FileExt;
+                let lock_path = format!("{venv_p}.lock");
+                if let Some(parent) = std::path::Path::new(&lock_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::OpenOptions::new().create(true).write(true).open(&lock_path) {
+                    Ok(f) => {
+                        // Bounded wait: a holder that crashes releases the lock (the
+                        // OS drops it on handle close), but a live-but-stuck holder
+                        // (e.g. uv wedged on a hung mount) would otherwise block us
+                        // forever. After the cap, proceed degraded rather than hang —
+                        // verify_wheel_record + retry still guard correctness.
+                        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+                        let waited_since = std::time::Instant::now();
+                        loop {
+                            match f.try_lock_exclusive() {
+                                Ok(true) => break Some(f),
+                                // Another holder has the lock.
+                                Ok(false) => {
+                                    if waited_since.elapsed() >= MAX_WAIT {
+                                        tracing::warn!(
+                                            workspace_id = %w_id,
+                                            "venv install lock {lock_path} still held after {}s, proceeding without cross-process install lock",
+                                            MAX_WAIT.as_secs()
+                                        );
+                                        break Some(f);
+                                    }
+                                    tokio::select! {
+                                        _ = kill_rx.recv() => {
+                                            pids.lock().await.get_mut(i).and_then(|e| e.take());
+                                            return Err(Error::from(anyhow::anyhow!(
+                                                "install of {venv_p} canceled while waiting for venv file lock"
+                                            )));
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        workspace_id = %w_id,
+                                        "could not lock {lock_path}, proceeding without cross-process install lock: {e}"
+                                    );
+                                    break Some(f);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace_id = %w_id,
+                            "could not open install lock file {lock_path}, proceeding without cross-process install lock: {e}"
+                        );
+                        None
+                    }
+                }
+            };
+
+            // Double-checked: another job (this process or another sharing the
+            // mount) may have installed this exact dep while we waited on the
+            // locks. Reuse it instead of reinstalling.
+            if metadata(format!("{venv_p}/.valid.windmill")).await.is_ok() {
+                print_success(
+                    false, false, &job_id, &w_id, &req, req_tl, counter_arc,
+                    total_to_install, start, &conn,
+                )
+                .await;
+                pids.lock().await.get_mut(i).and_then(|e| e.take());
+                return Ok(());
+            }
+
+            #[cfg(all(feature = "enterprise", feature = "parquet"))]
             if is_not_pro {
-                if let Some(os) = windmill_common::s3_helpers::get_object_store().await {
+                if let Some(os) = windmill_object_store::get_object_store().await {
                     tokio::select! {
                         // Cancel was called on the job
                         _ = kill_rx.recv() => return Err(Error::from(anyhow::anyhow!("S3 pull was canceled"))),
@@ -1891,6 +2917,30 @@ pub async fn handle_python_reqs(
                                     workspace_id = %w_id,
                                     "No tarball was found for {venv_p} on S3 or different problem occurred {job_id}:\n{e}",
                                 );
+                            } else if let Err(verify_err) = verify_wheel_record(&venv_p).await {
+                                // The object-store tar extracted cleanly but the resulting
+                                // directory is missing files referenced by the wheel RECORD.
+                                // Wipe the broken cache entry and fall through to a fresh
+                                // local install rather than treating it as authoritative.
+                                tracing::warn!(
+                                    workspace_id = %w_id,
+                                    job_id = %job_id,
+                                    "Object-store cache for {venv_p} failed wheel RECORD verification, will reinstall locally: {verify_err}"
+                                );
+                                if let Err(rm_err) = tokio::fs::remove_dir_all(&venv_p).await {
+                                    tracing::warn!(
+                                        workspace_id = %w_id,
+                                        "could not remove broken cache dir {venv_p}: {rm_err}"
+                                    );
+                                }
+                                append_logs(
+                                    &job_id,
+                                    &w_id,
+                                    format!(
+                                        "\n[!] cached wheel for {req} from object store failed integrity check, reinstalling: {verify_err}\n"
+                                    ),
+                                    &conn,
+                                ).await;
                             } else {
                                 print_success(
                                     true,
@@ -1974,7 +3024,11 @@ pub async fn handle_python_reqs(
                     "failed to get PID for python installation process: {}",
                     &req
                   )))
-                  .and_then(|pid| write_file(&format!("/proc/{pid}"), "oom_score_adj", "1000"))
+                  .and_then(|pid| write_file(
+                      &format!("/proc/{pid}"),
+                      "oom_score_adj",
+                      &windmill_common::worker::JOB_OOM_SCORE_ADJ.to_string(),
+                  ))
                 {
                   tracing::error!(
                       req = %req,
@@ -2037,14 +3091,47 @@ pub async fn handle_python_reqs(
                 }
             };
 
-            #[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+            #[cfg(all(feature = "enterprise", feature = "parquet"))]
             let s3_push = is_not_pro;
 
-            #[cfg(not(all(feature = "enterprise", feature = "parquet", unix)))]
+            #[cfg(not(all(feature = "enterprise", feature = "parquet")))]
             let s3_push = false;
 
-            if !*DISABLE_NSJAIL {
+            if is_sandboxing_enabled() {
                 let _ = std::fs::remove_file(format!("{job_dir}/{req}.config.proto"));
+            }
+
+            // Verify the install before declaring success: if uv exited 0 but
+            // the on-disk directory is missing files the wheel RECORD says
+            // should exist, do NOT write .valid.windmill, do NOT queue the
+            // piptar upload, and fail the job. This prevents a broken tar
+            // from ever being pushed to the object store and propagated to
+            // every other replica.
+            if let Err(verify_err) = verify_wheel_record(&venv_p).await {
+                tracing::error!(
+                    workspace_id = %w_id,
+                    job_id = %job_id,
+                    "uv pip install of {req} into {venv_p} failed wheel RECORD verification: {verify_err}"
+                );
+                append_logs(
+                    &job_id,
+                    &w_id,
+                    format!(
+                        "\nWheel RECORD verification failed after install of {req}: {verify_err}. \
+                         Aborting to avoid publishing a corrupt cache entry."
+                    ),
+                    &conn,
+                ).await;
+                if let Err(rm_err) = tokio::fs::remove_dir_all(&venv_p).await {
+                    tracing::warn!(
+                        workspace_id = %w_id,
+                        "could not remove broken install dir {venv_p}: {rm_err}"
+                    );
+                }
+                pids.lock().await.get_mut(i).and_then(|e| e.take());
+                return Err(Error::from(anyhow!(
+                    "wheel RECORD verification failed after install of {req}"
+                )));
             }
 
             print_success(
@@ -2061,7 +3148,7 @@ pub async fn handle_python_reqs(
             )
             .await;
 
-            #[cfg(all(feature = "enterprise", feature = "parquet", unix))]
+            #[cfg(all(feature = "enterprise", feature = "parquet"))]
             if s3_push {
                 // Send to upload channel for sequential processing
                 let upload_task = PiptarUploadTask {
@@ -2198,12 +3285,32 @@ This is not normal behavior, please make sure all workers have enough memory.\n
     };
 }
 
+/// Python function body for `res_to_json(res, typ)`.
+/// Handles DataFrame, bytes, dict coercion + JSON serialization.
+fn python_res_to_json_body(postprocessor: &str) -> String {
+    format!(
+        r#"    if typ.__name__ == 'DataFrame':
+        if typ.__module__ == 'pandas.core.frame':
+            res = res.values.tolist()
+        elif typ.__module__ == 'polars.dataframe.frame':
+            res = res.rows()
+    elif typ.__name__ == 'bytes':
+        res = to_b_64(res)
+    elif typ.__name__ == 'dict':
+        for k, v in res.items():
+            if type(v).__name__ == 'bytes':
+                res[k] = to_b_64(v)
+    unprocessed = json.dumps(res, separators=(',', ':'), default=str).replace('\n', '')
+    return {postprocessor}"#
+    )
+}
+
 // Returns code snippet that needs to be injected into wrapper to post-process results or leave unprocessed
 fn get_result_postprocessor<'a>(skip: bool) -> &'a str {
     if skip {
         "unprocessed"
     } else {
-        "re.sub(replace_invalid_fields, ' null ', unprocessed)"
+        "_fix(unprocessed)"
     }
 }
 
@@ -2232,9 +3339,27 @@ pub async fn start_worker(
     jobs_rx: tokio::sync::mpsc::Receiver<DedicatedWorkerJob>,
     killpill_rx: tokio::sync::broadcast::Receiver<()>,
     client: windmill_common::client::AuthedClient,
+    concurrency_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 ) -> error::Result<()> {
     use crate::PyV;
     tracing::info!("script path: {}", script_path);
+
+    let codegen = compute_py_codegen(inner_content, script_path);
+
+    // Write script to proper module path (e.g., f/my/script.py)
+    let module_dir = format!("{}/{}", job_dir, codegen.dirs);
+    tokio::fs::create_dir_all(&module_dir).await?;
+    write_file(
+        &module_dir,
+        &format!("{}.py", codegen.module_name),
+        inner_content,
+    )?;
+
+    let any_relative_imports = RELATIVE_IMPORT_REGEX.is_match(inner_content);
+    if any_relative_imports {
+        // Dedicated worker runs deployed scripts only — no temp refs.
+        let _ = write_file(job_dir, "loader.py", &render_relative_python_loader(&None))?;
+    }
 
     let mut mem_peak: i32 = 0;
     let mut canceled_by: Option<CanceledBy> = None;
@@ -2247,6 +3372,7 @@ pub async fn start_worker(
         "NOT_AVAILABLE",
         "dedicated_worker",
         Some(script_path.to_string()),
+        None,
         None,
         None,
         None,
@@ -2277,85 +3403,16 @@ pub async fn start_worker(
         &mut None,
         None,
         annotations,
+        &None, // dedicated worker runs deployed scripts only
     )
     .await?;
 
-    let (
-        import_loader,
-        import_base64,
-        import_datetime,
-        module_dir_dot,
-        _dirs,
-        last,
-        transforms,
-        spread,
-        _,
-        _,
-    ) = prepare_wrapper(job_dir, None, None, None, inner_content, script_path).await?;
-
     {
-        let postprocessor = get_result_postprocessor(annotations.skip_result_postprocessing);
-        let indented_transforms = transforms
-            .lines()
-            .map(|x| format!("    {}", x))
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        let wrapper_content: String = format!(
-            r#"
-import json
-{import_loader}
-{import_base64}
-{import_datetime}
-import traceback
-import sys
-from {module_dir_dot} import {last} as inner_script
-import re
-
-
-def to_b_64(v: bytes):
-    import base64
-    b64 = base64.b64encode(v)
-    return b64.decode('ascii')
-
-replace_invalid_fields = re.compile(r'(?:\bNaN\b|\\u0000|Infinity|\-Infinity)')
-sys.stdout.write('start\n')
-
-for line in sys.stdin:
-    if line == 'end\n':
-        break
-    kwargs = json.loads(line, strict=False)
-    args = {{}}
-{indented_transforms}
-    {spread}
-    for k, v in list(args.items()):
-        if v == '<function call>':
-            del args[k]
-
-    try:
-        res = inner_script.main(**args)
-        typ = type(res)
-        if typ.__name__ == 'DataFrame':
-            if typ.__module__ == 'pandas.core.frame':
-                res = res.values.tolist()
-            elif typ.__module__ == 'polars.dataframe.frame':
-                res = res.rows()
-        elif typ.__name__ == 'bytes':
-            res = to_b_64(res)
-        elif typ.__name__ == 'dict':
-            for k, v in res.items():
-                if type(v).__name__ == 'bytes':
-                    res[k] = to_b_64(v)
-        unprocessed = json.dumps(res, separators=(',', ':'), default=str).replace('\n', '')
-        res_json = {postprocessor}
-        sys.stdout.write("wm_res[success]:" + res_json + "\n")
-    except BaseException as e:
-        exc_type, exc_value, exc_traceback = sys.exc_info()
-        tb = traceback.format_tb(exc_traceback)
-        err_json = json.dumps({{ "message": str(e), "name": e.__class__.__name__, "stack": '\n'.join(tb[1:])  }}, separators=(',', ':'), default=str).replace('\n', '')
-        sys.stdout.write("wm_res[error]:" + err_json + "\n")
-    sys.stdout.flush()
-"#,
+        let scripts = [PyScriptEntry { original_path: script_path, codegen: &codegen }];
+        let wrapper_content = generate_multi_script_wrapper(
+            &scripts,
+            annotations.skip_result_postprocessing,
+            any_relative_imports,
         );
         write_file(job_dir, "wrapper.py", &wrapper_content)?;
     }
@@ -2378,10 +3435,14 @@ for line in sys.stdin:
         None,
         None,
         None,
+        None,
     )
     .await;
 
-    let mut proc_envs = HashMap::new();
+    let mut proc_envs: HashMap<String, String> = PYTHON_UTF8_ENVS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let additional_python_paths_folders = additional_python_paths.iter().join(":");
     proc_envs.insert("PYTHONPATH".to_string(), additional_python_paths_folders);
     proc_envs.insert("PATH".to_string(), PATH_ENV.to_string());
@@ -2409,6 +3470,7 @@ for line in sys.stdin:
             &mut None,
         )
         .await?;
+
     handle_dedicated_process(
         &python_path,
         job_dir,
@@ -2426,6 +3488,348 @@ for line in sys.stdin:
         script_path,
         "python",
         client,
+        false,
+        concurrency_semaphore,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_python_module_dir_nested_path() {
+        assert_eq!(
+            compute_python_module_dir("f/my_folder/my_script"),
+            "f/my_folder"
+        );
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_deep_path() {
+        assert_eq!(compute_python_module_dir("f/a/b/c/script"), "f/a/b/c");
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_root_level() {
+        // Root-level script (no parent dirs) should fall back to "tmp"
+        assert_eq!(compute_python_module_dir("my_script"), "tmp");
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_single_folder() {
+        assert_eq!(compute_python_module_dir("f/script"), "f");
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_digit_prefix() {
+        // Dirs starting with digits get underscore-prefixed
+        assert_eq!(
+            compute_python_module_dir("1st_folder/script"),
+            "_1st_folder"
+        );
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_hyphens_replaced() {
+        // Hyphens are replaced with underscores
+        assert_eq!(
+            compute_python_module_dir("my-folder/sub-dir/script"),
+            "my_folder/sub_dir"
+        );
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_at_replaced() {
+        // @ is replaced with .
+        assert_eq!(compute_python_module_dir("u/@admin/script"), "u/.admin");
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_keyword_segment() {
+        // A folder whose name is a Python keyword would otherwise produce an
+        // invalid `from f.in.x import ...`; it is underscore-prefixed.
+        assert_eq!(compute_python_module_dir("f/in/script"), "f/_in");
+    }
+
+    #[test]
+    fn test_compute_python_module_dir_neutralizes_traversal() {
+        // A Preview path skips the DB `proper_id` CHECK, so it can carry `..`.
+        // `..`/`.` segments must be neutralized so the dir stays inside job_dir.
+        let dirs = compute_python_module_dir("u/x/../../../../tmp/evil/payload");
+        assert!(!dirs.split('/').any(|s| s == ".." || s == "."));
+        assert_eq!(dirs, "u/x/_/_/_/_/tmp/evil");
+        // The `@`->`.` rewrite must not be able to synthesize a `..` segment.
+        assert_eq!(compute_python_module_dir("u/@./script"), "u/_");
+    }
+
+    #[test]
+    fn test_compute_py_codegen_basic_args() {
+        let code = "def main(x: str, y: int):\n    return x\n";
+        let cg = compute_py_codegen(code, "f/test/script");
+        assert!(cg.spread.contains("args[\"x\"]"));
+        assert!(cg.spread.contains("args[\"y\"]"));
+        assert!(cg.transforms.is_empty());
+        assert!(cg.pre_spread.is_none());
+        assert_eq!(cg.module_name, "script");
+    }
+
+    #[test]
+    fn test_compute_py_codegen_keyword_step_id() {
+        // Regression for a flow inline step whose auto-assigned id is a Python
+        // keyword (e.g. `in`): the generated wrapper must not emit
+        // `from pkg import in as inner_script` (SyntaxError). The module name is
+        // underscore-prefixed, matching the digit-leading guard.
+        let code = "def main():\n    return 1\n";
+        let cg = compute_py_codegen(code, "u/admin/myflow/in");
+        assert_eq!(cg.module_name, "_in");
+        assert_eq!(cg.module_dir_dot, "u.admin.myflow");
+
+        // Non-keyword ids are unaffected.
+        let cg2 = compute_py_codegen(code, "u/admin/myflow/step");
+        assert_eq!(cg2.module_name, "step");
+    }
+
+    #[test]
+    fn test_compute_py_codegen_with_datetime_and_bytes() {
+        let code = "import datetime\n\ndef main(name: str, created_at: datetime.datetime, file: bytes):\n    return name\n";
+        let cg = compute_py_codegen(code, "f/my/handler");
+        assert!(cg.transforms.contains("datetime.fromisoformat"));
+        assert!(cg.transforms.contains("base64.b64decode"));
+        assert!(cg.spread.contains("args[\"name\"]"));
+        assert_eq!(cg.module_dir_dot, "f.my");
+        assert_eq!(cg.module_name, "handler");
+    }
+
+    #[test]
+    fn test_compute_py_codegen_star_kwargs() {
+        let code = "def main(**kwargs):\n    return kwargs\n";
+        let cg = compute_py_codegen(code, "f/test/star");
+        assert_eq!(cg.spread, "args = kwargs");
+    }
+
+    #[test]
+    fn test_compute_py_codegen_with_preprocessor() {
+        let code = "import datetime\n\ndef main(x: str, ts: datetime.datetime):\n    return x\n\ndef preprocessor(input: str, when: datetime.datetime):\n    return {\"x\": input, \"ts\": when}\n";
+        let cg = compute_py_codegen(code, "f/test/pre");
+        assert!(cg.spread.contains("args[\"x\"]"));
+        assert!(cg.pre_spread.is_some());
+        let pre = cg.pre_spread.as_ref().unwrap();
+        assert!(pre.contains("pre_args[\"input\"]"));
+    }
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_filter_lines_by_deps_no_deps_keeps_everything() {
+        let (kept, ignored) = filter_lines_by_deps(lines(&["requests==2.0", "numpy==1.0"]), &[]);
+        assert_eq!(kept, lines(&["requests==2.0", "numpy==1.0"]));
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn test_filter_lines_by_deps_matches_and_partitions() {
+        let deps = vec![Regex::new("^my-local-pkg").unwrap()];
+        let (kept, ignored) = filter_lines_by_deps(
+            lines(&["requests==2.0", "my-local-pkg==1.2.3", "numpy==1.0"]),
+            &deps,
+        );
+        assert_eq!(kept, lines(&["requests==2.0", "numpy==1.0"]));
+        assert_eq!(ignored, lines(&["my-local-pkg==1.2.3"]));
+    }
+
+    #[test]
+    fn test_filter_lines_by_deps_preserves_comment_lines() {
+        // `#` lines (e.g. the `# py: 3.11` lockfile header) must survive even when a
+        // dependency regex would otherwise match them.
+        let deps = vec![Regex::new("py").unwrap()];
+        let (kept, ignored) = filter_lines_by_deps(
+            lines(&["# py: 3.11", "pyyaml==6.0", "requests==2.0"]),
+            &deps,
+        );
+        assert_eq!(kept, lines(&["# py: 3.11", "requests==2.0"]));
+        assert_eq!(ignored, lines(&["pyyaml==6.0"]));
+    }
+
+    /// Materialize a fake installed wheel: every file in `files` is created, and
+    /// `record_entries` is written verbatim as the RECORD (so a test can list a
+    /// path in RECORD without creating it, to simulate out-of-band loss).
+    fn write_fake_wheel(root: &std::path::Path, files: &[&str], record_entries: &[&str]) {
+        for f in files {
+            let full = root.join(f);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, b"x").unwrap();
+        }
+        let dist_info = root.join("pkg-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(dist_info.join("RECORD"), record_entries.join("\n") + "\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_wheel_record_ok_when_all_present() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_wheel(
+            dir.path(),
+            &["pkg/__init__.py", "pkg/mod.py"],
+            &[
+                "pkg/__init__.py,sha256=aaa,1",
+                "pkg/mod.py,sha256=bbb,1",
+                "pkg-1.0.0.dist-info/RECORD,,",
+            ],
+        );
+        assert!(verify_wheel_record(dir.path().to_str().unwrap())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_wheel_record_err_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // RECORD lists pkg/mod.py but we never create it: the exact failure mode
+        // the customer hit (wmill/s3_reader.py present in RECORD, gone on disk).
+        write_fake_wheel(
+            dir.path(),
+            &["pkg/__init__.py"],
+            &[
+                "pkg/__init__.py,sha256=aaa,1",
+                "pkg/mod.py,sha256=bbb,1",
+                "pkg-1.0.0.dist-info/RECORD,,",
+            ],
+        );
+        let err = verify_wheel_record(dir.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.contains("pkg/mod.py"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_verify_wheel_record_err_when_no_dist_info() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loose.py"), b"x").unwrap();
+        assert!(verify_wheel_record(dir.path().to_str().unwrap())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_wheel_record_skips_absolute_and_escaping_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absolute and `..` RECORD entries are not package-relative and must be
+        // skipped rather than reported missing.
+        write_fake_wheel(
+            dir.path(),
+            &["pkg/__init__.py"],
+            &[
+                "pkg/__init__.py,sha256=aaa,1",
+                "/etc/passwd,sha256=ccc,1",
+                "../outside.py,sha256=ddd,1",
+                "pkg-1.0.0.dist-info/RECORD,,",
+            ],
+        );
+        assert!(verify_wheel_record(dir.path().to_str().unwrap())
+            .await
+            .is_ok());
+    }
+
+    // Regression tests for the concurrent-install guard. Two jobs installing the
+    // same uncached dep into the shared `venv_p` used to race uv's `--reinstall`,
+    // corrupting the on-disk wheel and failing with "Env installation did not
+    // succeed". The guard serializes those installs.
+
+    #[tokio::test]
+    async fn test_venv_install_lock_serializes_same_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Same target path => one shared lock => no two tasks install at once.
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                let lock = get_venv_install_lock("/cache/py/3.11/samedep==1.0").await;
+                let _g = lock.lock_owned().await;
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                // Yield so any concurrency would be observed by another task.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "installs into the same target dir must be serialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_venv_install_lock_distinct_paths_are_independent() {
+        // Different target paths get different locks and never block each other.
+        let a = get_venv_install_lock("/cache/py/3.11/depA==1.0").await;
+        let b = get_venv_install_lock("/cache/py/3.11/depB==1.0").await;
+        let _ga = a.lock_owned().await;
+        // Holding depA's lock must not prevent acquiring depB's.
+        assert!(
+            b.try_lock().is_ok(),
+            "distinct deps must install in parallel"
+        );
+        // Same path returns the same underlying lock.
+        let a2 = get_venv_install_lock("/cache/py/3.11/depA==1.0").await;
+        assert!(
+            a2.try_lock().is_err(),
+            "same target dir must map to the same lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_venv_file_lock_excludes_across_descriptions() {
+        // The cross-process layer: an advisory lock on a sibling `.lock` excludes a
+        // second independent open file handle (i.e. another worker process) while
+        // held, and frees it on close. Mirrors the loop in handle_python_reqs and
+        // must hold on every platform (flock on unix, LockFileEx on windows) — a
+        // Windows host running several agents against one wheel cache relies on it.
+        use fs4::fs_std::FileExt;
+
+        let dir = std::env::temp_dir().join("wm_venv_lock_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("dep==1.0.lock");
+
+        let f1 = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            f1.try_lock_exclusive().unwrap(),
+            "first holder must acquire the lock"
+        );
+
+        // A second handle (stand-in for another process) cannot take it.
+        let f2 = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            !f2.try_lock_exclusive().unwrap(),
+            "a second holder must be blocked while the lock is held"
+        );
+
+        // Releasing the first lets the second acquire it.
+        drop(f1);
+        assert!(
+            f2.try_lock_exclusive().unwrap(),
+            "lock must be acquirable once the holder releases it"
+        );
+
+        drop(f2);
+        let _ = std::fs::remove_file(&lock_path);
+    }
 }

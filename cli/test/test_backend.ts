@@ -13,16 +13,27 @@
  * Usage:
  *   import { withTestBackend, cleanupTestBackend } from "./test_backend.ts";
  *
- *   Deno.test("my test", async () => {
+ *   test("my test", async () => {
  *     await withTestBackend(async (backend, tempDir) => {
  *       const result = await backend.runCLICommand(["sync", "pull"], tempDir);
  *       // ...
  *     });
  *   });
+ *
+ * CROSS-LINKS - Related test helper locations (keep in sync when adding new helpers):
+ * @see test_fixtures.ts - Local file fixtures (createLocalScript, createLocalFlow, etc.)
+ * @see sync_pull_push.test.ts - Local fixtures + createRemoteScript (API-based)
+ *
+ * This file contains: API-based creation helpers (createTestApp, createTestResource,
+ *   createAppWithInlineScript, createFlowWithInlineScript, etc.)
+ * If you add new helpers, update cross-links in the files above.
  */
 
 import { CargoBackend, CargoBackendConfig } from "./cargo_backend.ts";
 import { ContainerizedBackend, ContainerConfig } from "./containerized_backend.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 /**
  * Common interface for test backends
@@ -37,8 +48,8 @@ export interface TestBackend {
   stop(): Promise<void>;
   reset(): Promise<void>;
 
-  createCLICommand(args: string[], workingDir: string, workspaceName?: string): Deno.Command;
-  runCLICommand(args: string[], workingDir: string, workspaceName?: string): Promise<{
+  createCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }): any;
+  runCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }): Promise<{
     stdout: string;
     stderr: string;
     code: number;
@@ -54,6 +65,10 @@ export interface TestBackend {
   listAllApps?(): Promise<any[]>;
   listAllResources?(): Promise<any[]>;
   listAllVariables?(): Promise<any[]>;
+
+  // Methods for creating apps and flows with custom inline scripts
+  createAppWithInlineScript?(path: string, inlineScriptContent: string, language?: string): Promise<void>;
+  createFlowWithInlineScript?(path: string, inlineScriptContent: string, language?: string): Promise<void>;
 }
 
 /**
@@ -94,18 +109,19 @@ class CargoBackendAdapter implements TestBackend {
     await this.backend.reset();
   }
 
-  createCLICommand(args: string[], workingDir: string, workspaceName?: string): Deno.Command {
-    return this.backend.createCLICommand(args, workingDir, workspaceName);
+  createCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }): any {
+    return this.backend.createCLICommand(args, workingDir, opts);
   }
 
-  async runCLICommand(args: string[], workingDir: string, workspaceName?: string) {
-    return this.backend.runCLICommand(args, workingDir, workspaceName);
+  async runCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }) {
+    return this.backend.runCLICommand(args, workingDir, opts);
   }
 
   async apiRequest(path: string, options?: RequestInit): Promise<Response> {
     return this.backend.apiRequest(path, options);
   }
 
+  /** Seeds test data via API calls. See file header for cross-links to related helpers. */
   async seedTestData(): Promise<void> {
     // Create test folder first
     await this.createTestFolder("test");
@@ -121,6 +137,7 @@ class CargoBackendAdapter implements TestBackend {
     await this.createTestApp("f/test/test_dashboard");
   }
 
+  /** See file header for cross-links to related helpers. */
   private async createTestApp(path: string): Promise<void> {
     const response = await this.backend.apiRequest(`/api/w/${this.workspace}/apps/create`, {
       method: "POST",
@@ -153,6 +170,7 @@ class CargoBackendAdapter implements TestBackend {
     }
   }
 
+  /** See file header for cross-links to related helpers. */
   private async createTestFolder(name: string): Promise<void> {
     const response = await this.backend.apiRequest(`/api/w/${this.workspace}/folders/create`, {
       method: "POST",
@@ -169,6 +187,7 @@ class CargoBackendAdapter implements TestBackend {
     }
   }
 
+  /** See file header for cross-links to related helpers. */
   private async createTestGroup(name: string): Promise<void> {
     const response = await this.backend.apiRequest(`/api/w/${this.workspace}/groups/create`, {
       method: "POST",
@@ -186,6 +205,7 @@ class CargoBackendAdapter implements TestBackend {
   }
 
 
+  /** See file header for cross-links to related helpers. */
   private async createTestResource(path: string, description: string): Promise<void> {
     // First ensure the folder exists
     const folderPath = path.split("/").slice(0, 2).join("/"); // e.g., "f/test"
@@ -225,6 +245,7 @@ class CargoBackendAdapter implements TestBackend {
     }
   }
 
+  /** See file header for cross-links to related helpers. */
   private async createTestVariable(path: string, value: string): Promise<void> {
     const response = await this.backend.apiRequest(
       `/api/w/${this.workspace}/variables/create`,
@@ -326,6 +347,88 @@ class CargoBackendAdapter implements TestBackend {
     if (!response.ok) return [];
     return response.json();
   }
+
+  async createAppWithInlineScript(path: string, inlineScriptContent: string, language: string = "bun"): Promise<void> {
+    const response = await this.backend.apiRequest(`/api/w/${this.workspace}/apps/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path,
+        value: {
+          type: "app",
+          grid: [
+            {
+              id: "button1",
+              data: {
+                type: "buttoncomponent",
+                componentInput: {
+                  type: "runnable",
+                  runnable: {
+                    type: "runnableByName",
+                    inlineScript: {
+                      content: inlineScriptContent,
+                      language,
+                    },
+                  },
+                },
+              },
+            },
+          ],
+          hiddenInlineScripts: [],
+          css: {},
+          norefreshbar: false,
+        },
+        summary: "Test app with inline script",
+        policy: {
+          on_behalf_of: null,
+          on_behalf_of_email: null,
+          triggerables: {},
+          execution_mode: "viewer",
+        },
+      }),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Failed to create app ${path}: ${error}`);
+    }
+    await response.text();
+  }
+
+  async createFlowWithInlineScript(path: string, inlineScriptContent: string, language: string = "bun"): Promise<void> {
+    const response = await this.backend.apiRequest(`/api/w/${this.workspace}/flows/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path,
+        summary: "Test flow with inline script",
+        description: `Flow at ${path}`,
+        value: {
+          modules: [
+            {
+              id: "a",
+              value: {
+                type: "rawscript",
+                content: inlineScriptContent,
+                language,
+                input_transforms: {},
+              },
+            },
+          ],
+        },
+        schema: {
+          $schema: "https://json-schema.org/draft/2020-12/schema",
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      }),
+    });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Failed to create flow ${path}: ${error}`);
+    }
+    await response.text();
+  }
 }
 
 /**
@@ -366,12 +469,12 @@ class ContainerizedBackendAdapter implements TestBackend {
     await this.backend.reset();
   }
 
-  createCLICommand(args: string[], workingDir: string, workspaceName?: string): Deno.Command {
-    return this.backend.createCLICommand(args, workingDir, workspaceName);
+  createCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }): any {
+    return this.backend.createCLICommand(args, workingDir, opts);
   }
 
-  async runCLICommand(args: string[], workingDir: string, workspaceName?: string) {
-    return this.backend.runCLICommand(args, workingDir, workspaceName);
+  async runCLICommand(args: string[], workingDir: string, opts?: { workspace?: string; token?: string }) {
+    return this.backend.runCLICommand(args, workingDir, opts);
   }
 
   async seedTestData(): Promise<void> {
@@ -414,7 +517,7 @@ let globalBackend: TestBackend | null = null;
  * Get the backend type from environment
  */
 function getBackendType(): "cargo" | "docker" {
-  const envType = Deno.env.get("TEST_BACKEND")?.toLowerCase();
+  const envType = process.env["TEST_BACKEND"]?.toLowerCase();
   if (envType === "docker") {
     return "docker";
   }
@@ -433,7 +536,7 @@ export function createTestBackend(type?: "cargo" | "docker"): TestBackend {
   } else {
     console.log("🦀 Using Cargo-based test backend");
     return new CargoBackendAdapter({
-      verbose: Deno.env.get("VERBOSE") === "1",
+      verbose: process.env["VERBOSE"] === "1",
     });
   }
 }
@@ -444,6 +547,7 @@ export function createTestBackend(type?: "cargo" | "docker"): TestBackend {
 export async function getTestBackend(): Promise<TestBackend> {
   if (!globalBackend) {
     globalBackend = createTestBackend();
+    registerCleanup();
     await globalBackend.start();
   }
   return globalBackend;
@@ -456,7 +560,7 @@ export async function withTestBackend<T>(
   testFn: (backend: TestBackend, tempDir: string) => Promise<T>
 ): Promise<T> {
   const backend = await getTestBackend();
-  const tempDir = await Deno.makeTempDir({ prefix: "windmill_cli_test_" });
+  const tempDir = await mkdtemp(join(tmpdir(), "windmill_cli_test_"));
 
   try {
     await backend.reset();
@@ -465,7 +569,7 @@ export async function withTestBackend<T>(
     }
     return await testFn(backend, tempDir);
   } finally {
-    await Deno.remove(tempDir, { recursive: true });
+    await rm(tempDir, { recursive: true });
   }
 }
 
@@ -477,6 +581,127 @@ export async function cleanupTestBackend(): Promise<void> {
     await globalBackend.stop();
     globalBackend = null;
   }
+}
+
+// Auto-cleanup on process exit
+let cleanupRegistered = false;
+function registerCleanup() {
+  if (cleanupRegistered) return;
+  cleanupRegistered = true;
+  process.on("exit", () => {
+    if (globalBackend) {
+      // Synchronous kill — can't await in exit handler.
+      // Kill the direct child (cargo); any orphaned windmill child processes
+      // will be cleaned up by cleanupStaleTestResources() on next startup.
+      const pid = (globalBackend as any).backend?.process?.pid;
+      if (pid) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Best effort — process may already be dead
+        }
+      }
+    }
+  });
+  // Handle graceful shutdown
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, async () => {
+      await cleanupTestBackend();
+      process.exit(0);
+    });
+  }
+}
+
+/**
+ * Create a non-admin user, add them to the workspace, and return their token.
+ */
+export async function createNonAdminUser(
+  backend: TestBackend,
+  workspaceId: string = backend.workspace
+): Promise<string> {
+  if (!backend.apiRequest) {
+    throw new Error("Backend does not support apiRequest");
+  }
+
+  const email = `nonadmin_${Date.now()}@test.dev`;
+  const password = "testpass123";
+
+  // Create user globally (as admin)
+  const createResp = await backend.apiRequest("/api/users/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      email,
+      password,
+      super_admin: false,
+      name: "Non-Admin Test User",
+    }),
+  });
+  if (!createResp.ok) {
+    throw new Error(`Failed to create user: ${await createResp.text()}`);
+  }
+  await createResp.text();
+
+  // Add user to workspace as non-admin
+  const addResp = await backend.apiRequest(
+    `/api/w/${workspaceId}/workspaces/add_user`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email,
+        is_admin: false,
+        operator: false,
+      }),
+    }
+  );
+  if (!addResp.ok) {
+    throw new Error(`Failed to add user to workspace: ${await addResp.text()}`);
+  }
+  await addResp.text();
+
+  // Login as the non-admin user to get a token
+  const loginResp = await fetch(`${backend.baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!loginResp.ok) {
+    throw new Error(`Failed to login as non-admin: ${await loginResp.text()}`);
+  }
+  return await loginResp.text();
+}
+
+/**
+ * Create workspace dependencies via the API (e.g. a shared package.json for bun scripts).
+ */
+export async function createRemoteWorkspaceDeps(
+  backend: TestBackend,
+  language: string,
+  content: string,
+  name?: string,
+): Promise<void> {
+  if (!backend.apiRequest) {
+    throw new Error("Backend does not support apiRequest");
+  }
+
+  const resp = await backend.apiRequest(
+    `/api/w/${backend.workspace}/workspace_dependencies/create`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workspace_id: backend.workspace,
+        language,
+        content,
+        ...(name ? { name } : {}),
+      }),
+    }
+  );
+  if (!resp.ok) {
+    throw new Error(`Failed to create workspace deps (${resp.status}): ${await resp.text()}`);
+  }
+  await resp.text();
 }
 
 // Re-export for convenience

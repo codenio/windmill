@@ -1,7 +1,6 @@
 use std::{collections::HashMap, process::Stdio};
 
 use anyhow::anyhow;
-use const_format::concatcp;
 use itertools::Itertools;
 use regex::Regex;
 use tokio::{
@@ -24,11 +23,16 @@ use windmill_queue::{append_logs, CanceledBy, MiniPulledJob};
 use crate::{
     common::{
         build_command_with_isolation, create_args_and_out_file, get_reserved_variables,
-        read_result, start_child_process, OccupancyMetrics, DEV_CONF_NSJAIL,
+        read_result, resolve_nsjail_timeout, resolve_nsjail_tmp_mount_block, start_child_process,
+        OccupancyMetrics, DEV_CONF_NSJAIL,
     },
-    handle_child::{self}, get_proxy_envs_for_lang,
-    universal_pkg_installer::{par_install_language_dependencies_seq, RequiredDependency},
-    DISABLE_NSJAIL, DISABLE_NUSER, NSJAIL_PATH, PATH_ENV, PROXY_ENVS, RUBY_CACHE_DIR, RUBY_REPOS,
+    get_proxy_envs_for_lang,
+    handle_child::{self},
+    is_sandboxing_enabled, read_ee_registry_url_list_with_workspace_override,
+    universal_pkg_installer::{
+        par_install_language_dependencies_seq, InstallDeps, RequiredDependency,
+    },
+    DISABLE_NUSER, NSJAIL_PATH, PATH_ENV, PROXY_ENVS, RUBY_CACHE_DIR, RUBY_REPOS,
     TRACING_PROXY_CA_CERT_PATH,
 };
 use windmill_common::scripts::ScriptLang;
@@ -50,7 +54,6 @@ const NSJAIL_CONFIG_RUN_RUBY_CONTENT: &str = include_str!("../nsjail/run.ruby.co
 const NSJAIL_CONFIG_DOWNLOAD_RUBY_CONTENT: &str =
     include_str!("../nsjail/download.ruby.config.proto");
 const NSJAIL_CONFIG_LOCK_RUBY_CONTENT: &str = include_str!("../nsjail/lock.ruby.config.proto");
-
 
 #[allow(dead_code)]
 pub(crate) struct JobHandlerInput<'a> {
@@ -121,7 +124,7 @@ pub async fn prepare<'a>(
         .write_all(&wrap(inner_content)?.into_bytes())
         .await?;
 
-    let mini_wm_path = format!("{RUBY_CACHE_DIR}/gems/windmill-internal/windmill");
+    let mini_wm_path = format!("{}/gems/windmill-internal/windmill", *RUBY_CACHE_DIR);
     if !std::fs::metadata(&mini_wm_path).is_ok() {
         fs::create_dir_all(&mini_wm_path).await?;
 
@@ -309,7 +312,8 @@ Your Gemfile syntax will continue to work as-is."
     let mut file = File::create(job_dir.to_owned() + "/Gemfile").await?;
     file.write_all(&gemfile.as_bytes()).await?;
 
-    let req_hash = format!("ruby-{}", calculate_hash(&gemfile));
+    let ws_suffix = crate::workspace_registry_cache_suffix(w_id).await;
+    let req_hash = format!("ruby-{}{ws_suffix}", calculate_hash(&gemfile));
     if let Some(db) = conn.as_sql() {
         if let Some(cached) = sqlx::query_scalar!(
             "SELECT lockfile FROM pip_resolution_cache WHERE hash = $1",
@@ -330,7 +334,7 @@ Your Gemfile syntax will continue to work as-is."
         )
         .await;
 
-        let mut cmd = if !cfg!(windows) && !*DISABLE_NSJAIL {
+        let mut cmd = if !cfg!(windows) && is_sandboxing_enabled() {
             let nsjail_proto = format!("{}.lock.config.proto", Uuid::new_v4());
             let _ = write_file(
                 &job_dir,
@@ -338,7 +342,7 @@ Your Gemfile syntax will continue to work as-is."
                 &NSJAIL_CONFIG_LOCK_RUBY_CONTENT
                     .replace("{JOB_DIR}", job_dir)
                     .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
-                    .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
+                    .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
                     .replace("#{DEV}", DEV_CONF_NSJAIL), // .replace("{BUILD}", &build_dir),
             )?;
             let mut cmd = Command::new(NSJAIL_PATH.as_str());
@@ -360,7 +364,17 @@ Your Gemfile syntax will continue to work as-is."
             ])
             .envs(RUBY_PROXY_ENVS.clone());
 
-        for repo in RUBY_REPOS.read().await.clone().unwrap_or_default() {
+        for repo in read_ee_registry_url_list_with_workspace_override(
+            RUBY_REPOS.read().await.clone(),
+            "ruby_repos",
+            "ruby repos",
+            job_id,
+            w_id,
+            conn,
+        )
+        .await
+        .unwrap_or_default()
+        {
             if let (Some(url), usr, Some(passwd)) =
                 (repo.domain(), repo.username(), repo.password())
             {
@@ -401,7 +415,7 @@ Your Gemfile syntax will continue to work as-is."
             mem_peak,
             canceled_by,
             child,
-            !*DISABLE_NSJAIL,
+            is_sandboxing_enabled(),
             worker_name,
             w_id,
             "bundle",
@@ -578,7 +592,7 @@ async fn install<'a>(
         // 123...zx-activesupport-8.0.2
         // ^^^^^^^^ hash based on source and type (GEM or GIT)
         let handle = format!("{}-{}-{}", hash, pkg, version);
-        let path = format!("{RUBY_CACHE_DIR}/gems/{}", &handle);
+        let path = format!("{}/gems/{}", *RUBY_CACHE_DIR, &handle);
 
         deps.push(RequiredDependency {
             path,
@@ -589,15 +603,25 @@ async fn install<'a>(
     }
 
     let job_dir = job_dir.to_owned();
-    let jailed = !cfg!(windows) && !*DISABLE_NSJAIL;
+    let jailed = !cfg!(windows) && is_sandboxing_enabled();
     let RubyAnnotations { verbose } = RubyAnnotations::parse(&inner_content);
-    let repos = RUBY_REPOS.read().await.clone().unwrap_or_default();
+    let repos = read_ee_registry_url_list_with_workspace_override(
+        RUBY_REPOS.read().await.clone(),
+        "ruby_repos",
+        "ruby repos",
+        &job.id,
+        &job.workspace_id,
+        conn,
+    )
+    .await
+    .unwrap_or_default();
     let (envs, reserved_variables) = (
         envs.clone(),
         get_reserved_variables(job, &client.token, conn, parent_runnable_path.clone()).await?,
     );
+    let nsjail_tmp_mount_block = resolve_nsjail_tmp_mount_block(&job_dir).await;
     par_install_language_dependencies_seq(
-        deps.clone(),
+        InstallDeps::Flat(deps.clone()),
         "ruby",
         "gem",
         false,
@@ -614,7 +638,8 @@ async fn install<'a>(
                     &NSJAIL_CONFIG_DOWNLOAD_RUBY_CONTENT
                         .replace("{TARGET}", &dependency.path)
                         .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
-                        .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
+                        .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
+                        .replace("{TMP_MOUNT_BLOCK}", &nsjail_tmp_mount_block)
                         .replace("#{DEV}", DEV_CONF_NSJAIL), // .replace("{BUILD}", &build_dir),
                 )?;
                 let mut cmd = Command::new(NSJAIL_PATH.as_str());
@@ -700,7 +725,7 @@ async fn install<'a>(
 
             Ok(cmd)
         },
-        // async move |_| Ok(()),
+        None,
         &job.id,
         &job.workspace_id,
         worker_name,
@@ -723,9 +748,9 @@ async fn install<'a>(
     };
     // Include builtin windmill client
     {
-        const WM_INTERNAL: &str = concatcp!(RUBY_CACHE_DIR, "/gems/windmill-internal");
-        res.top_level_paths.push(WM_INTERNAL.to_owned());
-        res.rubylib += format!(":{WM_INTERNAL}").as_str();
+        let wm_internal = format!("{}/gems/windmill-internal", *RUBY_CACHE_DIR);
+        res.top_level_paths.push(wm_internal.clone());
+        res.rubylib += format!(":{wm_internal}").as_str();
     }
     Ok(res)
 }
@@ -751,7 +776,7 @@ async fn run<'a>(
     let reserved_variables =
         get_reserved_variables(job, &client.token, conn, parent_runnable_path.clone()).await?;
 
-    let child = if !cfg!(windows) && !*DISABLE_NSJAIL {
+    let child = if !cfg!(windows) && is_sandboxing_enabled() {
         append_logs(
             &job.id,
             &job.workspace_id,
@@ -775,6 +800,8 @@ mount {{
             })
             .join("\n");
 
+        let nsjail_timeout =
+            resolve_nsjail_timeout(conn, &job.workspace_id, job.id, job.timeout).await;
         write_file(
             job_dir,
             "run.config.proto",
@@ -782,9 +809,14 @@ mount {{
                 .replace("{JOB_DIR}", job_dir)
                 .replace("{SHARED_MOUNT}", &shared_mount)
                 .replace("{SHARED_DEPENDENCIES}", &shared_deps)
-                .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
+                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
                 .replace("#{DEV}", DEV_CONF_NSJAIL)
-                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string()),
+                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
+                .replace("{TIMEOUT}", &nsjail_timeout),
         )?;
         let mut cmd = Command::new(NSJAIL_PATH.as_str());
         cmd.env_clear()
@@ -795,7 +827,16 @@ mount {{
             .envs(envs)
             .envs(reserved_variables)
             .envs(RUBY_PROXY_ENVS.clone())
-            .envs(get_proxy_envs_for_lang(&ScriptLang::Ruby).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::Ruby,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
             .args(vec![
                 "--config",
                 "run.config.proto",
@@ -834,7 +875,16 @@ mount {{
             .env("BASE_INTERNAL_URL", base_internal_url)
             .envs(reserved_variables)
             .envs(RUBY_PROXY_ENVS.clone())
-            .envs(get_proxy_envs_for_lang(&ScriptLang::Ruby).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::Ruby,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
             .envs(envs);
 
         cmd.stdin(Stdio::null())
@@ -858,7 +908,7 @@ mount {{
         mem_peak,
         canceled_by,
         child,
-        !*DISABLE_NSJAIL,
+        is_sandboxing_enabled(),
         worker_name,
         &job.workspace_id,
         "ruby",

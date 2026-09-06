@@ -9,8 +9,9 @@ name = "windmill_git_sync"
 path = "./src/lib.rs"
 
 [features]
-private = []
+private = ["windmill-common/private"]
 enterprise = ["windmill-queue/enterprise", "windmill-common/enterprise"]
+all_sqlx_features = ["enterprise"]
 default = []
 
 [dependencies]

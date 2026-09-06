@@ -2,7 +2,9 @@
 mod tests {
     use serde_json::json;
     use windmill_parser::{Arg, MainArgSignature, ObjectProperty, ObjectType, Typ};
-    use windmill_parser_ts::{parse_deno_signature, parse_expr_for_imports};
+    use windmill_parser_ts::{
+        parse_deno_signature, parse_expr_for_imports, parse_relative_imports,
+    };
 
     #[test]
     fn test_imports_basic() {
@@ -45,8 +47,9 @@ mod tests {
                 star_args: false,
                 star_kwargs: false,
                 args: vec![],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -77,6 +80,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "num_param".to_string(),
@@ -85,6 +89,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "bool_param".to_string(),
@@ -93,6 +98,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "any_param".to_string(),
@@ -101,10 +107,12 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -134,6 +142,7 @@ mod tests {
                         default: Some(json!("World")),
                         has_default: true,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "count".to_string(),
@@ -142,6 +151,7 @@ mod tests {
                         default: Some(json!(42)),
                         has_default: true,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "enabled".to_string(),
@@ -150,10 +160,12 @@ mod tests {
                         default: Some(json!(true)),
                         has_default: true,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -183,6 +195,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "numbers".to_string(),
@@ -191,6 +204,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "items".to_string(),
@@ -199,10 +213,12 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -231,9 +247,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 },],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -262,9 +280,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 },],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -302,9 +322,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -340,9 +362,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -398,9 +422,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -431,6 +457,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "base64_param".to_string(),
@@ -439,6 +466,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "email_param".to_string(),
@@ -447,6 +475,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "sql_param".to_string(),
@@ -455,10 +484,12 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -488,6 +519,7 @@ mod tests {
                         default: None,
                         has_default: false,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "optional".to_string(),
@@ -496,6 +528,7 @@ mod tests {
                         default: None,
                         has_default: true,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                     Arg {
                         name: "with_default".to_string(),
@@ -504,10 +537,12 @@ mod tests {
                         default: Some(json!(false)),
                         has_default: true,
                         oidx: None,
+                        otyp_inferred: false,
                     },
                 ],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -555,8 +590,9 @@ mod tests {
                 star_args: false,
                 star_kwargs: false,
                 args: vec![],
-                no_main_func: Some(true),
+                auto_kind: Some("lib".to_string()),
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -581,9 +617,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -610,9 +648,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -639,9 +679,64 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(false),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_union_array_type() {
+        let code = r#"
+        export async function main(
+            items: string | string[],
+            numbers: number[] | number,
+            plain: string
+        ) {
+            return { items, numbers, plain };
+        }
+        "#;
+        let sig = parse_deno_signature(code, false, false, None).unwrap();
+        assert_eq!(
+            sig,
+            MainArgSignature {
+                star_args: false,
+                star_kwargs: false,
+                args: vec![
+                    Arg {
+                        name: "items".to_string(),
+                        otyp: Some("string | string[]".to_string()),
+                        typ: Typ::Unknown,
+                        default: None,
+                        has_default: false,
+                        oidx: None,
+                        otyp_inferred: false,
+                    },
+                    Arg {
+                        name: "numbers".to_string(),
+                        otyp: Some("number[] | number".to_string()),
+                        typ: Typ::Unknown,
+                        default: None,
+                        has_default: false,
+                        oidx: None,
+                        otyp_inferred: false,
+                    },
+                    Arg {
+                        name: "plain".to_string(),
+                        otyp: None,
+                        typ: Typ::Str(None),
+                        default: None,
+                        has_default: false,
+                        oidx: None,
+                        otyp_inferred: false,
+                    },
+                ],
+                auto_kind: None,
+                has_preprocessor: Some(false),
+                ..Default::default()
             }
         );
     }
@@ -679,9 +774,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(true),
+                ..Default::default()
             }
         );
     }
@@ -709,9 +806,11 @@ mod tests {
                     default: None,
                     has_default: false,
                     oidx: None,
+                    otyp_inferred: false,
                 }],
-                no_main_func: Some(false),
+                auto_kind: None,
                 has_preprocessor: Some(true),
+                ..Default::default()
             }
         );
     }
@@ -749,12 +848,115 @@ mod tests {
         // Test case where there are exports but no preprocessor
         let code = r#"
         export { foo, bar } from "./utils";
-        
+
         export async function main(param: string) {
             return param;
         }
         "#;
         let sig = parse_deno_signature(code, false, false, None).unwrap();
         assert_eq!(sig.has_preprocessor, Some(false));
+    }
+
+    // ==========================================================================
+    // Tests for parse_relative_imports
+    // ==========================================================================
+
+    #[test]
+    fn test_relative_imports_dot() {
+        let code = r#"
+        import { helper } from "./helper";
+        export async function main() { return helper(); }
+        "#;
+        let result = parse_relative_imports(code, "f/folder/script").unwrap();
+        assert_eq!(result, vec!["f/folder/helper"]);
+    }
+
+    #[test]
+    fn test_relative_imports_double_dot() {
+        let code = r#"
+        import { utils } from "../utils/helper";
+        export async function main() { return utils(); }
+        "#;
+        let result = parse_relative_imports(code, "f/folder/subfolder/script").unwrap();
+        assert_eq!(result, vec!["f/folder/utils/helper"]);
+    }
+
+    #[test]
+    fn test_relative_imports_absolute_path() {
+        let code = r#"
+        import { shared } from "/f/shared/utils";
+        export async function main() { return shared(); }
+        "#;
+        let result = parse_relative_imports(code, "f/folder/script").unwrap();
+        assert_eq!(result, vec!["f/shared/utils"]);
+    }
+
+    #[test]
+    fn test_relative_imports_mixed() {
+        let code = r#"
+        import { helper } from "./helper";
+        import { utils } from "../utils";
+        import { shared } from "/f/shared/lib";
+        import lodash from "lodash";
+        export async function main() { return helper() + utils() + shared(); }
+        "#;
+        let result = parse_relative_imports(code, "f/folder/script").unwrap();
+        // Should only include relative imports, not external packages like lodash
+        assert_eq!(result, vec!["f/folder/helper", "f/shared/lib", "f/utils"]);
+    }
+
+    #[test]
+    fn test_relative_imports_with_ts_extension() {
+        let code = r#"
+        import { helper } from "./helper.ts";
+        export async function main() { return helper(); }
+        "#;
+        let result = parse_relative_imports(code, "f/folder/script").unwrap();
+        assert_eq!(result, vec!["f/folder/helper"]);
+    }
+
+    #[test]
+    fn test_relative_imports_external_only() {
+        let code = r#"
+        import lodash from "lodash";
+        import { something } from "@scope/package";
+        export async function main() { return lodash.map([]); }
+        "#;
+        let result = parse_relative_imports(code, "f/folder/script").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_relative_imports_deeply_nested() {
+        let code = r#"
+        import { a } from "../../a";
+        import { b } from "../../../b";
+        export async function main() { return a() + b(); }
+        "#;
+        let result = parse_relative_imports(code, "f/one/two/three/script").unwrap();
+        assert_eq!(result, vec!["f/b", "f/one/a"]);
+    }
+
+    #[test]
+    fn test_relative_imports_includes_re_exports() {
+        // Barrel re-exports must be captured as relative imports — without
+        // them, importers reaching helpers via a barrel file lose the edge in
+        // the dependency tree and the dep job 404s on the sibling fetches.
+        let code = r#"
+        export * from "./types.ts";
+        export { WorkflowError } from "./WorkflowError.ts";
+        export * as factory from "./errorFactory.ts";
+        export type { ErrorKind } from "./types-only.ts";
+        "#;
+        let result = parse_relative_imports(code, "f/lib/errors/index").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                "f/lib/errors/WorkflowError",
+                "f/lib/errors/errorFactory",
+                "f/lib/errors/types",
+                "f/lib/errors/types-only",
+            ]
+        );
     }
 }

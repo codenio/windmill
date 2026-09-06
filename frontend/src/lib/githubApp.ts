@@ -1,4 +1,8 @@
-import { GitSyncService, type GetGlobalConnectedRepositoriesResponse } from '$lib/gen'
+import {
+	GitSyncService,
+	type GetGlobalConnectedRepositoriesResponse,
+	type GetGhesConfigResponse
+} from '$lib/gen'
 import { sendUserToast } from '$lib/toast'
 import { base } from '$lib/base'
 
@@ -6,17 +10,24 @@ export interface GitHubAppState {
 	loadingGithubInstallations: boolean
 	githubInstallations: GetGlobalConnectedRepositoriesResponse
 	workspaceGithubInstallations: GetGlobalConnectedRepositoriesResponse
-	selectedGHAppAccountId: string | undefined
+	/**
+	 * Installations are keyed by `installation_id`, never by `account_id`: an org
+	 * can be installed more than once (re-installed, or added from another
+	 * workspace), and matching on the org name resolves to the wrong one.
+	 */
+	selectedGHAppInstallationId: number | undefined
 	selectedGHAppRepository: string | undefined
 	githubInstallationUrl: string | undefined
 	installationCheckInterval: number | undefined
 	isCheckingInstallation: boolean
 	importJwt: string
-}
-
-export interface GitHubRepository {
-	name: string
-	url: string
+	/**
+	 * True when the instance has a self-managed (GHES) GitHub App configured.
+	 * Used to hide cloud-only UI like the Export/Import buttons, since those
+	 * JWTs carry no `github_base_url` and would round-trip into broken
+	 * github.com-pointed installs.
+	 */
+	isGhesSelfManaged: boolean
 }
 
 export interface GitHubAppError extends Error {
@@ -90,12 +101,13 @@ export function createGitHubAppState(): GitHubAppState {
 		loadingGithubInstallations: false,
 		githubInstallations: [],
 		workspaceGithubInstallations: [],
-		selectedGHAppAccountId: undefined,
+		selectedGHAppInstallationId: undefined,
 		selectedGHAppRepository: undefined,
 		githubInstallationUrl: undefined,
 		installationCheckInterval: undefined,
 		isCheckingInstallation: false,
-		importJwt: ''
+		importJwt: '',
+		isGhesSelfManaged: false
 	}
 }
 
@@ -129,7 +141,31 @@ export async function loadGithubInstallations(
 			})
 		)
 
-		state.githubInstallationUrl = `https://github.com/apps/windmill-sync-helper/installations/new?state=${stateParam}`
+		// Check if GHES app is configured; if so, use GHES installation URL
+		try {
+			const ghesConfig: GetGhesConfigResponse = await GitSyncService.getGhesConfig()
+			if (ghesConfig?.base_url && ghesConfig?.app_slug) {
+				state.isGhesSelfManaged = true
+				const ghesBaseUrl = ghesConfig.base_url.replace(/\/$/, '')
+				// GHES (self-hosted) uses /github-apps/, github.com and GHE Cloud (*.ghe.com) use /apps/
+				const hostname = new URL(ghesBaseUrl).hostname
+				const isGHES = hostname !== 'github.com' && !hostname.endsWith('.ghe.com')
+				const appsPath = isGHES ? 'github-apps' : 'apps'
+				// GHE Cloud (*.ghe.com) requires the app owner (org/user) in the URL path
+				const appPath =
+					hostname.endsWith('.ghe.com') && ghesConfig.app_owner
+						? `${ghesConfig.app_owner}/${ghesConfig.app_slug}`
+						: ghesConfig.app_slug
+				state.githubInstallationUrl = `${ghesBaseUrl}/${appsPath}/${appPath}/installations/new?state=${stateParam}`
+			} else {
+				state.isGhesSelfManaged = false
+				state.githubInstallationUrl = `https://github.com/apps/windmill-sync-helper/installations/new?state=${stateParam}`
+			}
+		} catch {
+			// No GHES config — use default github.com URL
+			state.isGhesSelfManaged = false
+			state.githubInstallationUrl = `https://github.com/apps/windmill-sync-helper/installations/new?state=${stateParam}`
+		}
 	} catch (err) {
 		const githubError = handleGitHubAppError(err, 'load installations')
 		sendUserToast(`Failed to load GitHub installations: ${githubError.message}`, true)
@@ -203,18 +239,6 @@ export function stopInstallationCheck(state: GitHubAppState): void {
 		state.installationCheckInterval = undefined
 	}
 	state.isCheckingInstallation = false
-}
-
-/**
- * Gets repositories for a specific GitHub account
- */
-export function getRepositories(state: GitHubAppState, accountId: string): GitHubRepository[] {
-	if (!accountId) return []
-
-	return (
-		state.githubInstallations.find((installation) => installation.account_id === accountId)
-			?.repositories || []
-	)
 }
 
 /**

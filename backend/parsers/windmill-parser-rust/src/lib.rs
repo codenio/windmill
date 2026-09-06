@@ -21,23 +21,25 @@ pub fn parse_rust_signature(code: &str) -> anyhow::Result<MainArgSignature> {
             .iter()
             .map(|param| {
                 let (otyp, typ, name) = parse_rust_typ(param);
-                Arg { name, otyp, typ, default: None, has_default: false, oidx: None }
+                Arg { name, otyp, typ, default: None, has_default: false, oidx: None, otyp_inferred: false }
             })
             .collect_vec();
         Ok(MainArgSignature {
             star_args: false,
             star_kwargs: false,
             args,
-            no_main_func: Some(false),
+            auto_kind: None,
             has_preprocessor: None,
+            ..Default::default()
         })
     } else {
         Ok(MainArgSignature {
             star_args: false,
             star_kwargs: false,
             args: vec![],
-            no_main_func: Some(true),
+            auto_kind: Some("lib".to_string()),
             has_preprocessor: None,
+            ..Default::default()
         })
     }
 }

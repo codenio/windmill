@@ -55,6 +55,28 @@ const targets = [
     desc: "Ruby",
     features: "ruby-parser",
     env: "tree-sitter",
+  }, {
+    ident: "r",
+    desc: "R",
+    features: "r-parser",
+    env: "tree-sitter",
+  },
+  {
+    ident: "wac",
+    desc: "Workflow-as-Code",
+    features: "wac-parser",
+    env: "default",
+  }, {
+    ident: "asset",
+    desc: "Asset parsers (TS, Python, SQL) with SQL AST",
+    features: "asset-parser",
+    env: "default",
+  },
+  {
+    ident: "py-imports",
+    desc: "Python imports"
+    features: "py-imports-parser",
+    env: "default",
   },
   # ^^^ Add new entry here ^^^
 ];

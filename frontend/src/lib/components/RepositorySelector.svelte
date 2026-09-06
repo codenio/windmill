@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte'
 	import { GitSyncService } from '$lib/gen'
 	import Select from './select/Select.svelte'
 
@@ -10,7 +11,7 @@
 	interface Props {
 		disabled?: boolean
 		selectedRepository?: string | undefined
-		accountId: string
+		installationId: number
 		initialRepositories: Repository[]
 		totalCount: number
 		perPage: number
@@ -22,7 +23,7 @@
 	let {
 		disabled = false,
 		selectedRepository = $bindable(),
-		accountId,
+		installationId,
 		initialRepositories,
 		totalCount,
 		perPage,
@@ -32,7 +33,7 @@
 	}: Props = $props()
 
 	// Track all loaded repositories across pages
-	let loadedRepositories = $state<Repository[]>(initialRepositories)
+	let loadedRepositories = $state<Repository[]>(untrack(() => initialRepositories))
 	let currentPage = $state(1)
 	let isLoadingMore = $state(false)
 
@@ -66,8 +67,8 @@
 				page: nextPage
 			})
 
-			// Find the matching installation and get its repositories
-			const installation = installations.find((inst) => inst.account_id === accountId)
+			// Match on installation_id: several installations can share one account_id
+			const installation = installations.find((inst) => inst.installation_id === installationId)
 
 			if (installation?.repositories) {
 				// Append new repos to existing ones
@@ -94,8 +95,8 @@
 				}))}
 				placeholder="Select repository..."
 				clearable
-				disabled={disabled}
-				bind:filterText={filterText}
+				{disabled}
+				bind:filterText
 				bind:value={selectedRepository}
 			/>
 			{#if hasMoreRepos}

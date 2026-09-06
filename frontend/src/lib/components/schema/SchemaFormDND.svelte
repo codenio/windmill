@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { createEventDispatcher, untrack } from 'svelte'
-	import { dragHandle } from '@windmill-labs/svelte-dnd-action'
+	import { dragHandle, TRIGGERS } from '@windmill-labs/svelte-dnd-action'
 	import SchemaForm from '../SchemaForm.svelte'
 	import { GripVertical } from 'lucide-svelte'
 	import type { Schema } from '$lib/common'
@@ -26,6 +26,7 @@
 		className?: string
 		dndType?: string
 		lightHeaderFont?: boolean
+		workspace?: string | undefined
 	}
 
 	let {
@@ -46,7 +47,8 @@
 		noVariablePicker = false,
 		className = '',
 		dndType = generateRandomString(),
-		lightHeaderFont
+		lightHeaderFont,
+		workspace = undefined
 	}: Props = $props()
 
 	$effect.pre(() => {
@@ -79,9 +81,24 @@
 		}
 	}
 
+	let dragStartTime = 0
+	const DRAG_GRACE_PERIOD_MS = 200
+
 	function handleConsider(e) {
 		dragDisabledState = false
-		const { items: newItems } = e.detail
+		const { items: newItems, info } = e.detail
+
+		if (info.trigger === TRIGGERS.DRAG_STARTED) {
+			dragStartTime = Date.now()
+			items = $state.snapshot(newItems)
+			return
+		}
+
+		// Ignore reorders during grace period so small movements don't cause jumps
+		if (Date.now() - dragStartTime < DRAG_GRACE_PERIOD_MS) {
+			return
+		}
+
 		items = $state.snapshot(newItems)
 	}
 
@@ -130,7 +147,8 @@
 				items,
 				flipDurationMs,
 				dropTargetStyle: {},
-				type: dndType
+				type: dndType,
+				morphDisabled: true
 			}}
 	{items}
 	{diff}
@@ -139,6 +157,7 @@
 	bind:isValid
 	{noVariablePicker}
 	{lightHeaderFont}
+	{workspace}
 >
 	{#snippet actions()}
 		{#if !disableDnd}

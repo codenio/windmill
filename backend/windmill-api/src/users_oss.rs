@@ -38,7 +38,7 @@ pub async fn create_user(
     mut _nu: NewUser,
 ) -> Result<(StatusCode, String)> {
     Err(Error::internal_err(
-        "Not implemented in Windmill's Open Source repository".to_string(),
+        "User creation is not implemented in the open-source version.".to_string(),
     ))
 }
 
@@ -60,13 +60,6 @@ pub fn hash_password(_argon2: Arc<Argon2<'_>>, _password: String) -> Result<Stri
     Err(Error::internal_err(
         "Not implemented in Windmill's Open Source repository".to_string(),
     ))
-}
-
-#[cfg(not(feature = "private"))]
-pub fn send_email_if_possible(_subject: &str, _content: &str, _to: &str) {
-    tracing::warn!(
-        "send_email_if_possible is not implemented in Windmill's Open Source repository"
-    );
 }
 
 #[cfg(not(feature = "private"))]

@@ -11,15 +11,25 @@
 	import S3FilePicker from './S3FilePicker.svelte'
 	import FileUpload from './common/fileUpload/FileUpload.svelte'
 
-	export let value: any
-	export let editor: SimpleEditor | undefined = undefined
+	interface Props {
+		value: any
+		editor?: SimpleEditor | undefined
+		/** Workspace to browse/upload S3 objects in; defaults to the nav workspace. */
+		workspace?: string | undefined
+	}
+
+	let {
+		value = $bindable(),
+		editor = $bindable(undefined),
+		workspace = undefined
+	}: Props = $props()
 
 	const dispatch = createEventDispatcher()
 
-	let s3FilePicker: S3FilePicker
-	let s3FileUploadRawMode: false
+	let s3FilePicker: S3FilePicker | undefined = $state()
+	let s3FileUploadRawMode: boolean | undefined = $state()
 	let el: HTMLTextAreaElement | undefined = undefined
-	let rawValue: string | undefined = undefined
+	let rawValue: string | undefined = $state(undefined)
 
 	function evalValueToRaw() {
 		rawValue = JSON.stringify(value, null, 2)
@@ -44,6 +54,7 @@
 		editor?.setCode(rawValue)
 	}}
 	readOnlyMode={false}
+	{workspace}
 />
 
 <div class="flex flex-col w-full gap-1">
@@ -81,6 +92,7 @@
 				}
 			}}
 			defaultValue={value?.s3}
+			{workspace}
 		/>
 	{/if}
 	<Button

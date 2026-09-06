@@ -14,13 +14,14 @@ use windmill_queue::{append_logs, CanceledBy, MiniPulledJob};
 use crate::{
     common::{
         build_command_with_isolation, create_args_and_out_file, get_reserved_variables,
-        read_result, start_child_process, OccupancyMetrics, DEV_CONF_NSJAIL,
+        read_result, resolve_nsjail_timeout, resolve_nsjail_tmp_mount_block, start_child_process,
+        OccupancyMetrics, DEV_CONF_NSJAIL,
     },
-    handle_child, get_proxy_envs_for_lang, DISABLE_NSJAIL, DISABLE_NUSER, NSJAIL_PATH, PATH_ENV,
-    TRACING_PROXY_CA_CERT_PATH,
+    get_proxy_envs_for_lang, handle_child, is_sandboxing_enabled, DISABLE_NUSER, NSJAIL_PATH,
+    PATH_ENV, TRACING_PROXY_CA_CERT_PATH,
 };
-use windmill_common::scripts::ScriptLang;
 use windmill_common::client::AuthedClient;
+use windmill_common::scripts::ScriptLang;
 
 const NSJAIL_CONFIG_RUN_NU_CONTENT: &str = include_str!("../nsjail/run.nu.config.proto");
 lazy_static::lazy_static! {
@@ -127,7 +128,7 @@ pub async fn handle_nu_job<'a>(mut args: JobHandlerInput<'a>) -> Result<Box<RawV
 //         //     mem_peak,
 //         //     canceled_by,
 //         //     child,
-//         //     !*DISABLE_NSJAIL,
+//         //     is_sandboxing_enabled(),
 //         //     worker_name,
 //         //     &job.workspace_id,
 //         //     "cargo",
@@ -236,7 +237,7 @@ async fn run<'a>(
 ) -> Result<(), Error> {
     let reserved_variables =
         get_reserved_variables(job, &client.token, conn, parent_runnable_path.clone()).await?;
-    let child = if !cfg!(windows) && !*DISABLE_NSJAIL {
+    let child = if !cfg!(windows) && is_sandboxing_enabled() {
         append_logs(
             &job.id,
             &job.workspace_id,
@@ -245,6 +246,8 @@ async fn run<'a>(
         )
         .await;
 
+        let nsjail_timeout =
+            resolve_nsjail_timeout(conn, &job.workspace_id, job.id, job.timeout).await;
         write_file(
             job_dir,
             "run.config.proto",
@@ -253,8 +256,13 @@ async fn run<'a>(
                 .replace("{NU_PATH}", &NU_PATH)
                 .replace("{SHARED_MOUNT}", &shared_mount)
                 .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
-                .replace("{TRACING_PROXY_CA_CERT_PATH}", TRACING_PROXY_CA_CERT_PATH)
-                .replace("#{DEV}", DEV_CONF_NSJAIL),
+                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
+                .replace("#{DEV}", DEV_CONF_NSJAIL)
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
+                .replace("{TIMEOUT}", &nsjail_timeout),
         )?;
         let mut nsjail_cmd = Command::new(NSJAIL_PATH.as_str());
         nsjail_cmd
@@ -264,7 +272,16 @@ async fn run<'a>(
             .env("BASE_INTERNAL_URL", base_internal_url)
             .envs(envs)
             .envs(reserved_variables)
-            .envs(get_proxy_envs_for_lang(&ScriptLang::Nu).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::Nu,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
             .args(vec![
                 "--config",
                 "run.config.proto",
@@ -303,7 +320,16 @@ async fn run<'a>(
             .env("BASE_INTERNAL_URL", base_internal_url)
             .envs(envs)
             .envs(reserved_variables)
-            .envs(get_proxy_envs_for_lang(&ScriptLang::Nu).await?)
+            .envs(
+                get_proxy_envs_for_lang(
+                    &ScriptLang::Nu,
+                    job.kind,
+                    &job.id,
+                    &job.workspace_id,
+                    conn,
+                )
+                .await?,
+            )
             // TODO(v1):
             // "--plugins",
             // &format!(
@@ -335,7 +361,7 @@ async fn run<'a>(
         mem_peak,
         canceled_by,
         child,
-        !*DISABLE_NSJAIL,
+        is_sandboxing_enabled(),
         worker_name,
         &job.workspace_id,
         "nu",

@@ -54,9 +54,13 @@ export type TriggerKind =
 	| 'nats'
 	| 'postgres'
 	| 'mqtt'
+	| 'amqp'
 	| 'sqs'
 	| 'gcp'
+	| 'azure'
 	| 'nextcloud'
+	| 'google'
+	| 'github'
 export function captureTriggerKindToTriggerKind(kind: CaptureTriggerKind): TriggerKind {
 	switch (kind) {
 		case 'webhook':
@@ -75,6 +79,8 @@ export function captureTriggerKindToTriggerKind(kind: CaptureTriggerKind): Trigg
 			return 'nats'
 		case 'mqtt':
 			return 'mqtt'
+		case 'amqp':
+			return 'amqp'
 		case 'sqs':
 			return 'sqs'
 		case 'postgres':

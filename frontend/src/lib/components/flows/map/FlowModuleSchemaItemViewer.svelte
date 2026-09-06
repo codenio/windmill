@@ -2,9 +2,13 @@
 	import Popover from '$lib/components/Popover.svelte'
 	import Badge from '$lib/components/common/badge/Badge.svelte'
 	import type { FlowNodeColorClasses } from '$lib/components/graph'
-	import { Pencil } from 'lucide-svelte'
-	import { slide } from 'svelte/transition'
 	import { twMerge } from 'tailwind-merge'
+	import { getContext } from 'svelte'
+
+	// Detached mode (sessions): a step's editor is hidden until asked for, so add the
+	// hint to the name tooltip. Provided by FlowEditor; absent (=> false) elsewhere.
+	const stepExploreHint = getContext<(() => boolean) | undefined>('flowGraphStepExploreHint')
+	const showExploreHint = $derived(stepExploreHint?.() ?? false)
 
 	let iconWidth: number = $state(0)
 	let idBadgeWidth: number | undefined = $state(undefined)
@@ -12,10 +16,9 @@
 		label?: string
 		path?: string
 		id?: string
-		deletable?: boolean
 		bold?: boolean
 		editId?: boolean
-		hover?: boolean
+		disableEditId?: boolean
 		colorClasses?: FlowNodeColorClasses
 		icon?: import('svelte').Snippet
 		onclick?: () => void
@@ -25,10 +28,9 @@
 		label = '',
 		path = '',
 		id = '',
-		deletable = false,
 		bold = false,
 		editId = $bindable(false),
-		hover = false,
+		disableEditId = false,
 		colorClasses,
 		icon,
 		onclick
@@ -59,6 +61,9 @@
 			<div>
 				<div>{label}</div>
 				{#if path != ''}<div>{path}</div>{/if}
+				{#if showExploreHint}
+					<div class="mt-1 text-tertiary">double click, or click again, to explore</div>
+				{/if}
 			</div>
 		{/snippet}
 	</Popover>
@@ -74,20 +79,17 @@
 				)}
 				baseClass={twMerge('!px-1')}
 				title={id}
-				clickable
-				onclick={(e) => {
-					e?.preventDefault()
-					e?.stopPropagation()
-					editId = !editId
-					onclick?.()
-				}}
+				clickable={!disableEditId}
+				onclick={disableEditId
+					? undefined
+					: (e) => {
+							e?.preventDefault()
+							e?.stopPropagation()
+							editId = !editId
+							onclick?.()
+						}}
 			>
 				<span class="max-w-full text-2xs truncate flex items-center">
-					{#if editId || (hover && deletable)}
-						<span transition:slide={{ axis: 'x', duration: 100 }}>
-							<Pencil size={10} class="mr-1" />
-						</span>
-					{/if}
 					<span class="max-w-12 truncate">
 						{id}
 					</span>

@@ -19,39 +19,25 @@
 	import { base } from '$lib/base'
 	import Notification from '$lib/components/common/alert/Notification.svelte'
 
-	export let open: boolean = false
-	export let numUnacknowledgedCriticalAlerts: number = 0
-	export let muteSettings
-	let workspaceContext = false
-	let childRef
-
-	$: {
-		setupApiFunctions(workspaceContext)
+	interface Props {
+		open?: boolean
+		numUnacknowledgedCriticalAlerts?: number
+		muteSettings: any
 	}
 
-	function setupApiFunctions(_ctx?) {
-		getCriticalAlerts = withSuperadminLogic(
-			SettingService.getCriticalAlerts,
-			SettingService.workspaceGetCriticalAlerts
-		)
-
-		acknowledgeCriticalAlert = withSuperadminLogic(
-			SettingService.acknowledgeCriticalAlert,
-			SettingService.workspaceAcknowledgeCriticalAlert
-		)
-
-		acknowledgeAllCriticalAlerts = withSuperadminLogic(
-			SettingService.acknowledgeAllCriticalAlerts,
-			SettingService.workspaceAcknowledgeAllCriticalAlerts
-		)
-	}
-
-	$: isCriticalAlertsUIOpen.set(open)
-	$: if ($isCriticalAlertsUIOpen) open = $isCriticalAlertsUIOpen
+	let {
+		open = $bindable(false),
+		numUnacknowledgedCriticalAlerts = $bindable(0),
+		muteSettings = $bindable()
+	}: Props = $props()
+	let workspaceContext = $state(false)
+	let childRef: CriticalAlertModalInner | undefined = $state()
 
 	let checkForNewAlertsInterval: ReturnType<typeof setInterval>
 	let checkingForNewAlerts = false
 
+	// The returned closure reads workspaceContext / $workspaceStore / $devopsRole at
+	// call time, so the wrappers are stable and never need recreating.
 	const withSuperadminLogic = (superadminFunction, workspaceFunction) => {
 		return async (params = {}) => {
 			if (!$devopsRole || workspaceContext) {
@@ -65,11 +51,21 @@
 		}
 	}
 
-	let getCriticalAlerts
-	let acknowledgeCriticalAlert
-	let acknowledgeAllCriticalAlerts
-
-	setupApiFunctions()
+	let getCriticalAlerts = $derived(
+		withSuperadminLogic(SettingService.getCriticalAlerts, SettingService.workspaceGetCriticalAlerts)
+	)
+	let acknowledgeCriticalAlert = $derived(
+		withSuperadminLogic(
+			SettingService.acknowledgeCriticalAlert,
+			SettingService.workspaceAcknowledgeCriticalAlert
+		)
+	)
+	let acknowledgeAllCriticalAlerts = $derived(
+		withSuperadminLogic(
+			SettingService.acknowledgeAllCriticalAlerts,
+			SettingService.workspaceAcknowledgeAllCriticalAlerts
+		)
+	)
 
 	onMount(async () => {
 		await updateHasUnacknowledgedCriticalAlerts(false)
@@ -92,7 +88,7 @@
 		sendUserToast(
 			`Critical alert UI mute settings changed.\nPlease reload page for UI changes to take effect.`
 		)
-		childRef.refreshAlerts()
+		childRef?.refreshAlerts()
 	}
 	async function saveGlobalMuteSetting() {
 		await SettingService.setGlobal({
@@ -102,7 +98,7 @@
 		sendUserToast(
 			`Critical alert UI mute settings changed.\nPlease reload page for UI changes to take effect.`
 		)
-		childRef.refreshAlerts()
+		childRef?.refreshAlerts()
 	}
 
 	async function updateHasUnacknowledgedCriticalAlerts(sendToast: boolean = false) {
@@ -166,9 +162,15 @@
 	}
 
 	async function acknowledgeAlert(id: number) {
-		await acknowledgeCriticalAlert({ id })
+		await acknowledgeCriticalAlert?.({ id })
 		updateHasUnacknowledgedCriticalAlerts()
 	}
+	$effect(() => {
+		if ($isCriticalAlertsUIOpen) open = $isCriticalAlertsUIOpen
+	})
+	$effect(() => {
+		isCriticalAlertsUIOpen.set(open)
+	})
 </script>
 
 <Modal2
@@ -178,18 +180,22 @@
 	fixedHeight="lg"
 	fixedWidth="lg"
 >
-	<svelte:fragment slot="header-left">
+	{#snippet headerLeft()}
 		<Notification notificationCount={numUnacknowledgedCriticalAlerts} notificationLimit={9999} />
-	</svelte:fragment>
-	<svelte:fragment slot="header-right">
+	{/snippet}
+	{#snippet headerRight()}
 		<List horizontal>
 			{#if $superadmin || $userStore?.is_admin}
+				<!-- Portal to `body` (not the trigger) so toggle clicks don't bubble to the melt
+				     trigger and toggle the popover shut. `dropdown-portal` on the content root is a
+				     `portalDivs` marker, so the enclosing Modal2's clickOutside treats the whole
+				     popover surface — padding included — as inside a portal and stays open. -->
 				<Popover
 					floatingConfig={{ strategy: 'fixed', placement: 'bottom-end' }}
-					portal="#mute-settings-button"
-					contentClasses="p-4"
+					portal="body"
+					contentClasses="p-4 dropdown-portal"
 				>
-					<svelte:fragment slot="trigger">
+					{#snippet trigger()}
 						<div id="mute-settings-button">
 							<Button variant="default" nonCaptureEvent>
 								{#if muteSettings.global || muteSettings.workspace}
@@ -199,8 +205,8 @@
 								{/if}
 							</Button>
 						</div>
-					</svelte:fragment>
-					<svelte:fragment slot="content">
+					{/snippet}
+					{#snippet content()}
 						<List justify="start">
 							<div class="w-full">
 								{#if $superadmin}
@@ -226,24 +232,24 @@
 								/>
 							</div>
 						</List>
-					</svelte:fragment>
+					{/snippet}
 				</Popover>
 			{/if}
 
 			{#if $superadmin}
 				<Popover
 					floatingConfig={{ strategy: 'fixed', placement: 'bottom-end' }}
-					portal="#settings-button"
-					contentClasses="p-4"
+					portal="body"
+					contentClasses="p-4 dropdown-portal"
 				>
-					<svelte:fragment slot="trigger">
+					{#snippet trigger()}
 						<div id="settings-button">
 							<Button variant="default" nonCaptureEvent>
 								<Settings size="16" />
 							</Button>
 						</div>
-					</svelte:fragment>
-					<svelte:fragment slot="content">
+					{/snippet}
+					{#snippet content()}
 						<List justify="start" gap="none">
 							<div class="w-full">
 								<Button
@@ -271,7 +277,7 @@
 								</Button>
 							</div>
 						</List>
-					</svelte:fragment>
+					{/snippet}
 				</Popover>
 			{:else}
 				<Button
@@ -287,10 +293,11 @@
 				</Button>
 			{/if}
 		</List>
-	</svelte:fragment>
+	{/snippet}
 
 	<CriticalAlertModalInner
 		bind:workspaceContext
+		{muteSettings}
 		{numUnacknowledgedCriticalAlerts}
 		{updateHasUnacknowledgedCriticalAlerts}
 		{getCriticalAlerts}
